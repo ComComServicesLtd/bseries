@@ -14,16 +14,16 @@ BSeries::BSeries()
 
 
 uint32_t BSeries::getChecksum(SERIES *series){
-    return 1234567890 + ((series->version ^ series->timestamp) ^ (series->interval ^ series->datatype));
+    return 1234567890 + ((series->version ^ series->timestamp) ^ (series->interval ^ series->datasize));
 }
 
 
-int BSeries::createSeries(FILE *file, SERIES *series, BType datatype){
+int BSeries::createSeries(FILE *file, SERIES *series, uint32_t datasize){
 
     series->version = 1;
     series->timestamp = time(NULL);
     series->interval = default_Seconds_Per_Point;
-    series->datatype = datatype;
+    series->datasize = datasize;
     series->checksum = getChecksum(series);
 
     fseek(file,0,SEEK_SET);
@@ -53,15 +53,16 @@ void BSeries::closeSeries(uint32_t max_age){
     auto it = series_list.begin();
     while(it != series_list.end()){
 
-        if(it->second.last_write){
+
+        if(it->second != NULL){
 
 
 
-            age = current_timestamp - it->second.last_write;
-            if(age > max_age){
-                if(it->second.file != NULL){
-                    fclose(it->second.file);
-                    it->second.file = NULL;
+            age = current_timestamp - it->second->last_write;
+            if(age > max_age ||  !it->second->last_write){
+                if(it->second->file != NULL){
+                    fclose(it->second->file);
+                    delete it->second;
                 }
 
                 it = series_list.erase(it);
@@ -75,13 +76,7 @@ void BSeries::closeSeries(uint32_t max_age){
 
 
 
-        } else { // invalid date, erase it
-
-            if(it->second.file != NULL){
-                fclose(it->second.file);
-                it->second.file = NULL;
-
-            }
+        } else { // invalid entry, erase it
             it = series_list.erase(it);
         }
 
@@ -131,9 +126,34 @@ bool BSeries::trim(){
 
 
 
-int BSeries::write(uint32_t key, void *value,BType type, uint32_t timestamp = 0){
 
-  ENTRY *series = &series_list[key];
+/// Any modifications to the map (New entries or deleted entries have to lock)
+
+int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timestamp = 0){
+
+   debug("Looking Up Key: %d\n",key);
+
+
+
+    index_access.lock();
+   ENTRY *series = series_list[key];
+   if(series == NULL){
+      debug("No Entry Found, Creating new one\n");
+      series = (ENTRY*)malloc(sizeof(ENTRY));
+      memset(series,0,sizeof(ENTRY));
+      if(series == NULL){
+         error("Malloc Failed, Fatal!\n");
+           index_access.unlock();
+           return -99999;
+
+      }
+      debug("Malloc Success\n");
+      series_list[key] = series;
+
+   }
+   index_access.unlock();
+
+
   uint32_t status = NO_ERROR;
 
   if(!timestamp)
@@ -179,7 +199,7 @@ retry:
 
             if(size != 1){
                 /// Create header and continue write
-                if(!createSeries(series->file,&series->header,type)){ // attempt to create header, if failure, return error
+                if(!createSeries(series->file,&series->header,datasize)){ // attempt to create header, if failure, return error
                     fclose(series->file);
                     error("\t CREATE_NEW_HEADER_FAIL\n");
                     status = CREATE_NEW_HEADER_FAIL;
@@ -200,7 +220,7 @@ retry:
 
         /// If we reach this point, we have a valid header and our pointer is on the first data point in the series
 
-        int64_t pos = sizeof(SERIES) + (((timestamp - series->header.timestamp)/series->header.interval)*series->header.datatype.structure.datasize);
+        int64_t pos = sizeof(SERIES) + (((timestamp - series->header.timestamp)/series->header.interval)* series->header.datasize);
         /// Calculate the position in the file (Byte) where we are going to write the data point,
         /// this is based on the start timestampfor the series and the number of seconds between points,
         /// the position is also offseted to account for the header size
@@ -213,7 +233,7 @@ retry:
             debug("\t Updated file size = %u\n",series->file_size);
         }
 
-        debug("\t Writing data @ %u\nfile size = %u\n",pos,series->file_size);
+        debug("\t Writing data @ %u\n\t file size = %u\n",pos,series->file_size);
         if(pos >= series->file_size){ // projected write position greater than file length, append more null points :) :)
 
             int64_t grow_by = (pos - series->file_size) + WRITE_AHEAD_SIZE; // Calculate how many bytes we are going to grow the file, we want WRITE_AHEAD_SIZE beyond the current requested write position
@@ -238,6 +258,8 @@ retry:
                 break;
             }
 
+            debug("\t freeing null buffer\n");
+
             free(nullFill); // Free our temporary buffer
             series->file_size += grow_by;
         }
@@ -250,10 +272,13 @@ retry:
             break;
         }
 
+
+        debug("\t seeking to current writing position: %d\n",pos);
         fseek(series->file,pos,SEEK_SET); // Seek to the current writing position, this is based on the timestamp and interval
 
-        size = fwrite(value,series->header.datatype.structure.datasize,1,series->file); // Write the data point
-        debug("\t Wrote %d point @ %d\n",size,pos);
+        debug("\t Datapoint Size = %d\n",series->header.datasize);
+        size = fwrite(value,series->header.datasize,1,series->file); // Write the data point
+        debug("\t Wrote %d points @ %d\n",size,pos);
 
 
         if(size != 1){ // Check that write completed with the correct number of bytes written
@@ -262,9 +287,9 @@ retry:
             status = DATA_POINT_WRITE_FAILURE;
             break;
         }
-
-        series->last_write = time(NULL);
         debug("\t Success\n");
+        series->last_write = time(NULL);
+
         status = NO_ERROR; // Return successful, don't close file
         break;
 
@@ -292,7 +317,11 @@ retry:
     break;
    } while (true);
 
+  debug("\t Unlocking Series mutex\n");
+
   series->access.unlock();
+
+   debug("\t Done\n");
   return status;
 
 
@@ -317,14 +346,36 @@ retry:
 
 
 
-int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n_points, int64_t *r_points, int64_t *seconds_per_point, int64_t *first_point_timestamp, BType *datatype, void** result){ // Returns number of points if successful or -1 if error
+int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n_points, int64_t *r_points, int64_t *seconds_per_point, int64_t *first_point_timestamp, uint32_t *datasize, void** result){ // Returns number of points if successful or -1 if error
 
 
     debug("Reading from series %u where time > %lu and time < %lu\n",key,start_time,end_time);
 
 
     uint32_t status = NO_ERROR;
-    ENTRY *series = &series_list[key];
+
+    debug("Looking Up Key: %d\n",key);
+
+    index_access.lock();
+    ENTRY *series = series_list[key];
+    if(series == NULL){
+       debug("No Entry Found, Creating new one\n");
+       series = (ENTRY*)malloc(sizeof(ENTRY));
+
+       if(series == NULL){
+          error("Malloc Failed, Fatal!\n");
+            index_access.unlock();
+            return -99999;
+       }
+
+       memset(series,0,sizeof(ENTRY));
+       debug("Malloc Success\n");
+       series_list[key] = series;
+    }
+
+    index_access.unlock();
+
+
 
     do {
         series->access.lock();
@@ -369,7 +420,19 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
         if(series->header.checksum != getChecksum(&series->header)){// cached checksum header is invalid, read it from the file
             error("\t INVALID CACHED HEADER, READING HEADER FROM FILE\n");
 
+            fseek(series->file,0,SEEK_SET);
             int size = fread((char*)&series->header,sizeof(series->header),1,series->file);
+
+            typedef struct _SERIES
+            {
+                 uint32_t version; // = 1, version code. only 1 currently valid
+                 uint32_t timestamp; // First point timestamp (Unix Epoch)
+                 uint32_t interval; // = 10 for every 10 seconds
+                 uint32_t datasize;
+                 uint32_t checksum; // = 1234567890 + ((version ^ timestamp) ^ (interval ^ datatype);
+            } SERIES;
+
+           debug("%u\n\tVersion: %lu\n\tTimestamp: %lu\n\tInverval: %lu\n\tDatasize: %lu\n\tChecksum: %lu\n\n   ",key,series->header.version,series->header.timestamp,series->header.interval,series->header.datasize,series->header.checksum);
 
 
             if(size != 1){
@@ -410,7 +473,9 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
 
         debug("start_time = %ld start_byte = %ld end_time = %ld points = %ld %d\n",start_time,start_pos,end_time,points,offset);
 
-        float *output = (float*)malloc(points*series->header.datatype.structure.datasize);
+        char *output = (char*)malloc(points*series->header.datasize);
+
+        debug("Point Size: %d\nPoints: %d\n",series->header.datasize,points);
 
 
         if(output == NULL){
@@ -419,14 +484,14 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
             break;
         }
 
-        memset(output,0xff,points*sizeof(float)); // Set to the null fill, for char a value of '0' is used, for float a value of 'FFFFFFFF' is used which represents 'Nan'
+        memset(output,0xff,points*series->header.datasize); // Set to the null fill, for char a value of '0' is used, for float a value of 'FFFFFFFF' is used which represents 'Nan'
 
-        fseek(series->file,((start_pos*series->header.datatype.structure.datasize)+sizeof(SERIES)),SEEK_SET);
-        *r_points  = fread(output+(offset*series->header.datatype.structure.datasize),series->header.datatype.structure.datasize,(points-offset),series->file);
+        fseek(series->file,((start_pos*series->header.datasize)+sizeof(SERIES)),SEEK_SET);
+        *r_points  = fread(output+(offset*series->header.datasize),series->header.datasize,(points-offset),series->file);
 
         *result = output;
         *n_points = points;
-        *datatype = series->header.datatype;
+        *datasize = series->header.datasize;
 
         status = NO_ERROR;
         break;
@@ -453,30 +518,35 @@ break;
 
 void BSeries::flush()
 {
+    this->index_access.lock();
     // Close all open files
     auto it = series_list.begin();
     while(it != series_list.end()){
-        if(it->second.file != NULL){
-            fflush(it->second.file);
+        if(it->second != NULL && it->second->file != NULL){
+            fflush(it->second->file);
         }
         it++;
     }
+    this->index_access.unlock();
 }
 
 
 
 void BSeries::close()
 {
+    this->index_access.lock();
     // Close all open files
     auto it = series_list.begin();
     while(it != series_list.end()){
-        if(it->second.file != NULL){
-            fclose(it->second.file);
-            it->second.file = NULL;
+        if(it->second != NULL){
+            if(it->second->file != NULL)
+            fclose(it->second->file);
 
+            delete it->second;
         }
         it++;
     }
+    this->index_access.unlock();
 }
 
 
