@@ -1,7 +1,7 @@
 #ifndef DEBUG_H
 #define DEBUG_H
 
-#define DEBUG
+#define WARN
 
 #ifdef DEBUG
 #define warn(...)  printf(__VA_ARGS__)

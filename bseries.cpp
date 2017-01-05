@@ -191,7 +191,7 @@ retry:
     if(series->file != NULL){
 
         if(series->header.checksum != getChecksum(&series->header)){// cached checksum header is invalid, read it from the file
-            error("\t INVALID CACHED HEADER, READING HEADER FROM FILE\n");
+            debug("\t INVALID CACHED HEADER, READING HEADER FROM FILE\n");
 
 
             size = fread((char*)&series->header,sizeof(series->header),1,series->file);
@@ -301,14 +301,14 @@ retry:
         series->file = fopen(filename,"ab");
 
         if(series->file == NULL){
-            warn("\t Failed to create file\n");
+            warn("\t Failed to create file %s\n",filename);
             status = CREATE_NEW_HEADER_FAIL;
             break;
         } else if(!tries){
             fclose(series->file);
             series->file = NULL;
             tries++;
-            warn("\t Attempting to create file\n");
+            debug("\t Attempting to create file\n");
             goto retry;
         }
 
@@ -418,7 +418,7 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
 
 
         if(series->header.checksum != getChecksum(&series->header)){// cached checksum header is invalid, read it from the file
-            error("\t INVALID CACHED HEADER, READING HEADER FROM FILE\n");
+            debug("\t INVALID CACHED HEADER, READING HEADER FROM FILE\n");
 
             fseek(series->file,0,SEEK_SET);
             int size = fread((char*)&series->header,sizeof(series->header),1,series->file);
