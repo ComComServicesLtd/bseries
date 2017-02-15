@@ -7,6 +7,7 @@
 #include <string.h>
 #include <thread>
 #include <mutex>
+#include <iostream>
 
 
 
@@ -61,20 +62,22 @@ typedef struct _SERIES
 
 typedef struct ENTRY
 {
-     FILE *file;
      SERIES header;
      mutex access;
      int64_t file_size;
      uint32_t last_write;
+     uint32_t last_commit;
+     uint32_t cache_start_timestamp;
+     char* write_ahead_cache;
 } ENTRY;
 
 
 
 
 
-#define WRITE_AHEAD_SIZE 4096
-#define SECONDS_PER_POINT 10
-#define MAX_FILES 10000
+//#define WRITE_AHEAD_SIZE 4096
+//#define SECONDS_PER_POINT 10
+//#define MAX_FILES 10000
 
 
 
@@ -84,6 +87,10 @@ class BSeries
 public:
     BSeries();
 
+    FILE* openFile(uint64_t key);
+    bool flushBuffer(ENTRY *entry, FILE *file);
+
+
     int createSeries(FILE *file, SERIES *series, uint32_t datasize);
     uint32_t getChecksum(SERIES *series);
 
@@ -91,9 +98,11 @@ public:
     int read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n_points, int64_t *r_points, int64_t *seconds_per_point, int64_t *first_point_timestamp, uint32_t *datasize, void **result);
 
     map<uint32_t,ENTRY*> series_list;
-    char *data_directory;
+    const char *data_directory;
 
-    int default_Seconds_Per_Point;
+    int write_ahead_size;
+    int default_seconds_per_point;
+    char default_null_fill_byte;
 
     void flush();
     void close();
@@ -105,6 +114,7 @@ public:
     mutex index_access;
 
 
+    bool shuttingDown;
 
     ~BSeries();
 };

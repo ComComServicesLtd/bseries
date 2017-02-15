@@ -4,15 +4,15 @@
 #define WARN
 
 #ifdef DEBUG
-#define warn(...)  printf(__VA_ARGS__)
-#define error(...) printf(__VA_ARGS__)
-#define debug(...) printf(__VA_ARGS__)
+#define _WARN(...)  printf(__VA_ARGS__)
+#define _ERROR(...) printf(__VA_ARGS__)
+#define _DEBUG(...) printf(__VA_ARGS__)
 #endif
 
 #ifdef WARN
-#define warn(...)  printf(__VA_ARGS__)
-#define error(...) printf(__VA_ARGS__)
-#define debug(...) // printf(__VA_ARGS__)
+#define _WARN(...)  printf(__VA_ARGS__)
+#define _ERROR(...) printf(__VA_ARGS__)
+#define _DEBUG(...) // printf(__VA_ARGS__)
 #endif
 
 #ifdef ERROR
