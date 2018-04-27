@@ -60,7 +60,7 @@ typedef struct _SERIES
 } SERIES;
 
 
-typedef struct ENTRY
+typedef struct
 {
      SERIES header;
      mutex access;
@@ -97,7 +97,7 @@ public:
     int write(uint32_t key, void *value, uint32_t datasize, uint32_t timestamp = 0);
     int read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n_points, int64_t *r_points, int64_t *seconds_per_point, int64_t *first_point_timestamp, uint32_t *datasize, void **result);
 
-    map<uint32_t,ENTRY*> series_list;
+    map<uint32_t,ENTRY> series_list;
     const char *data_directory;
 
     int write_ahead_size;

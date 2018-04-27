@@ -58,18 +58,13 @@ void BSeries::closeSeries(uint32_t max_age){
     while(it != series_list.end()){
 
 
-        if(it->second != NULL){
 
 
 
-            age = current_timestamp - it->second->last_write;
-            if(age > max_age ||  !it->second->last_write){
-                //if(it->second->file != NULL){
-                //    fclose(it->second->file);
-                //    delete it->second;
-                // }
+            age = current_timestamp - it->second.last_write;
+            if(age > max_age ||  !it->second.last_write){
 
-                // TODO, Flush buffer to disk, clear mutexes
+
                 it = series_list.erase(it);
             } else {
                 it++;
@@ -81,9 +76,7 @@ void BSeries::closeSeries(uint32_t max_age){
 
 
 
-        } else { // invalid entry, erase it
-            it = series_list.erase(it);
-        }
+
 
 
 
@@ -123,7 +116,7 @@ FILE* BSeries::openFile(uint64_t key, bool writeMode){
 
 bool BSeries::flushBuffer(ENTRY *series,FILE *file){
 
-    if(file == NULL)
+    if(file == NULL || series->write_ahead_cache == NULL)
         return false;
 
 
@@ -209,32 +202,12 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
 
     ENTRY *series;
 
-    try {
+   // if(series_list.find(key) == series_list.end()){
+   //     ENTRY _series;
+   //     series_list[key] = _series;
+   // }
 
-        series = series_list[key];
-
-    } catch (std::exception&e) {
-        cout << e.what() << endl;
-        index_access.unlock();
-        return -99999;
-    }
-
-
-
-    if(series == NULL){
-        _DEBUG("No Entry Found, Creating new one\n");
-        series = (ENTRY*)malloc(sizeof(ENTRY));
-        memset(series,0,sizeof(ENTRY));
-        if(series == NULL){
-            _ERROR("Series Malloc Failed, Fatal!\n");
-            index_access.unlock();
-            return -99999;
-        }
-        _DEBUG("Series Malloc Success\n");
-
-        series_list[key] = series;
-
-    }
+    series = &series_list[key];
 
     index_access.unlock();
 
@@ -511,34 +484,24 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
         _DEBUG("Looking Up Key: %d\n",key);
 
         index_access.lock();
-        series = series_list[key];
-        if(series == NULL){
-            _DEBUG("No Entry Found, Creating new one\n");
-            series = (ENTRY*)malloc(sizeof(ENTRY));
-
-            if(series == NULL){
-                _ERROR("Malloc Failed, Fatal!\n");
-                index_access.unlock();
-                status = MEMORY_ALLOCATION_FAILED;
-                break;
-            }
-
-            memset(series,0,sizeof(ENTRY));
-            _DEBUG("Malloc Success\n");
 
 
+       // if(series_list.find(key) == series_list.end()){
+       //     ENTRY _series;
+      //      series_list[key] = _series;
+      //  }
 
-            // Allocate write ahead cache if needed
-            if(!validateWriteAheadCache(series)){
-               _ERROR("\t WAL_MEMORY_ALLOCATION_FAILURE\n");
-               index_access.unlock();
-                status = WAL_MEMORY_ALLOCATION_FAILURE;
-                break;
-            }
+        series = &series_list[key];
 
 
-            series_list[key] = series;
+        // Allocate write ahead cache if needed
+        if(!validateWriteAheadCache(series)){
+           _ERROR("\t WAL_MEMORY_ALLOCATION_FAILURE\n");
+           index_access.unlock();
+            status = WAL_MEMORY_ALLOCATION_FAILURE;
+            break;
         }
+
 
         index_access.unlock();
 
@@ -822,16 +785,15 @@ void BSeries::flush()
     while(it != series_list.end()){
 
 
-        if(it->second != NULL){
-            it->second->access.lock(); // this will wait for any current writes to complete
+            it->second.access.lock(); // this will wait for any current writes to complete
 
             FILE *file = openFile(it->first,true);
             if(file != NULL){
                 _DEBUG("Flushing: %u\n",it->first);
-                this->flushBuffer(it->second,file);
+                this->flushBuffer(&it->second,file);
+                fclose(file);
             }
-            it->second->access.unlock();
-        }
+            it->second.access.unlock();
         it++;
     }
     this->index_access.unlock();
@@ -854,18 +816,13 @@ void BSeries::close()
     // Close all open files
     auto it = series_list.begin();
     while(it != series_list.end()){
-        if(it->second != NULL){
 
             _DEBUG("Closing: %u\n",it->first);
-            it->second->access.lock(); // Ensure nobody is accessing our resource
-            if(it->second->write_ahead_cache != NULL){
-                free(it->second->write_ahead_cache);
+            it->second.access.lock(); // Ensure nobody is accessing our resource
+            if(it->second.write_ahead_cache != NULL){
+                free(it->second.write_ahead_cache);
             }
 
-            free(it->second);
-
-            // delete it->second;
-        }
         it++;
     }
     this->index_access.unlock();
