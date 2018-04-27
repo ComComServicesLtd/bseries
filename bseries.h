@@ -87,7 +87,7 @@ class BSeries
 public:
     BSeries();
 
-    FILE* openFile(uint64_t key);
+    FILE* openFile(uint64_t key, bool writeMode);
     bool flushBuffer(ENTRY *entry, FILE *file);
 
 
@@ -117,6 +117,7 @@ public:
     bool shuttingDown;
 
     ~BSeries();
+    bool validateWriteAheadCache(ENTRY *series);
 };
 
 #endif // BSERIES_H
