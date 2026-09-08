@@ -1565,6 +1565,40 @@ int BSeries::seriesInfo(uint32_t key, SERIES *header, int64_t *file_size){
 }
 
 
+bool BSeries::seriesShape(uint32_t key, SERIES *header_out){
+
+    if(header_out == NULL || shuttingDown)
+        return false;
+
+    // The common case on a write path: the series is already open, so its header
+    // is in memory and this costs a lock rather than a file.
+    index_access.lock();
+
+    map<uint32_t,ENTRY>::iterator it = series_list.find(key);
+
+    if(it == series_list.end()){
+        index_access.unlock();
+        return seriesInfo(key,header_out,NULL) == NO_ERROR;
+    }
+
+    it->second.access.lock();
+    index_access.unlock();
+
+    bool bound = it->second.datasize != 0 &&
+                 it->second.header.checksum == getChecksum(&it->second.header);
+
+    if(bound)
+        *header_out = it->second.header;
+
+    it->second.access.unlock();
+
+    if(bound)
+        return true;
+
+    return seriesInfo(key,header_out,NULL) == NO_ERROR;
+}
+
+
 /// Lists the series present in data_directory, in ascending key order, starting
 /// after the given key. Returns the number of keys appended to the vector.
 ///

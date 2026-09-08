@@ -265,6 +265,16 @@ public:
     int createSeriesFile(uint32_t key, uint32_t interval, uint8_t datatype, uint8_t datasize, uint32_t start_timestamp = 0);
     int deleteSeries(uint32_t key);
     int seriesInfo(uint32_t key, SERIES *header, int64_t *file_size);
+
+    /// The header of a series that is already open, without touching the disk.
+    /// Falls back to reading the file only when the series is not in memory, which
+    /// on a write path means the first point after a cold start or an eviction.
+    ///
+    /// Use this rather than seriesInfo() wherever a write needs to know a series'
+    /// shape: seriesInfo() opens, reads, seeks and closes every time it is called,
+    /// which on a one point per series ingest is several syscalls per point for
+    /// information the entry is already holding.
+    bool seriesShape(uint32_t key, SERIES *header_out);
     int listSeriesKeys(vector<uint32_t> *keys, uint32_t after, int limit);
 
     void flush();

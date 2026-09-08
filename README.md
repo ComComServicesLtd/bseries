@@ -337,6 +337,49 @@ Detection costs nothing on the cached write path, where the slot is already in
 memory, and one point read on the direct path. `write()` only does it when a
 caller passes an `overwrote` flag, so the library's own hot path is unchanged.
 
+### What a write costs
+
+Points are appended into an in memory buffer and only reach the disk when that
+buffer fills, so a steady ingest does no file I/O at all for most points.
+Measured on a 500 series, one point per series ingest over HTTP:
+
+```
+100000 points:  read syscalls 0   write syscalls 0   disk bytes 0
+```
+
+The buffer flushes once every `write_ahead_size` points per series, and on a clean
+shutdown. Straight against the library, 100000 points into one series is 24 write
+syscalls — one per 4096 points.
+
+Getting there needs `seriesShape()` rather than `seriesInfo()` on any write path.
+`seriesInfo()` reads the header off disk deliberately, so probing unknown keys
+cannot grow the in memory index; calling it per point cost an open, two reads, a
+seek and a close for something the open series already knew.
+
+### Durability: what an unclean shutdown loses
+
+The other side of that: points sit in memory until their buffer fills. A `kill -9`
+or a power loss discards whatever has not flushed. Demonstrated — 3000 points
+written and readable, the file still 20 bytes, and nothing left after a restart.
+
+How long points sit there depends on the series interval, because a buffer holds
+`write_ahead_size` **points**, not seconds:
+
+| interval | points held before a flush | worst case age of unflushed data |
+|---|---|---|
+| 1s | 4096 | 1.1 hours |
+| 10s | 4096 | 11.4 hours |
+| 60s | 4096 | 68 hours |
+| 5m | 4096 | 342 hours |
+
+`SIGTERM` and `SIGINT` flush everything, so a normal restart loses nothing. The
+maintenance thread flushes series that have gone idle for `series_max_idle`, but an
+**actively written** series is never flushed early — it is the busy series whose
+data is at risk, not the quiet one.
+
+Lower `write_ahead_size` to trade syscalls for exposure: it is points per flush, so
+halving it halves both the buffered window and the points per disk write.
+
 ### Timestamps and how far a series can grow
 
 A series created by a write is stamped with **that write's timestamp**, so the

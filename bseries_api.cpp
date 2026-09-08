@@ -2157,9 +2157,11 @@ void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_
 bool BSeriesApi::resolveWriteShape(BSeries *db, uint32_t key, size_t body_bytes, uint32_t *datasize, int64_t *interval, std::string *error){
 
     SERIES header;
-    int64_t file_size = 0;
 
-    if(db->seriesInfo(key,&header,&file_size) == NO_ERROR){
+    // seriesShape rather than seriesInfo: this runs once per point on an ingest
+    // path, and the open/read/seek/close of reading the header back off disk each
+    // time is several syscalls for something the open series already knows.
+    if(db->seriesShape(key,&header)){
 
         *datasize = bsHeaderDataSize(&header);
         *interval = (int64_t)header.interval;
@@ -2244,9 +2246,8 @@ int BSeriesApi::writePoints(BSeries *db, uint32_t key, const std::string &points
 bool BSeriesApi::nearestSlotTime(BSeries *db, uint32_t key, long long when, long long *slot_time){
 
     SERIES header;
-    int64_t file_size = 0;
 
-    if(db->seriesInfo(key,&header,&file_size) != NO_ERROR || header.interval == 0){
+    if(!db->seriesShape(key,&header) || header.interval == 0){
         *slot_time = when;
         return false;
     }
