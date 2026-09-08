@@ -230,7 +230,53 @@ int main(int argc, char **argv){
         CHECK(bodyHas(r,"\"real_points\":2"), "gaps not counted as real");
     }
 
-    printf("[8] delete and list\n");
+    printf("[8] multi series read\n");
+    {
+        // a second float32 series alongside 10500, plus a uint8 one
+        REPLY r = request("POST","/v1/series/10501?type=float32&interval=60&start=1700000000","read-write-key");
+        CHECK(r.status==201, "create a second float32 series");
+        r = request("POST","/v1/series/10501/data?timestamp=1700000000","read-write-key","0000c8420000ca42");
+        CHECK(r.status==200 && bodyHas(r,"\"points_written\":2"), "seed it");
+
+        r = request("GET","/v1/data?keys=10500,10501&start=1700000000&end=1700000300","read-only-key");
+        CHECK(r.status==200, "multi read succeeds");
+        CHECK(bodyHas(r,"\"count\":2"), "two datasets returned");
+        CHECK(bodyHas(r,"\"key\":10500") && bodyHas(r,"\"key\":10501"), "both keys present");
+        CHECK(bodyHas(r,"0000a4410000aa410000b041"), "first dataset's blob");
+        CHECK(bodyHas(r,"0000c8420000ca42"), "second dataset's blob");
+        // one blob per dataset, not one JSON value per point
+        CHECK(!bodyHas(r,"\"points\":["), "points are not expanded into an array");
+
+        r = request("GET","/v1/data?keys=1-3&start=1700000000&end=1700000300","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"count\":3"), "a key range expands");
+        CHECK(bodyHas(r,"series_not_found"), "missing series become error entries");
+
+        r = request("GET","/v1/data?keys=1-3,10500&start=1700000000&end=1700000300&skip_missing=1","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"count\":1"), "skip_missing drops the absent ones");
+        CHECK(!bodyHas(r,"series_not_found"), "and reports no errors");
+
+        r = request("GET","/v1/data?start=1700000000","read-only-key");
+        CHECK(r.status==400 && bodyHas(r,"keys"), "keys is required");
+        r = request("GET","/v1/data?keys=notakey&start=1700000000","read-only-key");
+        CHECK(r.status==400, "a bad key is 400");
+        r = request("GET","/v1/data?keys=9-1&start=1700000000","read-only-key");
+        CHECK(r.status==400, "a backwards range is 400");
+        r = request("GET","/v1/data?keys=0-4000000000&start=1700000000","read-only-key");
+        CHECK(r.status==400, "a range past the cap is refused, not expanded");
+
+        // the point budget is shared, not per series
+        r = request("GET","/v1/data?keys=10500,10501&start=1&end=1700000000","read-only-key");
+        CHECK(r.status==413 && bodyHas(r,"range_too_large"), "the shared budget applies across series");
+
+        r = request("GET","/v1/data?keys=10500","read-only-key");
+        CHECK(r.status==400 && bodyHas(r,"start"), "start still required");
+        r = request("POST","/v1/data?keys=10500&start=1700000000","read-write-key");
+        CHECK(r.status==405, "POST to the multi read endpoint is 405");
+        r = request("GET","/v1/data?keys=10500&start=1700000000&end=1700000300",NULL);
+        CHECK(r.status==401, "multi read needs a key");
+    }
+
+    printf("[9] delete and list\n");
     {
         REPLY r = request("GET","/v1/series?limit=100","read-only-key");
         CHECK(r.status==200 && bodyHas(r,"10500") && bodyHas(r,"30001"), "both series listed");
@@ -243,7 +289,7 @@ int main(int argc, char **argv){
         CHECK(r.status==404, "deleting twice is 404");
     }
 
-    printf("[9] method handling\n");
+    printf("[10] method handling\n");
     {
         REPLY r = request("DELETE","/v1/series","read-write-key");
         CHECK(r.status==405, "DELETE on the collection is 405");

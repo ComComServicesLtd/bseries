@@ -80,6 +80,7 @@ because a series holds raw binary of whatever width it was defined with.
 | POST | `/v1/series/{key}?type=&interval=&start=` | write | create |
 | DELETE | `/v1/series/{key}` | write | delete |
 | GET | `/v1/series/{key}/data?start=&end=` | read | read a range |
+| GET | `/v1/data?keys=&start=&end=` | read | read a range across several series |
 | POST | `/v1/series/{key}/data?timestamp=` | write | write points |
 
 `start` and `end` are unix timestamps; `end` defaults to now. A write body is the
@@ -102,6 +103,37 @@ $ curl -H 'X-API-Key: $READ_KEY' \
 {"key":10500,"type":"float32","interval":60,"n_points":5,"real_points":3,
  "null_fill":"ffffffff","data":"0000a4410000aa4100000c42ffffffffffffffff"}
 ```
+
+### Reading several series at once
+
+`/v1/data` takes `keys` as a comma separated list, which may contain `N-M` ranges,
+and returns one dataset object per series:
+
+```
+$ curl -H 'X-API-Key: $READ_KEY' \
+    'localhost:8086/v1/data?keys=10500-10502&start=1700000000&end=1700000240'
+{"start":1700000000,"end":1700000240,"series":[
+  {"key":10500,"type":"float32","interval":60,"n_points":4,"real_points":3,
+   "null_fill":"ffffffff","data":"0000a4410000aa410000b041ffffffff"},
+  {"key":10501, ... },
+  {"key":10502, ... }],
+ "count":3}
+```
+
+The JSON array holds one entry per *series*, never one per point: a day of one
+second points is 86400 values, and wrapping each of those in JSON punctuation costs
+several times what the data itself does. Each series' whole range is one hex blob,
+the same as the single series endpoint returns.
+
+A series that cannot be read becomes an entry carrying an `error` rather than
+failing the request, so one missing key out of two hundred does not cost the caller
+the other hundred and ninety nine. Pass `skip_missing=1` to leave absent series out
+of the array entirely — useful when `keys` is a wide range over a sparse key space.
+
+`max_points_per_read` is a budget for the whole request rather than per series,
+otherwise asking for more series would multiply the cap. `max_series_per_read`
+bounds how many keys one request may name, and a range is checked against it before
+being expanded, so `keys=0-4000000000` is refused rather than materialised.
 
 ### Gaps in a response
 

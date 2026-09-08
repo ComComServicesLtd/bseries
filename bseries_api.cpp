@@ -210,6 +210,74 @@ static bool parseSigned(const std::string &text, long long *out){
 }
 
 
+/// Parses "10500", "1-500" or "1-50,10500,20000" into an explicit key list.
+///
+/// A range is expanded, so it is checked against the cap before anything is
+/// allocated: keys=0-4000000000 must not become four billion entries.
+
+static bool parseKeyList(const std::string &text, int max_keys, std::vector<uint32_t> *keys, std::string *error_out){
+
+    size_t position = 0;
+
+    while(position <= text.size()){
+
+        size_t comma = text.find(',',position);
+        if(comma == std::string::npos)
+            comma = text.size();
+
+        std::string item = text.substr(position,comma - position);
+        position = comma + 1;
+
+        if(item.empty())
+            continue;
+
+        unsigned long first = 0, last = 0;
+        size_t dash = item.find('-');
+
+        if(dash == std::string::npos){
+
+            if(!parseUnsigned(item,&first) || first > 0xFFFFFFFFuL){
+                *error_out = "'" + item + "' is not a series key";
+                return false;
+            }
+
+            last = first;
+
+        } else {
+
+            if(!parseUnsigned(item.substr(0,dash),&first) ||
+               !parseUnsigned(item.substr(dash + 1),&last) ||
+               first > 0xFFFFFFFFuL || last > 0xFFFFFFFFuL){
+                *error_out = "'" + item + "' is not a key range";
+                return false;
+            }
+
+            if(last < first){
+                *error_out = "'" + item + "' runs backwards";
+                return false;
+            }
+        }
+
+        if(last - first + 1 > (unsigned long)max_keys || keys->size() + (last - first + 1) > (size_t)max_keys){
+            char message[192];
+            snprintf(message,sizeof(message),"more than %d series requested, ask for fewer",max_keys);
+            *error_out = message;
+            return false;
+        }
+
+        for(unsigned long key = first; key <= last; key++)
+            keys->push_back((uint32_t)key);
+    }
+
+    if(keys->empty()){
+        *error_out = "no series keys were given";
+        return false;
+    }
+
+    return true;
+}
+
+
 /// Splits a path into its non empty segments.
 
 static std::vector<std::string> splitPath(const std::string &path){
@@ -247,6 +315,7 @@ void apiConfigDefaults(API_CONFIG *config){
     config->write_key = "";
     config->cors_origins.clear();
     config->max_points_per_read = 1000000;
+    config->max_series_per_read = 500;
     config->max_body_bytes = 1024 * 1024;
     config->max_connections = 64;
     config->write_ahead_size = 4096;
@@ -308,6 +377,7 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out){
         else if(key == "cors_origin")                  config->cors_origins.push_back(text);
         else if(key == "port"                     && parseUnsigned(text,&number)) config->port = (int)number;
         else if(key == "max_points_per_read"      && parseUnsigned(text,&number)) config->max_points_per_read = (int)number;
+        else if(key == "max_series_per_read"      && parseUnsigned(text,&number)) config->max_series_per_read = (int)number;
         else if(key == "max_body_bytes"           && parseUnsigned(text,&number)) config->max_body_bytes = (int)number;
         else if(key == "max_connections"          && parseUnsigned(text,&number)) config->max_connections = (int)number;
         else if(key == "write_ahead_size"         && parseUnsigned(text,&number)) config->write_ahead_size = (int)number;
@@ -462,6 +532,21 @@ void BSeriesApi::route(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     if(segments[1] == "health" && segments.size() == 2){
         handleHealth(request,response); // unauthenticated, exposes no data
+        return;
+    }
+
+    // /v1/data - several series over one time range
+    if(segments[1] == "data" && segments.size() == 2){
+
+        if(request.method != "GET"){
+            jsonError(response,405,"method_not_allowed","use GET to read series data");
+            return;
+        }
+
+        if(!authorise(request,false,response))
+            return;
+
+        handleMultiRead(request,response);
         return;
     }
 
@@ -737,64 +822,27 @@ void BSeriesApi::handleDeleteSeries(uint32_t key, HTTP_RESPONSE &response){
 }
 
 
-void BSeriesApi::handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+/// Builds the JSON object for one series over one time range, data blob and all.
+///
+/// The whole range comes back as a single hex blob rather than a point per array
+/// element: a day of one second points is 86400 values, and wrapping each in JSON
+/// punctuation costs several times what the data itself does. The array in a multi
+/// series response holds one of these objects per series, not one per point.
+///
+/// Returns a database status. On NO_ERROR the object is appended to out.
 
-    std::string start_text = httpQueryParam(request,"start");
-    std::string end_text = httpQueryParam(request,"end");
+int BSeriesApi::buildSeriesData(uint32_t key, long long start_time, long long end_time, std::string &out){
 
-    long long start_time = 0;
-    long long end_time = 0;
-
-    if(start_text.empty()){
-        jsonError(response,400,"bad_parameter","start is required, as a unix timestamp");
-        return;
-    }
-
-    if(!parseSigned(start_text,&start_time) || start_time <= 0){
-        jsonError(response,400,"bad_parameter","start must be a positive unix timestamp");
-        return;
-    }
-
-    if(end_text.empty()){
-        end_time = (long long)time(NULL);
-    } else if(!parseSigned(end_text,&end_time) || end_time <= 0){
-        jsonError(response,400,"bad_parameter","end must be a positive unix timestamp");
-        return;
-    }
-
-    if(end_time < start_time){
-        jsonError(response,400,"invalid_time_range","end must not be before start");
-        return;
-    }
+    SERIES header;
+    int64_t file_size = 0;
 
     // The series has to exist before read() is called: read() creates an in memory
     // entry for whatever key it is handed, so probing unknown keys over HTTP would
     // otherwise be a way to grow the index without bound.
-    SERIES header;
-    int64_t file_size = 0;
-
     int info = db->seriesInfo(key,&header,&file_size);
 
-    if(info != NO_ERROR){
-        jsonDatabaseError(response,info,"reading the series header");
-        return;
-    }
-
-    // Bound the response before allocating anything. The library will happily
-    // allocate a point for every interval in the range asked for.
-    if(header.interval > 0){
-
-        long long points = (end_time - start_time) / (long long)header.interval;
-
-        if(points > (long long)config.max_points_per_read){
-            char message[256];
-            snprintf(message,sizeof(message),
-                     "the range covers %lld points, the limit is %d; narrow start and end",
-                     points,config.max_points_per_read);
-            jsonError(response,413,"range_too_large",message);
-            return;
-        }
-    }
+    if(info != NO_ERROR)
+        return info;
 
     int64_t n_points = 0, real_points = 0, seconds_per_point = 0, first_point_timestamp = 0;
     uint32_t datasize = 0;
@@ -807,22 +855,20 @@ void BSeriesApi::handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_
 
     if(rc != NO_ERROR){
         if(result) delete[] (char*)result;
-        jsonDatabaseError(response,rc,"reading points");
-        return;
+        return rc;
     }
 
-    unsigned char fill = 0xFF;
-    {
-        // The fill actually used for this series, taken from the entry the read
-        // just bound rather than guessed from the type.
-        SERIES_DEFINITION definition;
-        if(db->definitionForKey(key,&definition) && definition.datasize == datasize)
-            fill = definition.null_fill_byte;
-        else if(header.version == SERIES_VERSION_TYPED)
-            fill = bsTypeNullFill(datatype,(uint8_t)datasize);
-        else
-            fill = (unsigned char)db->default_null_fill_byte;
-    }
+    // The fill actually in use for this series, rather than one guessed from the
+    // type: a definition can override it.
+    unsigned char fill;
+    SERIES_DEFINITION definition;
+
+    if(db->definitionForKey(key,&definition) && definition.datasize == datasize)
+        fill = definition.null_fill_byte;
+    else if(header.version == SERIES_VERSION_TYPED)
+        fill = bsTypeNullFill(datatype,(uint8_t)datasize);
+    else
+        fill = (unsigned char)db->default_null_fill_byte;
 
     // real_points from the library counts every point the file and cache windows
     // cover, gaps included. Count the points that differ from the fill instead, so
@@ -853,26 +899,206 @@ void BSeriesApi::handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_
 
     snprintf(head,sizeof(head),
         "{\"key\":%lu,\"type\":\"%s\",\"datasize\":%lu,\"interval\":%lld,"
-        "\"start\":%lld,\"end\":%lld,\"first_point_timestamp\":%lld,"
-        "\"n_points\":%lld,\"real_points\":%lld,\"null_fill\":\"%s\",\"data\":\"",
+        "\"first_point_timestamp\":%lld,\"n_points\":%lld,\"real_points\":%lld,"
+        "\"null_fill\":\"%s\",\"data\":\"",
         (unsigned long)key,
         bsTypeName(datatype,(uint8_t)datasize),
         (unsigned long)datasize,
         (long long)seconds_per_point,
-        start_time,
-        end_time,
         (long long)first_point_timestamp,
         (long long)n_points,
         (long long)recorded,
         nullFillPattern(fill,datasize).c_str());
 
-    response.status = 200;
-    response.body = head;
-    response.body += apiToHex(result,(size_t)(n_points * datasize));
-    response.body += "\"}";
+    out += head;
+    out += apiToHex(result,(size_t)(n_points * datasize));
+    out += "\"}";
 
     delete[] (char*)result;
+
+    return NO_ERROR;
 }
+
+
+/// Reads start and end from the query string. end defaults to now.
+
+bool BSeriesApi::readTimeRange(const HTTP_REQUEST &request, HTTP_RESPONSE &response, long long *start_time, long long *end_time){
+
+    std::string start_text = httpQueryParam(request,"start");
+    std::string end_text = httpQueryParam(request,"end");
+
+    if(start_text.empty()){
+        jsonError(response,400,"bad_parameter","start is required, as a unix timestamp");
+        return false;
+    }
+
+    if(!parseSigned(start_text,start_time) || *start_time <= 0){
+        jsonError(response,400,"bad_parameter","start must be a positive unix timestamp");
+        return false;
+    }
+
+    if(end_text.empty()){
+        *end_time = (long long)time(NULL);
+    } else if(!parseSigned(end_text,end_time) || *end_time <= 0){
+        jsonError(response,400,"bad_parameter","end must be a positive unix timestamp");
+        return false;
+    }
+
+    if(*end_time < *start_time){
+        jsonError(response,400,"invalid_time_range","end must not be before start");
+        return false;
+    }
+
+    return true;
+}
+
+
+/// How many points the range covers for one series, or 0 if it cannot be read.
+
+int64_t BSeriesApi::pointsInRange(uint32_t key, long long start_time, long long end_time){
+
+    SERIES header;
+    int64_t file_size = 0;
+
+    if(db->seriesInfo(key,&header,&file_size) != NO_ERROR)
+        return 0;
+
+    if(header.interval == 0)
+        return 0;
+
+    return (int64_t)((end_time - start_time) / (long long)header.interval);
+}
+
+
+void BSeriesApi::handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+
+    long long start_time = 0, end_time = 0;
+
+    if(!readTimeRange(request,response,&start_time,&end_time))
+        return;
+
+    // Bound the response before allocating anything. The library will happily
+    // allocate a point for every interval in the range asked for.
+    int64_t points = pointsInRange(key,start_time,end_time);
+
+    if(points > (int64_t)config.max_points_per_read){
+        char message[256];
+        snprintf(message,sizeof(message),
+                 "the range covers %lld points, the limit is %d; narrow start and end",
+                 (long long)points,config.max_points_per_read);
+        jsonError(response,413,"range_too_large",message);
+        return;
+    }
+
+    std::string object;
+    int rc = buildSeriesData(key,start_time,end_time,object);
+
+    if(rc != NO_ERROR){
+        jsonDatabaseError(response,rc,"reading points");
+        return;
+    }
+
+    char head[256];
+    snprintf(head,sizeof(head),"{\"start\":%lld,\"end\":%lld,",start_time,end_time);
+
+    // The single series response carries the range alongside the series object's
+    // own fields, flattened, so it keeps the shape it has always had.
+    response.status = 200;
+    response.body = head;
+    response.body += object.substr(1); // drop the object's opening brace
+}
+
+
+/// Several series over one time range, as an array of dataset objects.
+///
+/// A series that cannot be read becomes an entry carrying an error rather than
+/// failing the whole request, because one missing key out of two hundred should
+/// not cost the caller the other hundred and ninety nine.
+
+void BSeriesApi::handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+
+    long long start_time = 0, end_time = 0;
+
+    if(!readTimeRange(request,response,&start_time,&end_time))
+        return;
+
+    std::string keys_text = httpQueryParam(request,"keys");
+
+    if(keys_text.empty()){
+        jsonError(response,400,"bad_parameter","keys is required, for example keys=10500,10501 or keys=1-500");
+        return;
+    }
+
+    std::vector<uint32_t> keys;
+    std::string parse_error;
+
+    if(!parseKeyList(keys_text,config.max_series_per_read,&keys,&parse_error)){
+        jsonError(response,400,"bad_parameter",parse_error);
+        return;
+    }
+
+    bool skip_missing = false;
+    std::string skip_text = httpQueryParam(request,"skip_missing");
+
+    if(!skip_text.empty() && skip_text != "0" && skip_text != "false")
+        skip_missing = true;
+
+    // The point budget is shared across the whole request. Applying it per series
+    // would let a caller multiply it by the number of series they ask for.
+    int64_t total_points = 0;
+
+    for(size_t i = 0; i < keys.size(); i++)
+        total_points += pointsInRange(keys[i],start_time,end_time);
+
+    if(total_points > (int64_t)config.max_points_per_read){
+        char message[256];
+        snprintf(message,sizeof(message),
+                 "the request covers %lld points across %lu series, the limit is %d; "
+                 "narrow the range or ask for fewer series",
+                 (long long)total_points,(unsigned long)keys.size(),config.max_points_per_read);
+        jsonError(response,413,"range_too_large",message);
+        return;
+    }
+
+    char head[256];
+    snprintf(head,sizeof(head),"{\"start\":%lld,\"end\":%lld,\"series\":[",start_time,end_time);
+
+    response.status = 200;
+    response.body = head;
+
+    size_t returned = 0;
+
+    for(size_t i = 0; i < keys.size(); i++){
+
+        std::string object;
+        int rc = buildSeriesData(keys[i],start_time,end_time,object);
+
+        if(rc != NO_ERROR){
+
+            if(skip_missing && (rc == SERIES_NOT_FOUND || rc == FAILED_TO_OPEN_FILE))
+                continue;
+
+            char entry[256];
+            snprintf(entry,sizeof(entry),
+                     "{\"key\":%lu,\"error\":\"%s\",\"status\":%d}",
+                     (unsigned long)keys[i],
+                     (rc == SERIES_NOT_FOUND || rc == FAILED_TO_OPEN_FILE) ? "series_not_found" : "database_error",
+                     rc);
+            object = entry;
+        }
+
+        if(returned > 0)
+            response.body += ",";
+
+        response.body += object;
+        returned++;
+    }
+
+    char tail[128];
+    snprintf(tail,sizeof(tail),"],\"count\":%lu}",(unsigned long)returned);
+    response.body += tail;
+}
+
 
 
 void BSeriesApi::handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){

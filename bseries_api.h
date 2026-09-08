@@ -42,7 +42,8 @@ typedef struct {
     /// blocks browser callers and is the right default for a server side client.
     std::vector<std::string> cors_origins;
 
-    int max_points_per_read;
+    int max_points_per_read;   // shared across every series in one request
+    int max_series_per_read;
     int max_body_bytes;
     int max_connections;
     int write_ahead_size;
@@ -87,6 +88,11 @@ private:
     void handleCreateSeries(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleDeleteSeries(uint32_t key, HTTP_RESPONSE &response);
     void handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+
+    int buildSeriesData(uint32_t key, long long start_time, long long end_time, std::string &out);
+    bool readTimeRange(const HTTP_REQUEST &request, HTTP_RESPONSE &response, long long *start_time, long long *end_time);
+    int64_t pointsInRange(uint32_t key, long long start_time, long long end_time);
     void handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 };
 
