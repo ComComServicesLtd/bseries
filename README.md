@@ -112,6 +112,80 @@ Shutdown flushes every buffer, so give the container time to stop:
 `stop_grace_period` in compose, or `--stop-timeout` on `docker run`. The default
 10 seconds is enough for a normal database.
 
+### On MikroTik RouterOS
+
+A router is a good place for this: it already knows the numbers worth recording,
+and a 1.2MB static binary fits on hardware that has no room for a real database.
+
+```
+./tools/build-mikrotik.sh          # arm64; pass linux/arm or linux/amd64 otherwise
+scp -O bseries-arm64.tar <router>:
+```
+
+then edit and apply `mikrotik.example.rsc`. Check the target first with
+`/system resource print`: `architecture-name` is `arm64` for most recent models,
+`arm` for older 32 bit ones. Verified on a hAP ax² running RouterOS 7.24.2, where
+the container unpacks to 1.2MB and idles around 580KB of memory.
+
+**The image has to be repacked before RouterOS will read it.** Docker has not
+written the old `layer.tar`-per-directory format since the containerd image store
+became the default — buildx emits an OCI layout with gzipped layers, and
+`--output type=docker` does not change that. RouterOS reads only the old layout,
+and the failure is unhelpfully late: the container is created, then marked `F`
+with `could not load next layer`. `tools/oci-to-docker-archive.py` converts one to
+the other, and `build-mikrotik.sh` runs it for you. Build attestations have to go
+too — `--provenance=false --sbom=false` — since RouterOS cannot match them to a
+platform.
+
+**`Dockerfile.mikrotik` runs as root, unlike the main image.** Not an oversight:
+RouterOS mounts a directory out of its own flash, owned by root, and offers
+neither a shell nor `chown`, so a uid 10001 process cannot write its own
+database. Root is confined to the container's namespace, and the process still
+writes nothing outside `/data`.
+
+**Keep the database on a mount.** `/container/mounts` puts it on the router's
+flash, where it survives `/container/remove` and an image upgrade; the container's
+own layer does not. That flash has a limited erase budget, so the shipped hour
+between flushes matters more here than it does on a server — `BSERIES_FLUSH_INTERVAL`
+is the dial, and lowering it costs write cycles.
+
+Two RouterOS parameter names are easy to get wrong: mounts are declared with
+`list=`, not `name=`, and attached to a container with `mountlists=`, not
+`mounts=`. Both fail with a bare `bad parameter`.
+
+### The admin page
+
+`bseriesd` serves a small Vue page at `/` for managing tables, series, keys and
+the runtime settings. Point a browser at the database and sign in with a write
+key; there is nothing to install and no second server to run.
+
+**It is served by the database itself, and that is the whole point.** A page
+hosted anywhere else is a different origin, so every call it made would need
+`cors_origin` set and would carry the browser's preflight along with it. Served
+from `bseriesd`, the requests are same origin and none of that arises.
+
+**It is compiled into the binary**, so the scratch image still holds one file and
+there is still nothing to mount. `web/` holds the source — the page and a
+vendored copy of Vue — and `tools/embed.cpp` turns them into `web_assets.cpp`.
+The generator is C++ rather than a script so that building still needs nothing
+but a compiler and make. After editing anything under `web/`:
+
+```
+make web && make
+```
+
+Vue is vendored rather than loaded from a CDN deliberately: this is the page you
+reach for when a network is misbehaving, and it should not need that network to
+render. It costs about 200KB of binary.
+
+**The page itself is unauthenticated**, which it has to be — it is the thing a key
+is typed into. It ships no data of its own; everything it displays comes from a
+later call carrying the key. The key lives in `sessionStorage`, so it goes away
+when the tab closes and never reaches the URL or the server's log.
+
+There is still no TLS, so a key typed into this page crosses the network in
+clear. Reach it over the loopback, a trusted interface, or a reverse proxy.
+
 ### As a library
 
 `make lib` builds `libbseries.a`, and `make install-lib` installs it with the

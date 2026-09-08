@@ -1,0 +1,435 @@
+<!doctype html>
+<!--
+  bseries admin.
+
+  Served by bseriesd itself, so every request below is same origin and no
+  cors_origin needs setting. Vue is vendored beside this file rather than pulled
+  from a CDN: this is the page you reach for when a network is misbehaving, and
+  it should not need that network to render.
+
+  Both files are compiled into the binary by tools/embed-web.py. Edit this, run
+  `make web`, rebuild.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bseries</title>
+<script src="/admin/vue.global.prod.js"></script>
+<style>
+  :root { color-scheme: light dark; --line:#8883; --bad:#c0392b; --good:#1e8449; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 system-ui, sans-serif; }
+  main { max-width:64rem; margin:0 auto; padding:1rem; }
+  h1 { font-size:1.1rem; margin:0; }
+  h2 { font-size:.95rem; margin:1.5rem 0 .5rem; }
+  header { display:flex; align-items:center; gap:1rem; border-bottom:1px solid var(--line); padding-bottom:.75rem; }
+  header .sp { margin-left:auto; }
+  nav { display:flex; gap:.25rem; margin:1rem 0; flex-wrap:wrap; }
+  nav button { border:1px solid var(--line); background:none; color:inherit; padding:.35rem .8rem; border-radius:.25rem; cursor:pointer; font:inherit; }
+  nav button.on { background:#8882; font-weight:600; }
+  button { font:inherit; cursor:pointer; }
+  .act { border:1px solid var(--line); background:none; color:inherit; padding:.3rem .7rem; border-radius:.25rem; }
+  .act:hover { background:#8882; }
+  .danger { color:var(--bad); border-color:#c0392b66; }
+  input, select { font:inherit; padding:.3rem .4rem; border:1px solid var(--line); border-radius:.25rem; background:none; color:inherit; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { text-align:left; padding:.35rem .5rem; border-bottom:1px solid var(--line); }
+  th { font-weight:600; opacity:.7; font-size:.85rem; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  form.row { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; margin:.5rem 0 0; }
+  pre { background:#8881; padding:.6rem; border-radius:.25rem; overflow-x:auto; font-size:.85rem; }
+  .msg { padding:.5rem .7rem; border-radius:.25rem; margin:.75rem 0; }
+  .msg.err { background:#c0392b22; color:var(--bad); }
+  .msg.ok { background:#1e844922; color:var(--good); }
+  .muted { opacity:.65; }
+  .login { max-width:26rem; margin:4rem auto; }
+  .login input { width:100%; margin:.5rem 0; font-family:ui-monospace, monospace; }
+  code { font-family:ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<main id="app">
+
+  <!-- The key is the login. Nothing is fetched until one is accepted. -->
+  <section v-if="!key" class="login">
+    <h1>bseries</h1>
+    <p class="muted">Sign in with a write key. On a database with no keys yet, use
+       the bootstrap token from the server log to mint one first.</p>
+    <form @submit.prevent="signIn">
+      <input v-model="keyInput" type="password" placeholder="bsw_…" autofocus>
+      <button class="act" type="submit" :disabled="busy">Sign in</button>
+    </form>
+    <div v-if="error" class="msg err">{{ error }}</div>
+  </section>
+
+  <template v-else>
+    <header>
+      <h1>bseries</h1>
+      <span class="muted" v-if="health">{{ health.status }}</span>
+      <span class="sp"></span>
+      <button class="act" @click="signOut">Sign out</button>
+    </header>
+
+    <nav>
+      <button v-for="t in tabs" :key="t" :class="{on: tab === t}" @click="go(t)">{{ t }}</button>
+    </nav>
+
+    <div v-if="error" class="msg err">{{ error }}</div>
+    <div v-if="note" class="msg ok">{{ note }}</div>
+
+    <!-- ---------------------------------------------------------- tables -->
+    <section v-if="tab === 'tables'">
+      <table>
+        <thead><tr><th>table</th><th class="num">series</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="t in tables" :key="t.name">
+            <td><code>{{ t.name }}</code></td>
+            <td class="num">{{ t.series ?? '—' }}</td>
+            <td><button class="act danger" @click="dropTable(t.name)">drop</button></td>
+          </tr>
+          <tr v-if="!tables.length"><td colspan="3" class="muted">no tables</td></tr>
+        </tbody>
+      </table>
+      <form class="row" @submit.prevent="createTable">
+        <input v-model="newTable" placeholder="new table name" required>
+        <button class="act" type="submit">create</button>
+      </form>
+    </section>
+
+    <!-- ---------------------------------------------------------- series -->
+    <section v-if="tab === 'series'">
+      <form class="row" @submit.prevent="loadSeries">
+        <select v-model="table" @change="loadSeries">
+          <option v-for="t in tables" :key="t.name" :value="t.name">{{ t.name }}</option>
+        </select>
+        <input v-model="after" placeholder="after key" size="10">
+        <button class="act" type="submit">list</button>
+      </form>
+
+      <table v-if="table">
+        <thead><tr><th class="num">key</th><th>type</th><th class="num">interval</th><th class="num">points</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="s in series" :key="s.key">
+            <td class="num"><code>{{ s.key }}</code></td>
+            <td>{{ s.type }}<span class="muted" v-if="s.version < 3"> v{{ s.version }}</span></td>
+            <td class="num">{{ s.interval }}s</td>
+            <td class="num">{{ s.points_in_file ?? '—' }}</td>
+            <td>
+              <button class="act" @click="readSeries(s)">read</button>
+              <button class="act danger" @click="dropSeries(s.key)">delete</button>
+            </td>
+          </tr>
+          <tr v-if="!series.length"><td colspan="5" class="muted">no series</td></tr>
+        </tbody>
+      </table>
+
+      <form class="row" v-if="table" @submit.prevent="createSeries">
+        <input v-model="ns.key" placeholder="key (uint32)" size="10" required>
+        <select v-model="ns.type">
+          <option v-for="t in types" :key="t">{{ t }}</option>
+        </select>
+        <input v-model="ns.interval" placeholder="interval s" size="8" required>
+        <input v-model="ns.start" placeholder="start (unix, blank = now)" size="18">
+        <button class="act" type="submit">create</button>
+      </form>
+
+      <template v-if="reading">
+        <h2>series {{ reading.key }}</h2>
+        <form class="row" @submit.prevent="fetchPoints">
+          <input v-model="range.start" placeholder="start" size="12">
+          <input v-model="range.end" placeholder="end" size="12">
+          <input v-model="range.max_points" placeholder="max_points" size="10">
+          <select v-model="range.condense">
+            <option value="">raw</option>
+            <option>average</option><option>min</option><option>max</option>
+          </select>
+          <button class="act" type="submit">read</button>
+        </form>
+        <!-- Only with condense: a raw read hands back what was stored, and the
+             server refuses reserved there rather than ignoring it. -->
+        <form class="row" v-if="range.condense" @submit.prevent="fetchPoints">
+          <input v-model="range.reserved" placeholder="reserved e.g. 1,2" size="14">
+          <select v-model="range.reserved_mode" :disabled="!range.reserved">
+            <option value="">exclude</option>
+            <option value="dominate">dominate</option>
+          </select>
+          <input v-model="range.reserved_threshold" placeholder="threshold 0–1" size="12"
+                 :disabled="range.reserved_mode !== 'dominate'">
+          <span class="muted" v-if="lastRead && lastRead.reserved_points !== undefined">
+            {{ lastRead.reserved_points }} reserved of {{ lastRead.source_points }}
+          </span>
+        </form>
+        <pre v-if="points.length">{{ points.map(p => p[0] + '  ' + p[1] + (p[2] === null ? '' : '   loss ' + p[2])).join('\n') }}</pre>
+        <p v-else-if="points.checked" class="muted">no points in that range</p>
+      </template>
+    </section>
+
+    <!-- ------------------------------------------------------------ keys -->
+    <section v-if="tab === 'keys'">
+      <table>
+        <thead><tr><th>name</th><th>role</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="k in keys" :key="k.name">
+            <td><code>{{ k.name }}</code></td>
+            <td>{{ k.role }}</td>
+            <td><button class="act danger" @click="revokeKey(k.name)">revoke</button></td>
+          </tr>
+          <tr v-if="!keys.length"><td colspan="3" class="muted">no keys</td></tr>
+        </tbody>
+      </table>
+      <form class="row" @submit.prevent="mintKey">
+        <input v-model="nk.name" placeholder="name" required>
+        <select v-model="nk.role"><option>read</option><option>write</option></select>
+        <button class="act" type="submit">mint</button>
+      </form>
+      <div v-if="minted" class="msg ok">
+        <strong>{{ minted.name }}</strong> — copy it now, it is not shown again:
+        <pre>{{ minted.key }}</pre>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- config -->
+    <section v-if="tab === 'config'">
+      <p class="muted">Changes live in memory only; a restart returns to the
+         configuration file. Settings not listed here need a restart.</p>
+      <table>
+        <thead><tr><th>setting</th><th class="num">value</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="(v, k) in config" :key="k">
+            <td><code>{{ k }}</code></td>
+            <td class="num">{{ v }}</td>
+            <td>
+              <form class="row" v-if="mutable.includes(k)" @submit.prevent="setConfig(k, $event.target.v.value)">
+                <input name="v" :placeholder="v" size="10">
+                <button class="act" type="submit">set</button>
+              </form>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </template>
+</main>
+
+<script>
+const { createApp } = Vue;
+
+// Points come back as hex of the raw little endian values, so the page decodes
+// them the same way the format stores them.
+const READERS = {
+  uint8:  (d,o) => d.getUint8(o),        int8:    (d,o) => d.getInt8(o),
+  uint16: (d,o) => d.getUint16(o,true),  int16:   (d,o) => d.getInt16(o,true),
+  uint32: (d,o) => d.getUint32(o,true),  int32:   (d,o) => d.getInt32(o,true),
+  uint64: (d,o) => d.getBigUint64(o,true), int64: (d,o) => d.getBigInt64(o,true),
+  float32:(d,o) => d.getFloat32(o,true), float64: (d,o) => d.getFloat64(o,true),
+};
+
+createApp({
+  data: () => ({
+    key: sessionStorage.getItem('bseries_key') || '',
+    keyInput: '', busy: false, error: '', note: '',
+    tab: 'tables', tabs: ['tables','series','keys','config'],
+    health: null, tables: [], newTable: '',
+    table: '', series: [], after: '',
+    ns: { key:'', type:'float32', interval:'60', start:'' },
+    types: ['uint8','uint16','uint32','uint64','int8','int16','int32','int64','float32','float64'],
+    reading: null, points: [], lastRead: null,
+    range: { start:'', end:'', max_points:'', condense:'',
+             reserved:'', reserved_mode:'', reserved_threshold:'' },
+    keys: [], nk: { name:'', role:'read' }, minted: null,
+    config: {},
+    mutable: ['flush_interval','series_max_idle','maintenance_interval',
+              'max_points_per_read','max_series_per_read','max_points_per_write',
+              'max_condense_scan'],
+  }),
+
+  mounted() { if (this.key) this.go('tables'); },
+
+  methods: {
+    // One place that talks to the API, so errors surface the same way everywhere.
+    async api(path, options = {}) {
+      const r = await fetch(path, {
+        ...options,
+        headers: { 'X-API-Key': this.key, ...(options.headers || {}) },
+      });
+      const text = await r.text();
+      let body = null;
+      try { body = text ? JSON.parse(text) : null; } catch (e) { /* not json */ }
+      if (!r.ok) throw new Error(body?.message || body?.error || `HTTP ${r.status}`);
+      return body;
+    },
+
+    async run(fn, ok) {
+      this.busy = true; this.error = ''; this.note = '';
+      try { await fn(); if (ok) this.note = ok; }
+      catch (e) { this.error = e.message; }
+      finally { this.busy = false; }
+    },
+
+    async signIn() {
+      this.busy = true; this.error = '';
+      try {
+        this.key = this.keyInput.trim();
+        await this.api('/v1/auth/keys');          // write-only, so it proves the role
+        sessionStorage.setItem('bseries_key', this.key);
+        this.keyInput = '';
+        this.go('tables');
+      } catch (e) {
+        this.error = e.message; this.key = '';
+      } finally { this.busy = false; }
+    },
+
+    signOut() {
+      sessionStorage.removeItem('bseries_key');
+      Object.assign(this, { key:'', tables:[], series:[], keys:[], config:{}, reading:null, minted:null });
+    },
+
+    go(tab) {
+      this.tab = tab; this.error = ''; this.note = '';
+      if (tab === 'tables') this.loadTables();
+      if (tab === 'series') { this.loadTables().then(() => this.table && this.loadSeries()); }
+      if (tab === 'keys')   this.loadKeys();
+      if (tab === 'config') this.loadConfig();
+      this.api('/v1/health').then(h => this.health = h).catch(() => {});
+    },
+
+    loadTables() {
+      return this.run(async () => {
+        const r = await this.api('/v1/tables');
+        this.tables = (r.tables || []).map(t => (typeof t === 'string' ? { name: t } : t));
+        if (!this.table && this.tables.length) this.table = this.tables[0].name;
+      });
+    },
+    createTable() {
+      return this.run(async () => {
+        await this.api(`/v1/tables/${encodeURIComponent(this.newTable)}`, { method: 'POST' });
+        this.newTable = ''; await this.loadTables();
+      }, 'table created');
+    },
+    dropTable(name) {
+      if (!confirm(`Drop table ${name} and every series in it?`)) return;
+      return this.run(async () => {
+        await this.api(`/v1/tables/${encodeURIComponent(name)}?force=1`, { method: 'DELETE' });
+        if (this.table === name) { this.table = ''; this.series = []; }
+        await this.loadTables();
+      }, 'table dropped');
+    },
+
+    loadSeries() {
+      return this.run(async () => {
+        const q = new URLSearchParams({ limit: '200' });
+        if (this.after) q.set('after', this.after);
+        const r = await this.api(`/v1/${encodeURIComponent(this.table)}/series?${q}`);
+        this.series = r.series || [];
+      });
+    },
+    createSeries() {
+      return this.run(async () => {
+        const q = new URLSearchParams({ type: this.ns.type, interval: this.ns.interval });
+        if (this.ns.start) q.set('start', this.ns.start);
+        await this.api(`/v1/${encodeURIComponent(this.table)}/series/${encodeURIComponent(this.ns.key)}?${q}`,
+                       { method: 'POST' });
+        this.ns.key = ''; await this.loadSeries();
+      }, 'series created');
+    },
+    dropSeries(k) {
+      if (!confirm(`Delete series ${k}?`)) return;
+      return this.run(async () => {
+        await this.api(`/v1/${encodeURIComponent(this.table)}/series/${k}`, { method: 'DELETE' });
+        if (this.reading?.key === k) this.reading = null;
+        await this.loadSeries();
+      }, 'series deleted');
+    },
+
+    readSeries(s) {
+      this.reading = s;
+      this.points = [];
+      const span = (s.points_in_file || 60) * s.interval;
+      this.range.start = s.created;
+      this.range.end = s.created + Math.min(span, 3600);
+      this.fetchPoints();
+    },
+    fetchPoints() {
+      return this.run(async () => {
+        const q = new URLSearchParams({ start: this.range.start, end: this.range.end });
+        // The two are only meaningful together, and the server refuses one alone.
+        if (this.range.max_points && this.range.condense) {
+          q.set('max_points', this.range.max_points);
+          q.set('condense', this.range.condense);
+          if (this.range.reserved) {
+            q.set('reserved', this.range.reserved);
+            if (this.range.reserved_mode) q.set('reserved_mode', this.range.reserved_mode);
+            if (this.range.reserved_mode === 'dominate' && this.range.reserved_threshold)
+              q.set('reserved_threshold', this.range.reserved_threshold);
+          }
+        }
+        const r = await this.api(`/v1/${encodeURIComponent(this.table)}/series/${this.reading.key}/data?${q}`);
+        this.lastRead = r;
+        this.points = this.decode(r);
+        this.points.checked = true;
+      });
+    },
+
+    // condense=average promotes to float64, so the response's own type is what
+    // decides the width, never the series definition.
+    decode(r) {
+      const read = READERS[r.type];
+      if (!read || !r.data) return [];
+      const bytes = new Uint8Array(r.data.match(/../g).map(h => parseInt(h, 16)));
+      const view = new DataView(bytes.buffer);
+
+      // One little endian uint32 a bucket, present only when reserved was asked
+      // for, so the loss can be read beside the value rather than inside it.
+      let counts = null;
+      if (r.reserved_counts) {
+        const cb = new Uint8Array(r.reserved_counts.match(/../g).map(h => parseInt(h, 16)));
+        const cv = new DataView(cb.buffer);
+        counts = [];
+        for (let i = 0; i * 4 < cb.length; i++) counts.push(cv.getUint32(i * 4, true));
+      }
+
+      const out = [];
+      for (let i = 0; i * r.datasize < bytes.length; i++) {
+        const hex = r.data.substr(i * r.datasize * 2, r.datasize * 2);
+        out.push([r.first_point_timestamp + i * r.interval,
+                  hex === r.null_fill ? '—' : read(view, i * r.datasize),
+                  counts ? counts[i] : null]);
+      }
+      return out;
+    },
+
+    loadKeys() { return this.run(async () => { this.keys = (await this.api('/v1/auth/keys')).keys || []; }); },
+    mintKey() {
+      return this.run(async () => {
+        const q = new URLSearchParams({ role: this.nk.role, name: this.nk.name });
+        this.minted = await this.api(`/v1/auth/keys?${q}`, { method: 'POST' });
+        this.nk.name = ''; await this.loadKeys();
+      });
+    },
+    revokeKey(name) {
+      if (!confirm(`Revoke ${name}? Anything using it stops working.`)) return;
+      return this.run(async () => {
+        await this.api(`/v1/auth/keys/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        await this.loadKeys();
+      }, 'key revoked');
+    },
+
+    loadConfig() {
+      return this.run(async () => {
+        const r = await this.api('/v1/config');
+        this.config = r.config || r.settings || r;
+      });
+    },
+    setConfig(k, v) {
+      if (!v) return;
+      return this.run(async () => {
+        await this.api(`/v1/config?${new URLSearchParams({ [k]: v })}`, { method: 'POST' });
+        await this.loadConfig();
+      }, 'setting changed');
+    },
+  },
+}).mount('#app');
+</script>
+</body>
+</html>

@@ -141,6 +141,12 @@ private:
     void applyCors(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
     void handleHealth(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+
+    /// The admin page. Unauthenticated of necessity: it is the thing a key is
+    /// typed into, so requiring one to fetch it would leave nowhere to type it.
+    /// It carries no data of its own -- every byte it shows comes from a later
+    /// authenticated call.
+    bool handleWebAsset(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleListSeries(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleSeriesInfo(BSeries *db, uint32_t key, HTTP_RESPONSE &response);
     void handleCreateSeries(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);

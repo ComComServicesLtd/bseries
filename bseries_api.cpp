@@ -1,4 +1,5 @@
 #include "bseries_api.h"
+#include "web_assets.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1322,6 +1323,27 @@ void BSeriesApi::routeTable(BSeries *db, const std::vector<std::string> &rest, c
 }
 
 
+/// Serves the admin page out of the binary. Returns false when the path is not
+/// an asset, leaving the request to the API router.
+
+bool BSeriesApi::handleWebAsset(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+
+    if(request.method != "GET" && request.method != "HEAD")
+        return false;
+
+    // / is the page, so a router's address on its own is enough to reach it.
+    const WEB_ASSET *asset = webAsset(request.path == "/" ? "/admin" : request.path);
+
+    if(asset == NULL)
+        return false;
+
+    response.status = 200;
+    response.content_type = asset->content_type;
+    response.body.assign((const char *)asset->data,asset->length);
+    return true;
+}
+
+
 void BSeriesApi::route(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     applyCors(request,response);
@@ -1331,6 +1353,10 @@ void BSeriesApi::route(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
         response.body.clear();
         return;
     }
+
+    // Before the check below, which turns everything outside /v1 into a 404.
+    if(handleWebAsset(request,response))
+        return;
 
     std::vector<std::string> segments = splitPath(request.path);
 

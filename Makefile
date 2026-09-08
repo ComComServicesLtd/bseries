@@ -8,6 +8,10 @@
 CXX      ?= g++
 CXXFLAGS ?= -std=c++11 -O2 -Wall -Wextra
 
+# The asset generator runs on the machine doing the building, so it cannot be
+# built with CXX when CXX is a cross compiler.
+HOSTCXX  ?= g++
+
 # -MMD -MP makes the compiler emit a .d file listing the headers each object
 # depends on, which is included below. Without it a header change does not
 # rebuild anything that included it, and you get a link error or, worse, a
@@ -19,24 +23,36 @@ LDLIBS   ?= -pthread
 PREFIX   ?= /usr/local
 
 LIB_SOURCES    = bseries.cpp
-SERVER_SOURCES = bseries.cpp table_set.cpp auth_store.cpp runtime_settings.cpp http_server.cpp bseries_api.cpp bseriesd.cpp
+SERVER_SOURCES = bseries.cpp table_set.cpp auth_store.cpp runtime_settings.cpp http_server.cpp bseries_api.cpp web_assets.cpp bseriesd.cpp
 
 LIB_OBJECTS    = $(LIB_SOURCES:.cpp=.o)
 SERVER_OBJECTS = $(SERVER_SOURCES:.cpp=.o)
 
 TESTS = tests/test_bseries tests/test_definitions tests/test_auth tests/test_api tests/test_concurrency
 
-.PHONY: all clean test install static lib install-lib
+.PHONY: all clean test install static lib install-lib web
 
 all: bseriesd
 
 bseriesd: $(SERVER_OBJECTS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+# The admin page, compiled in. Regenerated whenever anything under web/ changes,
+# so an edit to the page needs nothing but a rebuild.
+WEB_FILES = web/admin.html web/vue.global.prod.js
+
+web: web_assets.cpp
+
+tools/embed: tools/embed.cpp
+	$(HOSTCXX) -O2 -Wall -o $@ $<
+
+web_assets.cpp: tools/embed $(WEB_FILES)
+	./tools/embed $@ /admin=web/admin.html /admin/vue.global.prod.js=web/vue.global.prod.js
+
 # A self contained binary, for a scratch or distroless container image. Clean
 # under musl; under glibc the linker warns that getaddrinfo wants its shared
 # libraries back at run time, which is why the image builds on alpine.
-static:
+static: web_assets.cpp
 	$(CXX) $(CXXFLAGS) -static -o bseriesd $(SERVER_SOURCES) $(LDLIBS)
 
 # The library on its own, for linking bseries into another program rather than
@@ -59,7 +75,7 @@ install-lib: libbseries.a
 -include $(SERVER_OBJECTS:.o=.d)
 
 tests/%: tests/%.cpp $(SERVER_SOURCES)
-	$(CXX) $(CXXFLAGS) -I. -o $@ $< bseries.cpp table_set.cpp auth_store.cpp runtime_settings.cpp http_server.cpp bseries_api.cpp $(LDLIBS)
+	$(CXX) $(CXXFLAGS) -I. -o $@ $< bseries.cpp table_set.cpp auth_store.cpp runtime_settings.cpp http_server.cpp bseries_api.cpp web_assets.cpp $(LDLIBS)
 
 test: $(TESTS)
 	@failed=0; \
@@ -84,4 +100,4 @@ install: bseriesd
 	install -m 755 bseriesd $(DESTDIR)$(PREFIX)/bin/bseriesd
 
 clean:
-	rm -f *.o *.d *.a bseriesd $(TESTS)
+	rm -f *.o *.d *.a bseriesd $(TESTS) tools/embed web_assets.cpp
