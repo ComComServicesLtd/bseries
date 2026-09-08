@@ -221,6 +221,32 @@ null fill every interval in between. `max_grow_points` bounds how far one write 
 reach; beyond it the write fails with `timestamp_too_far_ahead` rather than
 allocating and writing gigabytes for a single bad timestamp.
 
+### Where a write lands
+
+A write is placed by flooring, not by rounding to the nearest slot:
+
+    slot = (timestamp - series start) / interval        integer division
+
+With a 60 second interval, a reading timestamped 59 seconds past a slot goes into
+**that** slot, not the one a second away. The grid is anchored to the series' own
+start timestamp, which for a series created by a write is the timestamp of its
+first point, so the slot boundaries sit wherever that first reading fell.
+
+Two consequences worth designing around:
+
+* **Two readings can land in the same slot, and the later one silently replaces
+  the earlier.** There is no error and no indication. With a sampler running at the
+  series' own interval this only happens when a reading is late enough to cross a
+  slot boundary, which then also leaves the slot it should have filled empty.
+* Reads report `first_point_timestamp` as the true slot time of `output[i=0]`,
+  which can be up to `interval - 1` seconds before the `start` that was asked for.
+  Point `i` is at `first_point_timestamp + i * interval`; do not assume it is at
+  `start + i * interval`.
+
+If sub-interval placement matters for your data, the fix is a shorter interval,
+not a rounding rule: a series stores one value per slot and cannot represent two
+readings inside one.
+
 ### Gaps in a response
 
 `data` is the raw series content, so the points where nothing was recorded hold the

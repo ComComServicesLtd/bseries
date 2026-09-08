@@ -136,7 +136,37 @@ int main(int argc, char**argv){
         db.close();
     }
 
-    printf("[7] read of a missing series\n");
+    printf("[7] point grid alignment\n");
+    {
+        // The grid is anchored to the series' own start, so a read whose start_time
+        // falls mid slot must still label its points with their true slot times.
+        BSeries db; db.data_directory = dir;
+        const uint32_t T0 = 1700000000;
+        db.createSeriesFile(700,60,BS_UNSIGNED,1,T0);
+        for(int i=0;i<4;i++){ unsigned char v=(unsigned char)(100+i); db.write(700,&v,1,T0+i*60); }
+
+        long offsets[] = {0, 1, 30, 59};
+        for(unsigned k=0;k<4;k++){
+            int64_t n=0,r=0,spp=0,fpt=0; uint32_t ds=0; void*res=NULL;
+            int64_t s = (int64_t)T0 + offsets[k];
+            db.read(700,s,s+240,&n,&r,&spp,&fpt,&ds,&res);
+            char msg[128];
+            snprintf(msg,sizeof(msg),"start T0+%ld reports the slot time, not the request",offsets[k]);
+            CHECK(fpt == (int64_t)T0, msg);
+            CHECK(res && ((unsigned char*)res)[0] == 100, "and output[0] is that slot's value");
+            delete[] (char*)res;
+        }
+
+        // a request starting before the series keeps the same grid
+        int64_t n=0,r=0,spp=0,fpt=0; uint32_t ds=0; void*res=NULL;
+        db.read(700,(int64_t)T0-120,(int64_t)T0+240,&n,&r,&spp,&fpt,&ds,&res);
+        CHECK(fpt == (int64_t)T0-120, "a request before the series start stays on the grid");
+        CHECK(res && ((unsigned char*)res)[2] == 100, "and the series' first point lands two slots in");
+        delete[] (char*)res;
+        db.close();
+    }
+
+    printf("[8] read of a missing series\n");
     {
         BSeries db; db.data_directory = dir; db.default_seconds_per_point = 1;
         int64_t n,r,spp,fpt; uint32_t ds; void*res=NULL;

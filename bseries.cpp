@@ -1094,9 +1094,21 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
         int64_t points_in_file = (series->file_size - (int64_t)sizeof(SERIES))/series->datasize;
         *seconds_per_point = series->header.interval;
 
-        // output[0] corresponds to start_time: the mapping below places every file
-        // and cache point at (its timestamp - start_time) / interval.
-        *first_point_timestamp = start_time;
+        // The point grid is anchored to the series' own start, not to whatever
+        // start_time was asked for, so output[0] is the slot that *contains*
+        // start_time rather than start_time itself. Reporting the requested time
+        // here would label every returned point up to interval-1 seconds later
+        // than it really is. This mirrors the placement arithmetic below exactly.
+        {
+            int64_t first_slot;
+
+            if(start_time <= (int64_t)series->header.timestamp)
+                first_slot = -(((int64_t)series->header.timestamp - start_time) / (int64_t)series->header.interval);
+            else
+                first_slot = (start_time - (int64_t)series->header.timestamp) / (int64_t)series->header.interval;
+
+            *first_point_timestamp = (int64_t)series->header.timestamp + first_slot * (int64_t)series->header.interval;
+        }
 
         char *output = new (std::nothrow) char[points*series->datasize];
         if(output == NULL){
