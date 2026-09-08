@@ -596,6 +596,21 @@ void BSeriesApi::route(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
         return;
     }
 
+    // /v1/now - one value per series, into the slot nearest the server clock
+    if(segments[1] == "now" && segments.size() == 2){
+
+        if(request.method != "POST" && request.method != "PUT"){
+            jsonError(response,405,"method_not_allowed","use POST to push a reading into every series");
+            return;
+        }
+
+        if(!authorise(request,true,response))
+            return;
+
+        handleWriteNow(request,response);
+        return;
+    }
+
     // /v1/data - several series in one request, read or write
     if(segments[1] == "data" && segments.size() == 2){
 
@@ -1309,10 +1324,13 @@ bool BSeriesApi::resolveWriteShape(uint32_t key, size_t body_bytes, uint32_t *da
 /// Writes consecutive points starting at timestamp. Returns a database status and
 /// sets written to how many points landed before any failure.
 
-int BSeriesApi::writePoints(uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written){
+int BSeriesApi::writePoints(uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written, int64_t *overwritten){
 
     int64_t count = (int64_t)(points.size() / datasize);
     *written = 0;
+
+    if(overwritten != NULL)
+        *overwritten = 0;
 
     for(int64_t point = 0; point < count; point++){
 
@@ -1321,15 +1339,52 @@ int BSeriesApi::writePoints(uint32_t key, const std::string &points, uint32_t da
         if(point_time > 0xFFFFFFFFLL)
             return WRITE_BEFORE_SERIES_START; // ran off the end of 32 bit time
 
-        int rc = db->write(key,(void*)(points.data() + point * datasize),datasize,(uint32_t)point_time);
+        bool replaced = false;
+        int rc = db->write(key,(void*)(points.data() + point * datasize),datasize,(uint32_t)point_time,
+                           overwritten != NULL ? &replaced : NULL);
 
         if(rc != NO_ERROR)
             return rc;
+
+        if(replaced && overwritten != NULL)
+            (*overwritten)++;
 
         (*written)++;
     }
 
     return NO_ERROR;
+}
+
+
+/// The slot nearest a given time, as a timestamp.
+///
+/// Writes floor onto the grid, so handing the library the nearest slot's own
+/// timestamp is what places a reading in it. A series that does not exist yet has
+/// no grid to snap to, so the time is returned unchanged and becomes its start.
+
+bool BSeriesApi::nearestSlotTime(uint32_t key, long long when, long long *slot_time){
+
+    SERIES header;
+    int64_t file_size = 0;
+
+    if(db->seriesInfo(key,&header,&file_size) != NO_ERROR || header.interval == 0){
+        *slot_time = when;
+        return false;
+    }
+
+    long long interval = (long long)header.interval;
+    long long start = (long long)header.timestamp;
+
+    if(when <= start){
+        *slot_time = start;
+        return true;
+    }
+
+    // Rounding half up, so a reading exactly between two slots takes the later.
+    long long slot = (when - start + interval / 2) / interval;
+
+    *slot_time = start + slot * interval;
+    return true;
 }
 
 
@@ -1376,8 +1431,8 @@ void BSeriesApi::handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP
         return;
     }
 
-    int64_t written = 0;
-    int rc = writePoints(key,points,datasize,interval,timestamp,&written);
+    int64_t written = 0, overwritten = 0;
+    int rc = writePoints(key,points,datasize,interval,timestamp,&written,&overwritten);
 
     if(rc != NO_ERROR){
 
@@ -1397,9 +1452,11 @@ void BSeriesApi::handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP
     char buffer[256];
 
     snprintf(buffer,sizeof(buffer),
-        "{\"key\":%lu,\"points_written\":%lld,\"first_timestamp\":%lld,\"last_timestamp\":%lld,\"interval\":%lld}",
+        "{\"key\":%lu,\"points_written\":%lld,\"overwritten\":%lld,"
+        "\"first_timestamp\":%lld,\"last_timestamp\":%lld,\"interval\":%lld}",
         (unsigned long)key,
         (long long)written,
+        (long long)overwritten,
         timestamp,
         (long long)(timestamp + (written - 1) * interval),
         (long long)interval);
@@ -1420,6 +1477,7 @@ typedef struct {
     int64_t interval;
     int64_t count;
     int64_t written;
+    int64_t overwritten;
     int status;
     bool attempted;
 } BATCH_RECORD;
@@ -1459,6 +1517,221 @@ static int splitTokens(const std::string &line, std::string *tokens, int max){
 
     return count;
 }
+
+
+/// One value per series, into the slot nearest the server's clock.
+///
+///     POST /v1/now
+///     <key> <hex>
+///     <key> <hex>
+///
+/// This is the shape a poller wants: it has just sampled a thousand devices and
+/// does not care which slot each reading lands in, only that they all land in the
+/// one nearest now. No timestamp appears in the body at all, so a client with a
+/// wrong clock cannot scatter readings across the grid.
+///
+/// Unlike the general batch endpoint this rounds to the nearest slot rather than
+/// flooring, which halves the worst case placement error. It also reports which
+/// series already held a reading in that slot, since rounding to nearest makes two
+/// samples sharing a slot more likely, and a series can only hold one.
+
+void BSeriesApi::handleWriteNow(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+
+    long long now = (long long)time(NULL);
+
+    // An explicit time is allowed so a run can be replayed or tested; the point of
+    // the endpoint is that the body carries no timestamps, not that the clock is
+    // untouchable.
+    std::string at_text = httpQueryParam(request,"at");
+
+    if(!at_text.empty() && (!parseSigned(at_text,&now) || now <= 0 || now > 0xFFFFFFFFLL)){
+        jsonError(response,400,"bad_parameter","at must be a unix timestamp that fits in 32 bits");
+        return;
+    }
+
+    std::vector<BATCH_RECORD> records;
+    size_t position = 0;
+    int line_number = 0;
+
+    while(position <= request.body.size()){
+
+        size_t newline = request.body.find('\n',position);
+        if(newline == std::string::npos)
+            newline = request.body.size();
+
+        std::string line = request.body.substr(position,newline - position);
+        position = newline + 1;
+        line_number++;
+
+        while(!line.empty() && isspace((unsigned char)line[line.size()-1]))
+            line.erase(line.size()-1);
+
+        size_t first = line.find_first_not_of(" \t");
+        if(first == std::string::npos || line[first] == '#')
+            continue;
+
+        std::string tokens[2];
+        int found = splitTokens(line,tokens,2);
+
+        if(found != 2){
+            char message[192];
+            snprintf(message,sizeof(message),"line %d: expected <key> <hex>",line_number);
+            jsonError(response,400,"bad_record",message);
+            return;
+        }
+
+        BATCH_RECORD record;
+        record.line = line_number;
+        record.written = 0;
+        record.overwritten = 0;
+        record.status = NO_ERROR;
+        record.attempted = false;
+
+        unsigned long key_value = 0;
+
+        if(!parseUnsigned(tokens[0],&key_value) || key_value > 0xFFFFFFFFuL){
+            char message[192];
+            snprintf(message,sizeof(message),"line %d: '%s' is not a series key",line_number,tokens[0].c_str());
+            jsonError(response,400,"bad_record",message);
+            return;
+        }
+
+        record.key = (uint32_t)key_value;
+
+        if(!apiFromHex(tokens[1],&record.points) || record.points.empty()){
+            char message[192];
+            snprintf(message,sizeof(message),"line %d: the value is not valid hex",line_number);
+            jsonError(response,400,"bad_hex",message);
+            return;
+        }
+
+        std::string shape_error;
+
+        if(!resolveWriteShape(record.key,record.points.size(),&record.datasize,&record.interval,&shape_error)){
+            char message[256];
+            snprintf(message,sizeof(message),"line %d: %s",line_number,shape_error.c_str());
+            jsonError(response,422,"bad_point_width",shape_error);
+            return;
+        }
+
+        // One value per series is the whole contract here. A line carrying more
+        // than one point is a client using the wrong endpoint.
+        if(record.points.size() != record.datasize){
+            char message[256];
+            snprintf(message,sizeof(message),
+                     "line %d: %lu bytes is %lu points; this endpoint takes one value per series, use /v1/data for a run",
+                     line_number,(unsigned long)record.points.size(),
+                     (unsigned long)(record.points.size() / record.datasize));
+            jsonError(response,422,"expected_single_point",message);
+            return;
+        }
+
+        record.count = 1;
+        records.push_back(record);
+
+        if(records.size() > (size_t)config.max_series_per_read){
+            char message[192];
+            snprintf(message,sizeof(message),"more than %d series in one request",config.max_series_per_read);
+            jsonError(response,413,"too_many_points",message);
+            return;
+        }
+    }
+
+    if(records.empty()){
+        jsonError(response,400,"empty_body","no records were supplied");
+        return;
+    }
+
+    size_t records_written = 0;
+    size_t records_failed = 0;
+    size_t overwritten = 0;
+
+    for(size_t i = 0; i < records.size(); i++){
+
+        // Each series has its own grid, so the nearest slot is worked out per
+        // series rather than once for the batch.
+        long long slot_time = now;
+        nearestSlotTime(records[i].key,now,&slot_time);
+        records[i].timestamp = slot_time;
+
+        records[i].attempted = true;
+        records[i].status = writePoints(records[i].key,records[i].points,records[i].datasize,
+                                        records[i].interval,slot_time,
+                                        &records[i].written,&records[i].overwritten);
+
+        if(records[i].status == NO_ERROR){
+            records_written++;
+            if(records[i].overwritten > 0)
+                overwritten++;
+        } else {
+            records_failed++;
+        }
+    }
+
+    bool verbose = false;
+    std::string verbose_text = httpQueryParam(request,"verbose");
+
+    if(!verbose_text.empty() && verbose_text != "0" && verbose_text != "false")
+        verbose = true;
+
+    char head[320];
+
+    snprintf(head,sizeof(head),
+        "{\"now\":%lld,\"records\":%lu,\"records_written\":%lu,\"records_failed\":%lu,\"overwritten\":%lu",
+        now,
+        (unsigned long)records.size(),
+        (unsigned long)records_written,
+        (unsigned long)records_failed,
+        (unsigned long)overwritten);
+
+    response.body = head;
+
+    // Only the records worth looking at: the ones that failed, and the ones that
+    // replaced a reading already in their slot.
+    if(records_failed > 0 || overwritten > 0 || verbose){
+
+        response.body += ",\"results\":[";
+        bool first = true;
+
+        for(size_t i = 0; i < records.size(); i++){
+
+            bool interesting = records[i].status != NO_ERROR || records[i].overwritten > 0;
+
+            if(!interesting && !verbose)
+                continue;
+
+            char entry[384];
+
+            snprintf(entry,sizeof(entry),
+                "%s{\"line\":%d,\"key\":%lu,\"state\":\"%s\",\"error\":\"%s\",\"slot\":%lld,\"overwritten\":%s}",
+                first ? "" : ",",
+                records[i].line,
+                (unsigned long)records[i].key,
+                records[i].status == NO_ERROR ? "written" : "failed",
+                databaseErrorSlug(records[i].status),
+                (long long)records[i].timestamp,
+                records[i].overwritten > 0 ? "true" : "false");
+
+            response.body += entry;
+            first = false;
+        }
+
+        response.body += "]";
+    }
+
+    if(records_failed > 0){
+        response.status = 500;
+        response.body += (records_written == 0)
+            ? ",\"error\":\"write_failed\",\"message\":\"no record could be written, see results\"}"
+            : ",\"error\":\"partial_write\",\"message\":\"the batch was applied in part, see results\"}";
+        return;
+    }
+
+    response.status = 200;
+    response.body += "}";
+}
+
+
 
 
 /// Points for several series in one request.
@@ -1518,6 +1791,7 @@ void BSeriesApi::handleBatchWrite(const HTTP_REQUEST &request, HTTP_RESPONSE &re
         BATCH_RECORD record;
         record.line = line_number;
         record.written = 0;
+        record.overwritten = 0;
         record.status = NO_ERROR;
         record.attempted = false;
 
@@ -1584,6 +1858,7 @@ void BSeriesApi::handleBatchWrite(const HTTP_REQUEST &request, HTTP_RESPONSE &re
     // thousand their points. The database has no transactions, so this is
     // reported honestly per record rather than presented as all or nothing.
     int64_t written_points = 0;
+    int64_t overwritten_points = 0;
     size_t records_written = 0;
     size_t records_failed = 0;
 
@@ -1591,9 +1866,11 @@ void BSeriesApi::handleBatchWrite(const HTTP_REQUEST &request, HTTP_RESPONSE &re
 
         records[i].attempted = true;
         records[i].status = writePoints(records[i].key,records[i].points,records[i].datasize,
-                                        records[i].interval,records[i].timestamp,&records[i].written);
+                                        records[i].interval,records[i].timestamp,
+                                        &records[i].written,&records[i].overwritten);
 
         written_points += records[i].written;
+        overwritten_points += records[i].overwritten;
 
         if(records[i].status == NO_ERROR)
             records_written++;
@@ -1611,41 +1888,52 @@ void BSeriesApi::handleBatchWrite(const HTTP_REQUEST &request, HTTP_RESPONSE &re
 
     snprintf(head,sizeof(head),
         "{\"records\":%lu,\"records_written\":%lu,\"records_failed\":%lu,"
-        "\"points_written\":%lld,\"points_expected\":%lld",
+        "\"points_written\":%lld,\"points_expected\":%lld,\"overwritten\":%lld",
         (unsigned long)records.size(),
         (unsigned long)records_written,
         (unsigned long)records_failed,
         (long long)written_points,
-        (long long)total_points);
+        (long long)total_points,
+        (long long)overwritten_points);
 
     response.body = head;
 
-    // The per record detail is only worth the bytes when something went wrong, or
-    // when the caller explicitly asks for it.
-    if(records_failed > 0 || verbose){
+    // Only the records worth looking at, which for a two thousand device batch is
+    // the difference between a line of JSON and a megabyte of it. verbose=1 lists
+    // every record instead.
+    if(records_failed > 0 || overwritten_points > 0 || verbose){
 
         response.body += ",\"results\":[";
+        bool first = true;
 
         for(size_t i = 0; i < records.size(); i++){
+
+            bool interesting = records[i].status != NO_ERROR || records[i].overwritten > 0;
+
+            if(!interesting && !verbose)
+                continue;
 
             const char *state = !records[i].attempted ? "not_attempted"
                               : (records[i].status == NO_ERROR ? "written" : "failed");
 
-            char entry[384];
+            char entry[448];
 
             snprintf(entry,sizeof(entry),
                 "%s{\"line\":%d,\"key\":%lu,\"state\":\"%s\",\"error\":\"%s\","
-                "\"points_written\":%lld,\"points_expected\":%lld,\"first_timestamp\":%lld}",
-                i > 0 ? "," : "",
+                "\"points_written\":%lld,\"points_expected\":%lld,\"overwritten\":%lld,"
+                "\"first_timestamp\":%lld}",
+                first ? "" : ",",
                 records[i].line,
                 (unsigned long)records[i].key,
                 state,
                 databaseErrorSlug(records[i].status),
                 (long long)records[i].written,
                 (long long)records[i].count,
+                (long long)records[i].overwritten,
                 records[i].timestamp);
 
             response.body += entry;
+            first = false;
         }
 
         response.body += "]";

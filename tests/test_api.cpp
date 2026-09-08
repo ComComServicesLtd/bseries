@@ -396,7 +396,13 @@ int main(int argc, char **argv){
         CHECK(r.status==500 && bodyHas(r,"partial_write"), "a mixed batch reports partial_write");
         CHECK(bodyHas(r,"\"records_written\":1") && bodyHas(r,"\"records_failed\":1"), "counted both ways");
         CHECK(bodyHas(r,"timestamp_before_series_start"), "the failing record names its error");
-        CHECK(bodyHas(r,"\"state\":\"written\"") && bodyHas(r,"\"state\":\"failed\""), "each record's state given");
+        CHECK(bodyHas(r,"\"state\":\"failed\"") && !bodyHas(r,"\"state\":\"written\""),
+              "results lists only the interesting records");
+
+        r = request("POST","/v1/data?verbose=1","read-write-key",
+                    "10500 1699999000 0000a441\n10500 1700003060 0000aa41\n");
+        CHECK(bodyHas(r,"\"state\":\"written\"") && bodyHas(r,"\"state\":\"failed\""),
+              "verbose=1 lists every record");
         r = request("GET","/v1/series/10500/data?start=1700003000&end=1700003100","read-only-key");
         CHECK(r.status==200 && bodyHas(r,"\"real_points\":1"), "the good record was still applied");
 
@@ -478,7 +484,79 @@ int main(int argc, char **argv){
         CHECK(blob.compare(0,80000,big) == 0, "and its bytes survived chunking intact");
     }
 
-    printf("[12] method handling\n");
+    printf("[12] push a reading into every series at now\n");
+    {
+        const long long T = 1700000000;
+
+        // 60 second series, so slot boundaries are 60s apart from T
+        REPLY r = request("POST","/v1/series/60001?type=uint8&interval=60&start=1700000000","read-write-key");
+        CHECK(r.status==201, "create a 60s series");
+        r = request("POST","/v1/series/60002?type=uint8&interval=60&start=1700000000","read-write-key");
+        CHECK(r.status==201, "and another");
+
+        char path[256];
+
+        // 29s past a slot rounds back to it; 31s past rounds forward to the next
+        snprintf(path,sizeof(path),"/v1/now?at=%lld&verbose=1",T + 29);
+        r = request("POST",path,"read-write-key","60001 11\n");
+        CHECK(r.status==200 && bodyHas(r,"\"slot\":1700000000"), "29s past a slot rounds back to it");
+
+        snprintf(path,sizeof(path),"/v1/now?at=%lld&verbose=1",T + 31);
+        r = request("POST",path,"read-write-key","60002 22\n");
+        CHECK(r.status==200 && bodyHas(r,"\"slot\":1700000060"), "31s past a slot rounds up to the next");
+
+        snprintf(path,sizeof(path),"/v1/now?at=%lld&verbose=1",T + 30);
+        r = request("POST",path,"read-write-key","60002 23\n");
+        CHECK(r.status==200 && bodyHas(r,"\"slot\":1700000060"), "exactly halfway takes the later slot");
+
+        // several series in one request, no timestamps in the body at all
+        snprintf(path,sizeof(path),"/v1/now?at=%lld",T + 121);
+        r = request("POST",path,"read-write-key","60001 31\n60002 32\n");
+        CHECK(r.status==200 && bodyHas(r,"\"records_written\":2"), "two series pushed in one request");
+        CHECK(bodyHas(r,"\"overwritten\":0"), "nothing was replaced");
+        CHECK(!bodyHas(r,"\"results\""), "and no detail when nothing is interesting");
+
+        // pushing again into the same slot replaces a real reading, and says so
+        snprintf(path,sizeof(path),"/v1/now?at=%lld",T + 122);
+        r = request("POST",path,"read-write-key","60001 41\n60002 42\n");
+        CHECK(r.status==200 && bodyHas(r,"\"overwritten\":2"), "a second push into the same slot is reported");
+        CHECK(bodyHas(r,"\"results\"") && bodyHas(r,"\"overwritten\":true"), "and named per series");
+
+        // the replacement really is what is stored
+        r = request("GET","/v1/series/60001/data?start=1700000120&end=1700000180","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"data\":\"41\""), "the later value is the one kept");
+
+        // a fresh slot is not an overwrite
+        snprintf(path,sizeof(path),"/v1/now?at=%lld",T + 300);
+        r = request("POST",path,"read-write-key","60001 51\n");
+        CHECK(r.status==200 && bodyHas(r,"\"overwritten\":0"), "an empty slot is not an overwrite");
+
+        // one value per series is the contract
+        snprintf(path,sizeof(path),"/v1/now?at=%lld",T + 400);
+        r = request("POST",path,"read-write-key","60001 5152\n");
+        CHECK(r.status==422 && bodyHas(r,"expected_single_point"), "more than one point per line is refused");
+
+        r = request("POST","/v1/now","read-write-key","");
+        CHECK(r.status==400 && bodyHas(r,"empty_body"), "an empty body is 400");
+        r = request("POST","/v1/now","read-write-key","60001 11 1700000000\n");
+        CHECK(r.status==400 && bodyHas(r,"bad_record"), "a stray timestamp is refused");
+        r = request("POST","/v1/now","read-write-key","60001 zz\n");
+        CHECK(r.status==400 && bodyHas(r,"bad_hex"), "bad hex is 400");
+        r = request("POST","/v1/now","read-only-key","60001 11\n");
+        CHECK(r.status==403, "it needs the write key");
+        r = request("GET","/v1/now","read-write-key");
+        CHECK(r.status==405, "GET is 405");
+        r = request("POST","/v1/now?at=notatime","read-write-key","60001 11\n");
+        CHECK(r.status==400, "a bad at= is 400");
+
+        // the general batch endpoint reports overwrites too
+        r = request("POST","/v1/data","read-write-key","60001 1700000120 61\n");
+        CHECK(r.status==200 && bodyHas(r,"\"overwritten\":1"), "the batch endpoint reports overwrites");
+        r = request("POST","/v1/series/60001/data?timestamp=1700000120","read-write-key","62");
+        CHECK(r.status==200 && bodyHas(r,"\"overwritten\":1"), "so does the single series write");
+    }
+
+    printf("[13] method handling\n");
     {
         REPLY r = request("DELETE","/v1/series","read-write-key");
         CHECK(r.status==405, "DELETE on the collection is 405");

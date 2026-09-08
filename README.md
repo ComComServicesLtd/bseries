@@ -82,6 +82,7 @@ because a series holds raw binary of whatever width it was defined with.
 | GET | `/v1/series/{key}/data?start=&end=` | read | read a range |
 | GET | `/v1/data?keys=&start=&end=` | read | read a range across several series |
 | POST | `/v1/data` | write | write points to several series |
+| POST | `/v1/now` | write | push one reading into every series, at the nearest slot |
 | POST | `/v1/series/{key}/data?timestamp=` | write | write points |
 
 `start` and `end` are unix timestamps; `end` defaults to now. A write body is the
@@ -204,6 +205,56 @@ committed before the body is produced: anything that could make a read fail is
 checked up front, and a series that fails after that point is reported as an entry
 inside the array. An HTTP/1.0 client gets a close delimited body instead of chunked
 encoding, and that connection is not reused.
+
+### Pushing one reading into every series
+
+`POST /v1/now` is the shape a poller wants: it has just sampled a thousand devices
+and does not care which slot each reading lands in, only that they all land in the
+one nearest now. One record per line, and **no timestamps in the body at all**, so
+a client with a wrong clock cannot scatter readings across the grid:
+
+```
+<key>  <hex>
+```
+
+```
+$ printf '1 0a\n2 14\n3 1e\n' \
+    | curl -XPOST -H 'X-API-Key: $WRITE_KEY' --data-binary @- localhost:8086/v1/now
+{"now":1700000005,"records":3,"records_written":3,"records_failed":0,"overwritten":0}
+```
+
+Unlike `/v1/data`, this rounds to the **nearest** slot rather than flooring, which
+halves the worst case placement error; exactly halfway takes the later slot. Each
+series is snapped to its own grid, since each has its own start and interval. One
+value per series is the contract — a line carrying a run of points is refused with
+`expected_single_point`, because that is what `/v1/data` is for. `at=` overrides
+the server clock, for replay and testing.
+
+### When a reading replaces another
+
+A slot holds one value, so a second reading landing in a slot that already holds a
+real one replaces it. Every write endpoint now reports when that happened:
+
+```
+$ printf '1 0c\n2 16\n3 20\n' | curl -XPOST ... localhost:8086/v1/now
+{"now":1700000055,"records":3,"records_written":3,"records_failed":0,"overwritten":3,
+ "results":[{"line":1,"key":1,"state":"written","slot":1700000060,"overwritten":true},
+            {"line":2,"key":2,"state":"written","slot":1700000060,"overwritten":true},
+            {"line":3,"key":3,"state":"written","slot":1700000060,"overwritten":true}]}
+```
+
+A steady stream of these means the poller is sampling faster than the series
+interval, or its period is drifting against the grid — either way readings are
+being discarded, and now you can see it rather than infer it later from a gap.
+
+`results` lists only the records worth looking at: the ones that failed and the
+ones that replaced a reading. For a two thousand device batch that is the
+difference between a line of JSON and a megabyte of it. `verbose=1` lists every
+record instead. This applies to `/v1/data` as well.
+
+Detection costs nothing on the cached write path, where the slot is already in
+memory, and one point read on the direct path. `write()` only does it when a
+caller passes an `overwrote` flag, so the library's own hot path is unchanged.
 
 ### Timestamps and how far a series can grow
 

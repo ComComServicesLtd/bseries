@@ -626,7 +626,10 @@ bool BSeries::validateWriteAheadCache(ENTRY *series){
 
 /// Any modifications to the map (New entries or deleted entries have to lock)
 
-int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timestamp){
+int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timestamp, bool *overwrote){
+
+    if(overwrote != NULL)
+        *overwrote = false;
 
     if(shuttingDown) // We lock mutexes after the database is shutdown, some writes could hang here trying to lock the mutex so we force return
         return -1;
@@ -657,6 +660,7 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
     do {
 
         int size;
+        unsigned char existing_point[8]; // widest point this build stores
 
         _DEBUG("Writing to series %u\n",key);
 
@@ -779,8 +783,22 @@ retry:
 
             // Check if this is a cache write or memory write
             if(pointsInBuffer < write_ahead_size){
+
+                char *slot = series->write_ahead_cache + (pointsInBuffer * series->datasize);
+
+                if(overwrote != NULL){
+                    // Anything other than the null fill means a real reading is
+                    // about to be replaced.
+                    for(uint32_t byte = 0; byte < series->datasize; byte++){
+                        if((unsigned char)slot[byte] != series->null_fill_byte){
+                            *overwrote = true;
+                            break;
+                        }
+                    }
+                }
+
                 // Write to buffer
-                memcpy(series->write_ahead_cache + (pointsInBuffer * series->datasize),value,series->datasize);
+                memcpy(slot,value,series->datasize);
                 _DEBUG("\t Writing to buffer at pos: %d\n",pointsInBuffer);
 
                 if(pointsInBuffer == (write_ahead_size-1)){ // If we've reached the end of our buffer, flush it.
@@ -890,6 +908,20 @@ retry:
                     _ERROR("\tFailed to open file for direct writing\n");
                     status = FILE_OPEN_FAILURE;
                     break;
+                }
+            }
+
+            if(overwrote != NULL && series->datasize <= sizeof(existing_point)){
+
+                fseek(file,file_pos,SEEK_SET);
+
+                if(fread(existing_point,series->datasize,1,file) == 1){
+                    for(uint32_t byte = 0; byte < series->datasize; byte++){
+                        if(existing_point[byte] != series->null_fill_byte){
+                            *overwrote = true;
+                            break;
+                        }
+                    }
                 }
             }
 

@@ -7,6 +7,12 @@
 
 CXX      ?= g++
 CXXFLAGS ?= -std=c++11 -O2 -Wall -Wextra
+
+# -MMD -MP makes the compiler emit a .d file listing the headers each object
+# depends on, which is included below. Without it a header change does not
+# rebuild anything that included it, and you get a link error or, worse, a
+# binary built from two different versions of a struct.
+DEPFLAGS  = -MMD -MP
 LDFLAGS  ?=
 LDLIBS   ?= -pthread
 
@@ -28,7 +34,9 @@ bseriesd: $(SERVER_OBJECTS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+-include $(SERVER_OBJECTS:.o=.d)
 
 tests/%: tests/%.cpp $(SERVER_SOURCES)
 	$(CXX) $(CXXFLAGS) -I. -o $@ $< bseries.cpp http_server.cpp bseries_api.cpp $(LDLIBS)
@@ -56,4 +64,4 @@ install: bseriesd
 	install -m 755 bseriesd $(DESTDIR)$(PREFIX)/bin/bseriesd
 
 clean:
-	rm -f *.o bseriesd $(TESTS)
+	rm -f *.o *.d bseriesd $(TESTS)

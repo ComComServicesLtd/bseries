@@ -157,7 +157,11 @@ public:
     uint32_t getChecksum(SERIES *series);
     bool bindHeader(ENTRY *entry, uint32_t key);
 
-    int write(uint32_t key, void *value, uint32_t datasize, uint32_t timestamp = 0);
+    /// overwrote, when supplied, is set true if the slot this write lands in
+    /// already held something other than the series' null fill, meaning a real
+    /// reading was replaced. Checking costs a read of one point on the direct
+    /// write path, so it is only done when a caller asks for it.
+    int write(uint32_t key, void *value, uint32_t datasize, uint32_t timestamp = 0, bool *overwrote = NULL);
     int read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n_points, int64_t *r_points, int64_t *seconds_per_point, int64_t *first_point_timestamp, uint32_t *datasize, void **result, uint8_t *datatype = NULL);
 
 
