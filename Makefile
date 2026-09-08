@@ -26,12 +26,32 @@ SERVER_OBJECTS = $(SERVER_SOURCES:.cpp=.o)
 
 TESTS = tests/test_bseries tests/test_definitions tests/test_auth tests/test_api tests/test_concurrency
 
-.PHONY: all clean test install
+.PHONY: all clean test install static lib install-lib
 
 all: bseriesd
 
 bseriesd: $(SERVER_OBJECTS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+# A self contained binary, for a scratch or distroless container image. Clean
+# under musl; under glibc the linker warns that getaddrinfo wants its shared
+# libraries back at run time, which is why the image builds on alpine.
+static:
+	$(CXX) $(CXXFLAGS) -static -o bseriesd $(SERVER_SOURCES) $(LDLIBS)
+
+# The library on its own, for linking bseries into another program rather than
+# talking to it over HTTP.
+LIB_HEADERS = bseries.h bseries_types.h debug.h
+
+lib: libbseries.a
+
+libbseries.a: bseries.o
+	$(AR) rcs $@ $^
+
+install-lib: libbseries.a
+	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include/bseries
+	install -m 644 libbseries.a $(DESTDIR)$(PREFIX)/lib/libbseries.a
+	install -m 644 $(LIB_HEADERS) $(DESTDIR)$(PREFIX)/include/bseries/
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c -o $@ $<
@@ -64,4 +84,4 @@ install: bseriesd
 	install -m 755 bseriesd $(DESTDIR)$(PREFIX)/bin/bseriesd
 
 clean:
-	rm -f *.o *.d bseriesd $(TESTS)
+	rm -f *.o *.d *.a bseriesd $(TESTS)

@@ -1,0 +1,13 @@
+# Build output; the image builds from source inside the build stage
+*.o
+*.d
+*.a
+bseriesd
+tests/test_bseries
+tests/test_definitions
+tests/test_auth
+tests/test_api
+tests/test_concurrency
+
+.git
+.gitignore

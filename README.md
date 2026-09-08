@@ -72,6 +72,52 @@ bseriesd -c /etc/bseriesd.conf
 See `bseriesd.conf.example` for the settings. Point data crosses the wire as hex,
 because a series holds raw binary of whatever width it was defined with.
 
+### In a container
+
+```
+docker build -t bseries .
+docker run -d -p 127.0.0.1:8086:8086 -v bseries-data:/data bseries
+docker logs <id>          # prints the one time bootstrap token
+```
+
+The project has no dependencies, so the image is `scratch` plus one static binary
+and an empty data directory — nothing else to patch or audit. It builds on alpine
+rather than a glibc base on purpose: glibc's `getaddrinfo` wants its shared
+libraries back at run time even inside a static binary, and musl's does not.
+
+The container runs as uid 10001, writes only to `/data`, and works with a
+read-only root filesystem. `docker-compose.example.yml` is a starting point.
+
+**Configuration comes from the environment.** Every setting the file understands
+has a `BSERIES_` twin — `listen` is `BSERIES_LISTEN`, `max_points_per_read` is
+`BSERIES_MAX_POINTS_PER_READ` — so no configuration file needs baking into an
+image. A file can still be given with `-c` or `BSERIES_CONFIG`, and the
+environment wins over it. `BSERIES_CORS_ORIGIN` takes a comma separated list,
+since an environment variable cannot be repeated the way a configuration line can.
+
+The image sets `BSERIES_LISTEN=0.0.0.0`, unlike the shipped default of the
+loopback. Inside a container the loopback is reachable only from the container
+itself, so the normal default would look like the server was ignoring you.
+
+**Health checks need no HTTP client in the image.** `bseriesd --health` connects to
+the configured address, asks `/v1/health`, and exits 0 or 1, so `HEALTHCHECK` runs
+the same binary.
+
+**Logs go to stderr, unbuffered.** That matters more than it sounds: diagnostics
+used to go to stdout through `printf`, which is block buffered when stdout is a
+pipe — which is exactly what `docker logs` gives it. A warning would sit in the
+buffer until the process exited, and a `kill -9` lost it entirely.
+
+Shutdown flushes every buffer, so give the container time to stop:
+`stop_grace_period` in compose, or `--stop-timeout` on `docker run`. The default
+10 seconds is enough for a normal database.
+
+### As a library
+
+`make lib` builds `libbseries.a`, and `make install-lib` installs it with the
+headers under `$(PREFIX)/include/bseries`, for linking bseries into a program
+directly rather than talking to it over HTTP.
+
 Every data path is rooted at a table (see **Tables** below); `{t}` stands for the
 table name.
 

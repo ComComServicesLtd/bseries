@@ -5,6 +5,13 @@
 # server running with something other than what was intended.
 #
 #     bseriesd -c /etc/bseriesd.conf
+#
+# This file is optional. Every setting here also reads from the environment as
+# BSERIES_<SETTING> in upper case: listen is BSERIES_LISTEN, max_points_per_read
+# is BSERIES_MAX_POINTS_PER_READ, and so on. The environment wins over the file,
+# so an image can carry defaults in a file and be tuned with -e at run time.
+# BSERIES_CORS_ORIGIN takes a comma separated list, since an environment variable
+# cannot be repeated the way the cors_origin line below can.
 
 
 # --- where to listen ------------------------------------------------------

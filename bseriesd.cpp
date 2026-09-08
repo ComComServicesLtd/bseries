@@ -13,6 +13,9 @@
 #include <atomic>
 #include <vector>
 #include <string>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
 
 #include "bseries.h"
 #include "bseries_api.h"
@@ -86,22 +89,114 @@ static void maintenanceThread(TableSet *tables, RUNTIME_SETTINGS *runtime){
 
 static void usage(const char *program){
     fprintf(stderr,
-        "usage: %s -c <config file>\n"
+        "usage: %s [-c <config file>] [--health]\n"
         "\n"
-        "  -c <path>   configuration file, see bseriesd.conf.example\n"
+        "  -c <path>   configuration file, see bseriesd.conf.example.\n"
+        "              Optional: every setting also reads from the environment as\n"
+        "              BSERIES_<SETTING>, which is what a container usually wants.\n"
+        "  --health    connect to the configured address and exit 0 if the server\n"
+        "              is answering, 1 if it is not. Meant for a container health\n"
+        "              check, so the image needs no curl.\n"
         "  -h          this message\n",
         program);
 }
 
 
+/// Asks a running server whether it is alive, using nothing but sockets so that a
+/// minimal image does not have to carry an HTTP client just to be health checked.
+
+static int healthCheck(const API_CONFIG &config){
+
+    char port_text[16];
+    snprintf(port_text,sizeof(port_text),"%d",config.port);
+
+    // An address the server binds to may be a wildcard, which is not a useful
+    // thing to connect to; from inside the container the loopback is.
+    std::string host = config.bind_address;
+
+    if(host.empty() || host == "0.0.0.0" || host == "*")
+        host = "127.0.0.1";
+    else if(host == "::")
+        host = "::1";
+
+    struct addrinfo hints;
+    memset(&hints,0,sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *results = NULL;
+
+    if(getaddrinfo(host.c_str(),port_text,&hints,&results) != 0)
+        return 1;
+
+    int fd = -1;
+
+    for(struct addrinfo *candidate = results; candidate != NULL; candidate = candidate->ai_next){
+
+        fd = socket(candidate->ai_family,candidate->ai_socktype,candidate->ai_protocol);
+
+        if(fd < 0)
+            continue;
+
+        struct timeval timeout;
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+        setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+        setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
+
+        if(connect(fd,candidate->ai_addr,candidate->ai_addrlen) == 0)
+            break;
+
+        close(fd);
+        fd = -1;
+    }
+
+    freeaddrinfo(results);
+
+    if(fd < 0)
+        return 1;
+
+    const char *request =
+        "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    size_t length = strlen(request);
+    size_t sent = 0;
+
+    while(sent < length){
+        ssize_t wrote = send(fd,request + sent,length - sent,0);
+        if(wrote <= 0){ close(fd); return 1; }
+        sent += (size_t)wrote;
+    }
+
+    char reply[512];
+    ssize_t got = recv(fd,reply,sizeof(reply)-1,0);
+    close(fd);
+
+    if(got <= 0)
+        return 1;
+
+    reply[got] = 0;
+
+    return strstr(reply,"200") != NULL ? 0 : 1;
+}
+
+
 int main(int argc, char **argv){
 
-    const char *config_path = NULL;
+    // Whatever does reach stdout goes out a line at a time. Under docker logs it
+    // is a pipe, and a block buffered pipe means output that appears late or, on
+    // a hard kill, not at all. Diagnostics go to stderr, which is unbuffered.
+    setvbuf(stdout,NULL,_IOLBF,0);
+
+    const char *config_path = getenv("BSERIES_CONFIG");
+    bool health_only = false;
 
     for(int i = 1; i < argc; i++){
 
         if(strcmp(argv[i],"-c") == 0 && i + 1 < argc){
             config_path = argv[++i];
+        } else if(strcmp(argv[i],"--health") == 0){
+            health_only = true;
         } else if(strcmp(argv[i],"-h") == 0){
             usage(argv[0]);
             return 0;
@@ -111,23 +206,29 @@ int main(int argc, char **argv){
         }
     }
 
-    if(config_path == NULL){
-        usage(argv[0]);
-        return 2;
-    }
-
     API_CONFIG config;
     apiConfigDefaults(&config);
 
     std::string error;
 
-    if(apiLoadConfig(config_path,&config,&error) != NO_ERROR){
+    // The file is optional. A container is usually configured entirely from its
+    // environment, and requiring a file would mean baking one into every image.
+    if(config_path != NULL && apiLoadConfig(config_path,&config,&error) != NO_ERROR){
         fprintf(stderr,"bseriesd: %s\n",error.c_str());
         return 1;
     }
 
+    // Environment last, so it wins over a file baked into an image.
+    if(apiApplyEnvironment(&config,&error) != NO_ERROR){
+        fprintf(stderr,"bseriesd: %s\n",error.c_str());
+        return 1;
+    }
+
+    if(health_only)
+        return healthCheck(config);
+
     if(config.data_directory.empty()){
-        fprintf(stderr,"bseriesd: data_directory is not set in %s\n",config_path);
+        fprintf(stderr,"bseriesd: data_directory is not set; give it in a config file or as BSERIES_DATA_DIRECTORY\n");
         return 1;
     }
 

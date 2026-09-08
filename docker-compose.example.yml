@@ -1,0 +1,43 @@
+# A starting point rather than something to deploy unchanged.
+#
+# The database has no keys on a first run. It prints a one time bootstrap token
+# to its log; take it from `docker compose logs bseries` and mint the first key:
+#
+#   curl -XPOST -H 'X-API-Key: <token>' \
+#     'localhost:8086/v1/auth/keys?role=write&name=admin'
+#
+# The token is only good for that, and only until a write key exists.
+
+services:
+  bseries:
+    build: .
+    # image: bseries:latest
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8086:8086"     # bound to the host loopback; there is no TLS
+
+    volumes:
+      - bseries-data:/data
+      # - ./bseries.conf:/etc/bseries.conf:ro   # optional; the environment below
+      #                                          # is usually enough on its own
+
+    environment:
+      # Everything the configuration file understands has a BSERIES_ twin.
+      BSERIES_FLUSH_INTERVAL: "3600"
+      BSERIES_WRITE_AHEAD_SIZE: "1024"
+      BSERIES_SERIES_MAX_IDLE: "900"
+      # BSERIES_DEFINITIONS: /etc/bseries.conf
+      # BSERIES_CORS_ORIGIN: "https://dashboard.example.com,http://localhost:3000"
+
+    # Shutdown flushes every buffer to disk. The default 10 seconds is enough for
+    # a normal database; raise it if you hold a very large number of series.
+    stop_grace_period: 30s
+
+    # The image runs as an unprivileged user and never writes outside /data.
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  bseries-data:

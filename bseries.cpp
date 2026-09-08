@@ -1747,7 +1747,7 @@ int BSeries::listSeriesKeys(vector<uint32_t> *keys, uint32_t after, int limit){
 void BSeries::flush()
 {
 
-    cout << "Flushing Database" << endl;
+    _WARN("Flushing database\n");
 
     _DEBUG("Flushing All Series..\n");
     this->index_access.lock();
@@ -1768,7 +1768,7 @@ void BSeries::flush()
         it++;
     }
     this->index_access.unlock();
-    cout << "\t Done Flushing Database" << endl;
+    _WARN("Done flushing database\n");
 }
 
 
@@ -1776,7 +1776,7 @@ void BSeries::flush()
 void BSeries::close()
 {
 
-    cout << "Closing Database" << endl;
+    _WARN("Closing database\n");
 
     this->shuttingDown = true;
 
@@ -1800,7 +1800,7 @@ void BSeries::close()
     }
     this->index_access.unlock();
 
-    cout << "\t Done Closing Database" << endl;
+    _WARN("Done closing database\n");
 }
 
 

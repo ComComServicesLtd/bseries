@@ -527,6 +527,143 @@ void apiConfigDefaults(API_CONFIG *config){
 }
 
 
+/// One table of every setting, used by both the file parser and the environment
+/// reader so the two cannot drift apart.
+
+typedef struct {
+    const char *name;
+    int kind;                       // 0 = string, 1 = number, 2 = boolean, 3 = repeated string
+    std::string API_CONFIG::*text;
+    int API_CONFIG::*number;
+    bool API_CONFIG::*flag;
+} CONFIG_FIELD;
+
+#define CONFIG_TEXT   0
+#define CONFIG_NUMBER 1
+#define CONFIG_FLAG   2
+#define CONFIG_LIST   3
+
+static const CONFIG_FIELD CONFIG_FIELDS[] = {
+    {"listen",               CONFIG_TEXT,   &API_CONFIG::bind_address,        NULL, NULL},
+    {"data_directory",       CONFIG_TEXT,   &API_CONFIG::data_directory,      NULL, NULL},
+    {"definitions",          CONFIG_TEXT,   &API_CONFIG::definitions_path,    NULL, NULL},
+    {"keystore",             CONFIG_TEXT,   &API_CONFIG::keystore_path,       NULL, NULL},
+    {"read_key",             CONFIG_TEXT,   &API_CONFIG::read_key,            NULL, NULL},
+    {"write_key",            CONFIG_TEXT,   &API_CONFIG::write_key,           NULL, NULL},
+    {"cors_origin",          CONFIG_LIST,   NULL,                             NULL, NULL},
+    {"port",                 CONFIG_NUMBER, NULL, &API_CONFIG::port,                 NULL},
+    {"max_points_per_read",  CONFIG_NUMBER, NULL, &API_CONFIG::max_points_per_read,  NULL},
+    {"max_series_per_read",  CONFIG_NUMBER, NULL, &API_CONFIG::max_series_per_read,  NULL},
+    {"max_points_per_write", CONFIG_NUMBER, NULL, &API_CONFIG::max_points_per_write, NULL},
+    {"max_grow_points",      CONFIG_NUMBER, NULL, &API_CONFIG::max_grow_points,      NULL},
+    {"max_condense_scan",    CONFIG_NUMBER, NULL, &API_CONFIG::max_condense_scan,    NULL},
+    {"condense_window",      CONFIG_NUMBER, NULL, &API_CONFIG::condense_window_points, NULL},
+    {"max_body_bytes",       CONFIG_NUMBER, NULL, &API_CONFIG::max_body_bytes,       NULL},
+    {"max_connections",      CONFIG_NUMBER, NULL, &API_CONFIG::max_connections,      NULL},
+    {"write_ahead_size",     CONFIG_NUMBER, NULL, &API_CONFIG::write_ahead_size,     NULL},
+    {"default_interval",     CONFIG_NUMBER, NULL, &API_CONFIG::default_interval,     NULL},
+    {"flush_interval",       CONFIG_NUMBER, NULL, &API_CONFIG::flush_interval,       NULL},
+    {"series_max_idle",      CONFIG_NUMBER, NULL, &API_CONFIG::series_max_idle_seconds, NULL},
+    {"maintenance_interval", CONFIG_NUMBER, NULL, &API_CONFIG::maintenance_interval_seconds, NULL},
+    {"auto_create_tables",   CONFIG_FLAG,   NULL, NULL, &API_CONFIG::auto_create_tables}
+};
+
+#define CONFIG_FIELD_COUNT (sizeof(CONFIG_FIELDS)/sizeof(CONFIG_FIELDS[0]))
+
+
+/// Applies one name/value pair. Returns false when the name is unknown or the
+/// value does not fit it.
+
+static bool applyConfigField(API_CONFIG *config, const std::string &name, const std::string &value, std::string *why){
+
+    for(unsigned i = 0; i < CONFIG_FIELD_COUNT; i++){
+
+        if(name != CONFIG_FIELDS[i].name)
+            continue;
+
+        if(CONFIG_FIELDS[i].kind == CONFIG_TEXT){
+            config->*(CONFIG_FIELDS[i].text) = value;
+            return true;
+        }
+
+        if(CONFIG_FIELDS[i].kind == CONFIG_LIST){
+            config->cors_origins.push_back(value);
+            return true;
+        }
+
+        unsigned long number = 0;
+
+        if(!parseUnsigned(value,&number)){
+            if(why) *why = "'" + value + "' is not a number";
+            return false;
+        }
+
+        if(CONFIG_FIELDS[i].kind == CONFIG_FLAG)
+            config->*(CONFIG_FIELDS[i].flag) = (number != 0);
+        else
+            config->*(CONFIG_FIELDS[i].number) = (int)number;
+
+        return true;
+    }
+
+    if(why) *why = "unknown setting";
+    return false;
+}
+
+
+/// listen -> BSERIES_LISTEN. cors_origin takes a comma separated list, since an
+/// environment variable cannot be repeated the way a configuration line can.
+
+int apiApplyEnvironment(API_CONFIG *config, std::string *error_out){
+
+    for(unsigned i = 0; i < CONFIG_FIELD_COUNT; i++){
+
+        std::string variable = "BSERIES_";
+
+        for(const char *c = CONFIG_FIELDS[i].name; *c; c++)
+            variable += (char)toupper((unsigned char)*c);
+
+        const char *value = getenv(variable.c_str());
+
+        if(value == NULL || *value == 0)
+            continue;
+
+        if(CONFIG_FIELDS[i].kind == CONFIG_LIST){
+
+            std::string list = value;
+            size_t position = 0;
+
+            while(position <= list.size()){
+
+                size_t comma = list.find(',',position);
+                if(comma == std::string::npos)
+                    comma = list.size();
+
+                std::string item = list.substr(position,comma - position);
+                position = comma + 1;
+
+                size_t first = item.find_first_not_of(" \t");
+                size_t last = item.find_last_not_of(" \t");
+
+                if(first != std::string::npos)
+                    config->cors_origins.push_back(item.substr(first,last - first + 1));
+            }
+
+            continue;
+        }
+
+        std::string why;
+
+        if(!applyConfigField(config,CONFIG_FIELDS[i].name,value,&why)){
+            if(error_out) *error_out = variable + ": " + why;
+            return INVALID_SERIES_DEFINITION;
+        }
+    }
+
+    return NO_ERROR;
+}
+
+
 int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out){
 
     FILE *file = fopen(path,"r");
@@ -567,39 +704,16 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out){
             break;
         }
 
-        std::string key(name);
-        std::string text(value);
-        unsigned long number = 0;
+        std::string why;
 
-        if(key == "listen")                            config->bind_address = text;
-        else if(key == "data_directory")               config->data_directory = text;
-        else if(key == "definitions")                  config->definitions_path = text;
-        else if(key == "read_key")                     config->read_key = text;
-        else if(key == "write_key")                    config->write_key = text;
-        else if(key == "keystore")                     config->keystore_path = text;
-        else if(key == "cors_origin")                  config->cors_origins.push_back(text);
-        else if(key == "port"                     && parseUnsigned(text,&number)) config->port = (int)number;
-        else if(key == "max_points_per_read"      && parseUnsigned(text,&number)) config->max_points_per_read = (int)number;
-        else if(key == "max_series_per_read"      && parseUnsigned(text,&number)) config->max_series_per_read = (int)number;
-        else if(key == "max_points_per_write"     && parseUnsigned(text,&number)) config->max_points_per_write = (int)number;
-        else if(key == "max_grow_points"          && parseUnsigned(text,&number)) config->max_grow_points = (int)number;
-        else if(key == "flush_interval"           && parseUnsigned(text,&number)) config->flush_interval = (int)number;
-        else if(key == "max_condense_scan"        && parseUnsigned(text,&number)) config->max_condense_scan = (int)number;
-        else if(key == "condense_window"          && parseUnsigned(text,&number)) config->condense_window_points = (int)number;
-        else if(key == "auto_create_tables"       && parseUnsigned(text,&number)) config->auto_create_tables = (number != 0);
-        else if(key == "max_body_bytes"           && parseUnsigned(text,&number)) config->max_body_bytes = (int)number;
-        else if(key == "max_connections"          && parseUnsigned(text,&number)) config->max_connections = (int)number;
-        else if(key == "write_ahead_size"         && parseUnsigned(text,&number)) config->write_ahead_size = (int)number;
-        else if(key == "default_interval"         && parseUnsigned(text,&number)) config->default_interval = (int)number;
-        else if(key == "series_max_idle"          && parseUnsigned(text,&number)) config->series_max_idle_seconds = (int)number;
-        else if(key == "maintenance_interval"     && parseUnsigned(text,&number)) config->maintenance_interval_seconds = (int)number;
-        else {
-            char message[256];
-            snprintf(message,sizeof(message),"%s line %d: unknown or malformed setting '%s'",path,line_number,name);
+        if(!applyConfigField(config,std::string(name),std::string(value),&why)){
+            char message[320];
+            snprintf(message,sizeof(message),"%s line %d: %s '%s'",path,line_number,why.c_str(),name);
             if(error_out) *error_out = message;
             status = INVALID_SERIES_DEFINITION;
             break;
         }
+
     }
 
     fclose(file);

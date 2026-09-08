@@ -83,6 +83,17 @@ void apiConfigDefaults(API_CONFIG *config);
 /// cannot leave the server listening with settings the operator did not intend.
 int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out);
 
+/// Applies BSERIES_* environment variables over whatever is already in config.
+///
+/// Every setting the file understands has an environment twin: listen becomes
+/// BSERIES_LISTEN, max_points_per_read becomes BSERIES_MAX_POINTS_PER_READ, and so
+/// on. This is what lets the server run from `docker run -e` with no file at all,
+/// which is how a container expects to be configured.
+///
+/// Environment wins over the file, since the file is baked into an image and the
+/// environment is what the operator sets at run time.
+int apiApplyEnvironment(API_CONFIG *config, std::string *error_out);
+
 
 /// HTTP interface to a set of tables.
 ///
