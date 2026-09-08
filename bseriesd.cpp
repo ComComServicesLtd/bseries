@@ -261,13 +261,22 @@ int main(int argc, char **argv){
             return 1;
         }
 
+        // A wildcard bind address is not something anyone can curl, and printing
+        // it is the first thing a container user would try and fail with.
+        const char *reachable = config.bind_address.c_str();
+
+        if(config.bind_address.empty() || config.bind_address == "0.0.0.0" || config.bind_address == "*")
+            reachable = "localhost";
+        else if(config.bind_address == "::")
+            reachable = "[::1]";
+
         fprintf(stderr,
             "\nbseriesd: this database has no write key yet.\n"
             "  Create the first one with:\n\n"
             "    curl -XPOST -H 'X-API-Key: %s' \\\n"
             "      '%s:%d/v1/auth/keys?role=write&name=admin'\n\n"
             "  This token works only for that, and only until a write key exists.\n\n",
-            token.c_str(),config.bind_address.c_str(),config.port);
+            token.c_str(),reachable,config.port);
     }
 
     TableSet tables;
