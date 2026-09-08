@@ -117,6 +117,7 @@ int main(int argc, char **argv){
     db.data_directory = config.data_directory.c_str();
     db.write_ahead_size = config.write_ahead_size;
     db.default_seconds_per_point = config.default_interval;
+    db.max_grow_points = config.max_grow_points;
 
     if(!config.definitions_path.empty()){
 

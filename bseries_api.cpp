@@ -118,6 +118,28 @@ static void jsonError(HTTP_RESPONSE &response, int status, const char *error, co
 }
 
 
+/// A stable machine readable name for a database status code.
+
+static const char *databaseErrorSlug(int code){
+
+    switch(code){
+        case NO_ERROR:                     return "ok";
+        case SERIES_NOT_FOUND:
+        case FAILED_TO_OPEN_FILE:          return "series_not_found";
+        case SERIES_ALREADY_EXISTS:        return "series_exists";
+        case SERIES_TYPE_MISMATCH:         return "type_mismatch";
+        case WRITE_BEFORE_SERIES_START:    return "timestamp_before_series_start";
+        case SERIES_GROWTH_LIMIT:          return "timestamp_too_far_ahead";
+        case INVALID_TIME_RANGE:           return "invalid_time_range";
+        case INVALID_SERIES_DEFINITION:    return "invalid_series_definition";
+        case INVALID_HEADER_CHECKSUM:
+        case FAILED_TO_READ_HEADER:
+        case INVALID_SERIES_INTERVAL:      return "corrupt_series";
+        default:                           return "database_error";
+    }
+}
+
+
 /// Maps a database status code onto an HTTP status and a stable error slug.
 
 static void jsonDatabaseError(HTTP_RESPONSE &response, int code, const char *action){
@@ -138,6 +160,9 @@ static void jsonDatabaseError(HTTP_RESPONSE &response, int code, const char *act
             return;
         case WRITE_BEFORE_SERIES_START:
             jsonError(response,422,"timestamp_before_series_start",message);
+            return;
+        case SERIES_GROWTH_LIMIT:
+            jsonError(response,422,"timestamp_too_far_ahead",message);
             return;
         case INVALID_TIME_RANGE:
             jsonError(response,400,"invalid_time_range",message);
@@ -316,6 +341,8 @@ void apiConfigDefaults(API_CONFIG *config){
     config->cors_origins.clear();
     config->max_points_per_read = 1000000;
     config->max_series_per_read = 500;
+    config->max_points_per_write = 500000;
+    config->max_grow_points = 1000000;
     config->max_body_bytes = 1024 * 1024;
     config->max_connections = 64;
     config->write_ahead_size = 4096;
@@ -378,6 +405,8 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out){
         else if(key == "port"                     && parseUnsigned(text,&number)) config->port = (int)number;
         else if(key == "max_points_per_read"      && parseUnsigned(text,&number)) config->max_points_per_read = (int)number;
         else if(key == "max_series_per_read"      && parseUnsigned(text,&number)) config->max_series_per_read = (int)number;
+        else if(key == "max_points_per_write"     && parseUnsigned(text,&number)) config->max_points_per_write = (int)number;
+        else if(key == "max_grow_points"          && parseUnsigned(text,&number)) config->max_grow_points = (int)number;
         else if(key == "max_body_bytes"           && parseUnsigned(text,&number)) config->max_body_bytes = (int)number;
         else if(key == "max_connections"          && parseUnsigned(text,&number)) config->max_connections = (int)number;
         else if(key == "write_ahead_size"         && parseUnsigned(text,&number)) config->write_ahead_size = (int)number;
@@ -535,18 +564,22 @@ void BSeriesApi::route(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
         return;
     }
 
-    // /v1/data - several series over one time range
+    // /v1/data - several series in one request, read or write
     if(segments[1] == "data" && segments.size() == 2){
 
-        if(request.method != "GET"){
-            jsonError(response,405,"method_not_allowed","use GET to read series data");
+        if(request.method == "GET"){
+            if(!authorise(request,false,response)) return;
+            handleMultiRead(request,response);
             return;
         }
 
-        if(!authorise(request,false,response))
+        if(request.method == "POST" || request.method == "PUT"){
+            if(!authorise(request,true,response)) return;
+            handleBatchWrite(request,response);
             return;
+        }
 
-        handleMultiRead(request,response);
+        jsonError(response,405,"method_not_allowed","GET to read, POST to write");
         return;
     }
 
@@ -1101,6 +1134,88 @@ void BSeriesApi::handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &res
 
 
 
+/// Works out how wide a point is for this series and how far apart points sit.
+///
+/// The series' own header is the authority. For a series that does not exist yet
+/// the definitions file decides, and failing that the caller's payload is taken to
+/// be a single point, which is the only unambiguous reading available.
+
+bool BSeriesApi::resolveWriteShape(uint32_t key, size_t body_bytes, uint32_t *datasize, int64_t *interval, std::string *error){
+
+    SERIES header;
+    int64_t file_size = 0;
+
+    if(db->seriesInfo(key,&header,&file_size) == NO_ERROR){
+
+        *datasize = (header.version == SERIES_VERSION_TYPED)
+                  ? bsTypeCodeDataSize(header.typecode)
+                  : header.typecode;
+
+        *interval = (int64_t)header.interval;
+
+    } else {
+
+        SERIES_DEFINITION definition;
+
+        if(db->definitionForKey(key,&definition)){
+            *datasize = definition.datasize;
+            *interval = (int64_t)definition.interval;
+        } else {
+            *datasize = (uint32_t)body_bytes;
+            *interval = (int64_t)config.default_interval;
+        }
+    }
+
+    if(*datasize == 0){
+        *error = "the series has a zero point width";
+        return false;
+    }
+
+    if(body_bytes % *datasize != 0){
+        char message[192];
+        snprintf(message,sizeof(message),
+                 "%lu bytes is not a whole number of %lu byte points",
+                 (unsigned long)body_bytes,(unsigned long)*datasize);
+        *error = message;
+        return false;
+    }
+
+    if(body_bytes / *datasize > 1 && *interval <= 0){
+        *error = "the series has a zero interval, so consecutive points cannot be placed";
+        return false;
+    }
+
+    return true;
+}
+
+
+/// Writes consecutive points starting at timestamp. Returns a database status and
+/// sets written to how many points landed before any failure.
+
+int BSeriesApi::writePoints(uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written){
+
+    int64_t count = (int64_t)(points.size() / datasize);
+    *written = 0;
+
+    for(int64_t point = 0; point < count; point++){
+
+        long long point_time = timestamp + point * interval;
+
+        if(point_time > 0xFFFFFFFFLL)
+            return WRITE_BEFORE_SERIES_START; // ran off the end of 32 bit time
+
+        int rc = db->write(key,(void*)(points.data() + point * datasize),datasize,(uint32_t)point_time);
+
+        if(rc != NO_ERROR)
+            return rc;
+
+        (*written)++;
+    }
+
+    return NO_ERROR;
+}
+
+
 void BSeriesApi::handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     std::string timestamp_text = httpQueryParam(request,"timestamp");
@@ -1125,90 +1240,41 @@ void BSeriesApi::handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP
         return;
     }
 
-    // The point width has to be known before the body can be cut into points. For a
-    // series that does not exist yet that comes from the definitions file, and a
-    // body of exactly one point is the only unambiguous case.
     uint32_t datasize = 0;
+    int64_t interval = 0;
+    std::string shape_error;
 
-    SERIES header;
-    int64_t file_size = 0;
-
-    if(db->seriesInfo(key,&header,&file_size) == NO_ERROR){
-
-        datasize = (header.version == SERIES_VERSION_TYPED)
-                 ? bsTypeCodeDataSize(header.typecode)
-                 : header.typecode;
-
-    } else {
-
-        SERIES_DEFINITION definition;
-
-        if(db->definitionForKey(key,&definition)){
-            datasize = definition.datasize;
-        } else {
-            datasize = (uint32_t)points.size(); // a single point of whatever was sent
-        }
-    }
-
-    if(datasize == 0){
-        jsonError(response,500,"corrupt_series","the series has a zero point width");
-        return;
-    }
-
-    if(points.size() % datasize != 0){
-        char message[256];
-        snprintf(message,sizeof(message),
-                 "the body is %lu bytes, which is not a whole number of %lu byte points",
-                 (unsigned long)points.size(),(unsigned long)datasize);
-        jsonError(response,422,"bad_point_width",message);
+    if(!resolveWriteShape(key,points.size(),&datasize,&interval,&shape_error)){
+        jsonError(response,422,"bad_point_width",shape_error);
         return;
     }
 
     int64_t count = (int64_t)(points.size() / datasize);
-    int64_t interval = (file_size > 0) ? (int64_t)header.interval : 0;
 
-    if(interval == 0){
-        SERIES_DEFINITION definition;
-        interval = db->definitionForKey(key,&definition) ? (int64_t)definition.interval
-                                                         : (int64_t)config.default_interval;
-    }
-
-    if(count > 1 && interval <= 0){
-        jsonError(response,500,"corrupt_series","the series has a zero interval");
+    if(count > (int64_t)config.max_points_per_write){
+        char message[192];
+        snprintf(message,sizeof(message),"%lld points in one request, the limit is %d",
+                 (long long)count,config.max_points_per_write);
+        jsonError(response,413,"too_many_points",message);
         return;
     }
 
     int64_t written = 0;
+    int rc = writePoints(key,points,datasize,interval,timestamp,&written);
 
-    for(int64_t point = 0; point < count; point++){
+    if(rc != NO_ERROR){
 
-        long long point_time = timestamp + point * interval;
-
-        if(point_time > 0xFFFFFFFFLL){
-            jsonError(response,422,"timestamp_overflow","the run of points passes the end of 32 bit time");
+        if(written > 0){
+            char message[256];
+            snprintf(message,sizeof(message),
+                     "wrote %lld of %lld points before failing with database status %d",
+                     (long long)written,(long long)count,rc);
+            jsonError(response,500,"partial_write",message);
             return;
         }
 
-        int rc = db->write(key,(void*)(points.data() + point * datasize),datasize,(uint32_t)point_time);
-
-        if(rc != NO_ERROR){
-
-            if(written > 0){
-                // Some points already landed, so this is a partial write and the
-                // caller has to be told exactly how far it got.
-                char message[256];
-                snprintf(message,sizeof(message),
-                         "wrote %lld of %lld points before failing with database status %d",
-                         (long long)written,(long long)count,rc);
-                jsonError(response,500,"partial_write",message);
-                return;
-            }
-
-            jsonDatabaseError(response,rc,"writing points");
-            return;
-        }
-
-        written++;
+        jsonDatabaseError(response,rc,"writing points");
+        return;
     }
 
     char buffer[256];
@@ -1223,4 +1289,266 @@ void BSeriesApi::handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP
 
     response.status = 200;
     response.body = buffer;
+}
+
+
+/// One record of a batch write.
+
+typedef struct {
+    int line;
+    uint32_t key;
+    long long timestamp;
+    std::string points;    // already decoded from hex
+    uint32_t datasize;
+    int64_t interval;
+    int64_t count;
+    int64_t written;
+    int status;
+    bool attempted;
+} BATCH_RECORD;
+
+
+/// Splits a line on whitespace into at most max tokens. Returns how many it found;
+/// anything past max is left attached to the last token, which never happens for a
+/// well formed record and produces a clear error when it does.
+
+static int splitTokens(const std::string &line, std::string *tokens, int max){
+
+    int count = 0;
+    size_t position = 0;
+
+    while(position < line.size() && count < max){
+
+        while(position < line.size() && isspace((unsigned char)line[position]))
+            position++;
+
+        if(position >= line.size())
+            break;
+
+        size_t start = position;
+
+        while(position < line.size() && !isspace((unsigned char)line[position]))
+            position++;
+
+        tokens[count++] = line.substr(start,position - start);
+    }
+
+    // anything left over means the line had more fields than the grammar allows
+    while(position < line.size() && isspace((unsigned char)line[position]))
+        position++;
+
+    if(position < line.size())
+        return max + 1;
+
+    return count;
+}
+
+
+/// Points for several series in one request.
+///
+/// The body is one record per line:
+///
+///     <key> <timestamp|now> <hex>
+///
+/// The hex is one or more consecutive points, placed the same way the single series
+/// endpoint places them. Blank lines and lines beginning with # are ignored.
+///
+/// The whole body is parsed and validated before anything is written, so a typo on
+/// line four hundred cannot leave the first three hundred and ninety nine applied.
+/// The database has no transactions, so a failure during the write pass still
+/// leaves a partial batch; that is reported per record rather than glossed over.
+
+void BSeriesApi::handleBatchWrite(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+
+    std::vector<BATCH_RECORD> records;
+    int64_t total_points = 0;
+    long long now = (long long)time(NULL);
+
+    size_t position = 0;
+    int line_number = 0;
+
+    while(position <= request.body.size()){
+
+        size_t newline = request.body.find('\n',position);
+        if(newline == std::string::npos)
+            newline = request.body.size();
+
+        std::string line = request.body.substr(position,newline - position);
+        position = newline + 1;
+        line_number++;
+
+        while(!line.empty() && (line[line.size()-1] == '\r' || isspace((unsigned char)line[line.size()-1])))
+            line.erase(line.size()-1);
+
+        size_t first = line.find_first_not_of(" \t");
+        if(first == std::string::npos)
+            continue;                       // blank
+
+        if(line[first] == '#')
+            continue;                       // comment
+
+        std::string tokens[3];
+        int found = splitTokens(line,tokens,3);
+
+        if(found != 3){
+            char message[192];
+            snprintf(message,sizeof(message),
+                     "line %d: expected <key> <timestamp|now> <hex>",line_number);
+            jsonError(response,400,"bad_record",message);
+            return;
+        }
+
+        BATCH_RECORD record;
+        record.line = line_number;
+        record.written = 0;
+        record.status = NO_ERROR;
+        record.attempted = false;
+
+        unsigned long key_value = 0;
+
+        if(!parseUnsigned(tokens[0],&key_value) || key_value > 0xFFFFFFFFuL){
+            char message[192];
+            snprintf(message,sizeof(message),"line %d: '%s' is not a series key",line_number,tokens[0].c_str());
+            jsonError(response,400,"bad_record",message);
+            return;
+        }
+
+        record.key = (uint32_t)key_value;
+
+        if(tokens[1] == "now"){
+            record.timestamp = now;
+        } else if(!parseSigned(tokens[1],&record.timestamp) || record.timestamp <= 0 || record.timestamp > 0xFFFFFFFFLL){
+            char message[192];
+            snprintf(message,sizeof(message),
+                     "line %d: '%s' is not a unix timestamp that fits in 32 bits",line_number,tokens[1].c_str());
+            jsonError(response,400,"bad_record",message);
+            return;
+        }
+
+        if(!apiFromHex(tokens[2],&record.points) || record.points.empty()){
+            char message[192];
+            snprintf(message,sizeof(message),"line %d: the point data is not valid hex",line_number);
+            jsonError(response,400,"bad_hex",message);
+            return;
+        }
+
+        std::string shape_error;
+
+        if(!resolveWriteShape(record.key,record.points.size(),&record.datasize,&record.interval,&shape_error)){
+            char message[256];
+            snprintf(message,sizeof(message),"line %d: %s",line_number,shape_error.c_str());
+            jsonError(response,422,"bad_point_width",message);
+            return;
+        }
+
+        record.count = (int64_t)(record.points.size() / record.datasize);
+        total_points += record.count;
+
+        if(total_points > (int64_t)config.max_points_per_write){
+            char message[192];
+            snprintf(message,sizeof(message),
+                     "more than %d points in one request; split the batch",config.max_points_per_write);
+            jsonError(response,413,"too_many_points",message);
+            return;
+        }
+
+        records.push_back(record);
+    }
+
+    if(records.empty()){
+        jsonError(response,400,"empty_body","no records were supplied");
+        return;
+    }
+
+    // Everything parsed. Apply it.
+    //
+    // Every record is attempted even after one fails. These are independent
+    // series, and a single device with a bad clock must not cost the other
+    // thousand their points. The database has no transactions, so this is
+    // reported honestly per record rather than presented as all or nothing.
+    int64_t written_points = 0;
+    size_t records_written = 0;
+    size_t records_failed = 0;
+
+    for(size_t i = 0; i < records.size(); i++){
+
+        records[i].attempted = true;
+        records[i].status = writePoints(records[i].key,records[i].points,records[i].datasize,
+                                        records[i].interval,records[i].timestamp,&records[i].written);
+
+        written_points += records[i].written;
+
+        if(records[i].status == NO_ERROR)
+            records_written++;
+        else
+            records_failed++;
+    }
+
+    bool verbose = false;
+    std::string verbose_text = httpQueryParam(request,"verbose");
+
+    if(!verbose_text.empty() && verbose_text != "0" && verbose_text != "false")
+        verbose = true;
+
+    char head[320];
+
+    snprintf(head,sizeof(head),
+        "{\"records\":%lu,\"records_written\":%lu,\"records_failed\":%lu,"
+        "\"points_written\":%lld,\"points_expected\":%lld",
+        (unsigned long)records.size(),
+        (unsigned long)records_written,
+        (unsigned long)records_failed,
+        (long long)written_points,
+        (long long)total_points);
+
+    response.body = head;
+
+    // The per record detail is only worth the bytes when something went wrong, or
+    // when the caller explicitly asks for it.
+    if(records_failed > 0 || verbose){
+
+        response.body += ",\"results\":[";
+
+        for(size_t i = 0; i < records.size(); i++){
+
+            const char *state = !records[i].attempted ? "not_attempted"
+                              : (records[i].status == NO_ERROR ? "written" : "failed");
+
+            char entry[384];
+
+            snprintf(entry,sizeof(entry),
+                "%s{\"line\":%d,\"key\":%lu,\"state\":\"%s\",\"error\":\"%s\","
+                "\"points_written\":%lld,\"points_expected\":%lld,\"first_timestamp\":%lld}",
+                i > 0 ? "," : "",
+                records[i].line,
+                (unsigned long)records[i].key,
+                state,
+                databaseErrorSlug(records[i].status),
+                (long long)records[i].written,
+                (long long)records[i].count,
+                records[i].timestamp);
+
+            response.body += entry;
+        }
+
+        response.body += "]";
+    }
+
+    if(records_failed > 0){
+
+        // Nothing landing at all is a failed batch, not a partial one. Saying
+        // "partial" when zero points were written would be a lie a caller could
+        // act on.
+        response.status = 500;
+
+        if(records_written == 0)
+            response.body += ",\"error\":\"write_failed\",\"message\":\"no record could be written, see results\"}";
+        else
+            response.body += ",\"error\":\"partial_write\",\"message\":\"the batch was applied in part, see results\"}";
+
+        return;
+    }
+
+    response.status = 200;
+    response.body += "}";
 }

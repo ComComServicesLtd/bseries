@@ -5,6 +5,7 @@
 #include "bseries_api.h"
 #include "http_server.h"
 #include "test_util.h"
+#include <time.h>
 
 #include <string>
 #include <thread>
@@ -271,12 +272,105 @@ int main(int argc, char **argv){
         r = request("GET","/v1/data?keys=10500","read-only-key");
         CHECK(r.status==400 && bodyHas(r,"start"), "start still required");
         r = request("POST","/v1/data?keys=10500&start=1700000000","read-write-key");
-        CHECK(r.status==405, "POST to the multi read endpoint is 405");
+        CHECK(r.status==400 && bodyHas(r,"empty_body"), "POST to the same path is a batch write, not a read");
         r = request("GET","/v1/data?keys=10500&start=1700000000&end=1700000300",NULL);
         CHECK(r.status==401, "multi read needs a key");
     }
 
-    printf("[9] delete and list\n");
+    printf("[9] batch write\n");
+    {
+        // 10502 is new, 10500 and 10501 already exist
+        REPLY r = request("POST","/v1/series/10502?type=float32&interval=60&start=1700000000","read-write-key");
+        CHECK(r.status==201, "create a third series");
+
+        std::string batch =
+            "# one record per line\n"
+            "10500 1700000600 0000a4410000aa41\n"
+            "\n"
+            "10501 1700000600 0000b041\n"
+            "10502 1700000600 0000c8410000ca410000cc41\n";
+
+        r = request("POST","/v1/data","read-write-key",batch);
+        CHECK(r.status==200, "batch accepted");
+        CHECK(bodyHas(r,"\"records\":3"), "three records");
+        CHECK(bodyHas(r,"\"points_written\":6"), "six points across three series");
+        CHECK(!bodyHas(r,"\"results\""), "no per record detail unless asked");
+
+        r = request("POST","/v1/data?verbose=1","read-write-key","10500 1700001200 0000a441\n");
+        CHECK(r.status==200 && bodyHas(r,"\"results\""), "verbose returns per record detail");
+
+        // the points really landed, in the right series
+        r = request("GET","/v1/data?keys=10500-10502&start=1700000600&end=1700000780","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"0000a4410000aa41"), "10500 got its two points");
+        CHECK(bodyHas(r,"0000c8410000ca410000cc41"), "10502 got its three points");
+
+        r = request("POST","/v1/data","read-write-key","");
+        CHECK(r.status==400 && bodyHas(r,"empty_body"), "an empty batch is 400");
+        r = request("POST","/v1/data","read-write-key","# just a comment\n\n");
+        CHECK(r.status==400 && bodyHas(r,"empty_body"), "comments alone are 400");
+        r = request("POST","/v1/data","read-write-key","10500 1700000600\n");
+        CHECK(r.status==400 && bodyHas(r,"bad_record"), "a short record is 400");
+        r = request("POST","/v1/data","read-write-key","10500 1700000600 0000a441 extra\n");
+        CHECK(r.status==400 && bodyHas(r,"bad_record"), "a long record is 400");
+        r = request("POST","/v1/data","read-write-key","notakey 1700000600 0000a441\n");
+        CHECK(r.status==400 && bodyHas(r,"line 1"), "a bad key names its line");
+        r = request("POST","/v1/data","read-write-key","10500 notatime 0000a441\n");
+        CHECK(r.status==400 && bodyHas(r,"line 1"), "a bad timestamp names its line");
+        r = request("POST","/v1/data","read-write-key","10500 1700000600 zzz\n");
+        CHECK(r.status==400 && bodyHas(r,"bad_hex"), "bad hex is 400");
+
+        // nothing is written when a later line is malformed
+        r = request("GET","/v1/series/10500/data?start=1700002000&end=1700002200","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"real_points\":0"), "the range is empty before the test");
+        r = request("POST","/v1/data","read-write-key",
+                    "10500 1700002000 0000a441\n10500 badtime 0000a441\n");
+        CHECK(r.status==400, "a batch with a bad second line is rejected");
+        r = request("GET","/v1/series/10500/data?start=1700002000&end=1700002200","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"real_points\":0"), "and the good first line was not applied");
+
+        r = request("POST","/v1/data","read-write-key","10500 1700000600 0000a4\n");
+        CHECK(r.status==422 && bodyHas(r,"bad_point_width"), "a partial point is 422 and names the line");
+        r = request("POST","/v1/data","read-only-key","10500 1700000600 0000a441\n");
+        CHECK(r.status==403, "batch write needs the write key");
+        r = request("GET","/v1/data?keys=10500&start=1700000600&end=1700000780","read-write-key");
+        CHECK(r.status==200, "GET on the same path still reads");
+
+        // "now" is accepted in place of a timestamp
+        r = request("POST","/v1/data?verbose=1","read-write-key","1 now 07\n");
+        CHECK(r.status==200 && bodyHas(r,"\"points_written\":1"), "now writes at the current time");
+
+        // one bad record must not cost the others their points
+        r = request("POST","/v1/data","read-write-key",
+                    "10500 1699999000 0000a441\n10500 1700003000 0000aa41\n");
+        CHECK(r.status==500 && bodyHas(r,"partial_write"), "a mixed batch reports partial_write");
+        CHECK(bodyHas(r,"\"records_written\":1") && bodyHas(r,"\"records_failed\":1"), "counted both ways");
+        CHECK(bodyHas(r,"timestamp_before_series_start"), "the failing record names its error");
+        CHECK(bodyHas(r,"\"state\":\"written\"") && bodyHas(r,"\"state\":\"failed\""), "each record's state given");
+        r = request("GET","/v1/series/10500/data?start=1700003000&end=1700003100","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"real_points\":1"), "the good record was still applied");
+
+        // a series created by a write starts at that write's timestamp, so a
+        // batch assembled a moment before it is sent is not rejected wholesale
+        long long moments_ago = (long long)time(NULL) - 5;
+        char line[128];
+        snprintf(line,sizeof(line),"40000 %lld 42\n",moments_ago);
+        r = request("POST","/v1/data","read-write-key",line);
+        CHECK(r.status==200 && bodyHas(r,"\"points_written\":1"), "a new series accepts a slightly stale timestamp");
+
+        // and a point far past the end of a series is refused rather than
+        // null filling every interval in between
+        snprintf(line,sizeof(line),"40000 %lld 42\n",(long long)time(NULL) + 900000000LL);
+        r = request("POST","/v1/data","read-write-key",line);
+        CHECK(r.status==500 && bodyHas(r,"timestamp_too_far_ahead"), "a wildly future timestamp is refused");
+
+        // nothing landing at all is a failed batch, not a partial one
+        r = request("POST","/v1/data","read-write-key",
+                    "10500 1699999000 0000a441\n10501 1699999000 0000aa41\n");
+        CHECK(r.status==500 && bodyHas(r,"write_failed"), "no points written is write_failed, not partial_write");
+        CHECK(bodyHas(r,"\"records_written\":0"), "and no record counted as written");
+    }
+
+    printf("[10] delete and list\n");
     {
         REPLY r = request("GET","/v1/series?limit=100","read-only-key");
         CHECK(r.status==200 && bodyHas(r,"10500") && bodyHas(r,"30001"), "both series listed");
@@ -289,7 +383,7 @@ int main(int argc, char **argv){
         CHECK(r.status==404, "deleting twice is 404");
     }
 
-    printf("[10] method handling\n");
+    printf("[11] method handling\n");
     {
         REPLY r = request("DELETE","/v1/series","read-write-key");
         CHECK(r.status==405, "DELETE on the collection is 405");

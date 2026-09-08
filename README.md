@@ -81,6 +81,7 @@ because a series holds raw binary of whatever width it was defined with.
 | DELETE | `/v1/series/{key}` | write | delete |
 | GET | `/v1/series/{key}/data?start=&end=` | read | read a range |
 | GET | `/v1/data?keys=&start=&end=` | read | read a range across several series |
+| POST | `/v1/data` | write | write points to several series |
 | POST | `/v1/series/{key}/data?timestamp=` | write | write points |
 
 `start` and `end` are unix timestamps; `end` defaults to now. A write body is the
@@ -134,6 +135,61 @@ of the array entirely — useful when `keys` is a wide range over a sparse key s
 otherwise asking for more series would multiply the cap. `max_series_per_read`
 bounds how many keys one request may name, and a range is checked against it before
 being expanded, so `keys=0-4000000000` is refused rather than materialised.
+
+### Writing several series at once
+
+`POST /v1/data` takes one record per line, which streams straight from a file or a
+pipe and needs no JSON on the way in:
+
+```
+<key>  <timestamp|now>  <hex>
+```
+
+The hex is one or more consecutive points, placed the same way the single series
+endpoint places them. Blank lines and `#` comments are ignored.
+
+```
+$ printf '# one line per device\n10 1700000000 0a0b0c\n11 1700000000 141516\n' \
+    | curl -XPOST -H 'X-API-Key: $WRITE_KEY' --data-binary @- localhost:8086/v1/data
+{"records":2,"records_written":2,"records_failed":0,"points_written":6,"points_expected":6}
+```
+
+The whole body is parsed and validated before anything is written, so a typo on
+line four hundred cannot leave the first three hundred and ninety nine applied.
+Records are then applied independently: one device with a bad clock does not cost
+the other thousand their points.
+
+The database has no transactions, so a failure during that second pass leaves a
+partial batch. That is reported rather than glossed over — `records_written` and
+`records_failed`, plus a `results` array naming each record's line, state and
+error. A batch where nothing landed reports `write_failed`, not `partial_write`.
+Pass `verbose=1` to get `results` on success too.
+
+```json
+{"records":3,"records_written":2,"records_failed":1,"points_written":2,
+ "results":[{"line":1,"key":1,"state":"written","error":"ok",...},
+            {"line":2,"key":2,"state":"failed","error":"timestamp_before_series_start",...},
+            {"line":3,"key":3,"state":"written","error":"ok",...}],
+ "error":"partial_write","message":"the batch was applied in part, see results"}
+```
+
+`max_points_per_write` caps the total points one request may carry.
+
+### Timestamps and how far a series can grow
+
+A series created by a write is stamped with **that write's timestamp**, so the
+first point is the start of the series. A batch assembled a moment before it is
+sent is therefore accepted; stamping the series "now" instead meant the very write
+creating it could be rejected for predating it.
+
+Writing before an *existing* series' start is refused
+(`timestamp_before_series_start`) rather than silently relocated. To backfill
+history into a series that already exists, create it with `start=` set in the past.
+
+Because series are dense, a point timestamped far beyond the end of a series would
+null fill every interval in between. `max_grow_points` bounds how far one write may
+reach; beyond it the write fails with `timestamp_too_far_ahead` rather than
+allocating and writing gigabytes for a single bad timestamp.
 
 ### Gaps in a response
 

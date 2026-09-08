@@ -44,6 +44,8 @@ typedef struct {
 
     int max_points_per_read;   // shared across every series in one request
     int max_series_per_read;
+    int max_points_per_write;  // total points one write request may carry
+    int max_grow_points;       // how far past the end of a series one write may reach
     int max_body_bytes;
     int max_connections;
     int write_ahead_size;
@@ -94,6 +96,10 @@ private:
     bool readTimeRange(const HTTP_REQUEST &request, HTTP_RESPONSE &response, long long *start_time, long long *end_time);
     int64_t pointsInRange(uint32_t key, long long start_time, long long end_time);
     void handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void handleBatchWrite(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+
+    bool resolveWriteShape(uint32_t key, size_t body_bytes, uint32_t *datasize, int64_t *interval, std::string *error);
+    int writePoints(uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written);
 };
 
 

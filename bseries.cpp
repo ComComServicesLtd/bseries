@@ -15,6 +15,7 @@ BSeries::BSeries()
     this->default_seconds_per_point = 10;
     this->default_null_fill_byte = 0xFF;
     this->write_ahead_size = 4096;
+    this->max_grow_points = 1000000;
 
     this->shuttingDown = false;
 
@@ -36,9 +37,15 @@ uint32_t BSeries::getChecksum(SERIES *series){
 /// A database with no definitions file therefore produces byte identical files to
 /// the ones it produced before definitions existed.
 ///
+/// start_timestamp is where the series' first point sits. A series created by a
+/// write is stamped with that write's timestamp rather than with the current time:
+/// the first point is by definition the start of the series, and stamping it "now"
+/// meant the very write creating the series could be rejected for predating it,
+/// which any batch assembled a moment before sending would trip over.
+///
 /// Returns NO_ERROR, or a negative error code.
 
-int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize){
+int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize, uint32_t start_timestamp){
 
     SERIES_DEFINITION def;
 
@@ -68,7 +75,7 @@ int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t dat
         series->typecode = datasize;
     }
 
-    series->timestamp = time(NULL);
+    series->timestamp = start_timestamp ? start_timestamp : (uint32_t)time(NULL);
     series->checksum = getChecksum(series);
 
     fseek(file,0,SEEK_SET);
@@ -682,7 +689,7 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
             // If the header not read correctily, create the series
             if(size != 1){
                 /// Create header and continue write
-                int create_status = createSeries(file,&series->header,key,datasize);
+                int create_status = createSeries(file,&series->header,key,datasize,timestamp);
                 if(create_status != NO_ERROR){
                     fclose(file);
                     file = NULL; // the exit path below closes file, don't close it twice
@@ -826,6 +833,16 @@ retry:
                 // How many null points do we need to insert?... Measure from end of write ahead pos to where we want to be
                 int64_t grow_by = (pointsInBuffer - write_ahead_size); // Calculate how many bytes we are going to grow the file, we want write_ahead_size beyond the current requested write position
                 _DEBUG("\t Adding %u null points\n",grow_by);
+
+                // A point timestamped far past the end of the series would null
+                // fill every interval in between, so one write with a bad
+                // timestamp could ask for gigabytes of memory and disk.
+                if(max_grow_points > 0 && grow_by > max_grow_points){
+                    _ERROR("\t Write to series %u is %ld points past the end of the file, the limit is %ld\n",
+                           key,(long)grow_by,(long)max_grow_points);
+                    status = SERIES_GROWTH_LIMIT;
+                    break;
+                }
 
 
                 // Create a temporary buffer to hold the data

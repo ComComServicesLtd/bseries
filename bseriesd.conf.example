@@ -61,8 +61,16 @@ write_key             CHANGE_ME_read_write_key
 
 max_points_per_read   1000000       # a wider range is refused with 413
 max_series_per_read   500           # keys= may name at most this many series
+max_points_per_write  500000        # total points one write request may carry
 max_body_bytes        1048576       # a larger request body is refused with 413
 max_connections       64            # further connections get 503
+
+# Series are dense, so a point timestamped far beyond the end of a series null
+# fills every interval in between. This bounds how far one write may reach;
+# beyond it the write fails rather than allocating and writing gigabytes for a
+# single bad timestamp.
+
+max_grow_points       1000000
 
 
 # --- maintenance ----------------------------------------------------------

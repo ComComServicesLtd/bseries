@@ -31,6 +31,7 @@
 #define DEFINITIONS_FILE_UNREADABLE -12
 #define SERIES_ALREADY_EXISTS -13
 #define SERIES_NOT_FOUND -14
+#define SERIES_GROWTH_LIMIT -15
 
 
 #define INVALID_TIME_RANGE -1
@@ -152,7 +153,7 @@ public:
     bool flushBuffer(ENTRY *entry, FILE *file);
 
 
-    int createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize); // NO_ERROR, or negative
+    int createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize, uint32_t start_timestamp); // NO_ERROR, or negative
     uint32_t getChecksum(SERIES *series);
     bool bindHeader(ENTRY *entry, uint32_t key);
 
@@ -189,6 +190,13 @@ public:
     int write_ahead_size;
     int default_seconds_per_point;
     char default_null_fill_byte;
+
+    /// The most points one write may null fill to reach its position. Series are
+    /// dense, so a point timestamped far beyond the end of a series grows the file
+    /// by every interval in between; without a ceiling, one write with a bad
+    /// timestamp asks for an unbounded allocation and an unbounded file. Writes
+    /// that would exceed this fail with SERIES_GROWTH_LIMIT. Zero disables it.
+    int64_t max_grow_points;
 
     /// Series lifecycle, beyond the implicit "created by the first write" path.
     ///
