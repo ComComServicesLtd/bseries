@@ -30,17 +30,66 @@ typedef struct {
     std::string method;
     std::string path;                        // percent decoded, no query string
     std::string query;                       // raw, still encoded
+    std::string version;                     // "HTTP/1.1" or "HTTP/1.0"
     std::string body;
     std::vector<HTTP_HEADER> headers;
     std::string client_address;
 } HTTP_REQUEST;
 
 
+/// Writes a response out as it is produced instead of assembling it in memory.
+///
+/// A handler that knows its response could be large calls begin() and then write()
+/// as many times as it needs. Nothing beyond one buffer's worth is ever held, so
+/// the peak memory of a request stops depending on the size of its answer.
+///
+/// The status and headers go out with begin(), so everything that decides them has
+/// to be settled first: once streaming has started there is no way to turn the
+/// response into an error.
+///
+/// Framing is chunked for HTTP/1.1. An HTTP/1.0 client gets a close delimited body
+/// instead, since it cannot be expected to understand chunked encoding, and the
+/// connection is not reused in that case.
+
+class HttpStream
+{
+public:
+    HttpStream(int socket_fd, const std::string &http_version, bool keep_alive);
+
+    void begin(int status, const char *content_type, const std::vector<HTTP_HEADER> &headers);
+
+    bool write(const char *data, size_t length);
+    bool write(const std::string &text);
+    void finish();
+
+    bool started() const { return begun; }
+    bool failed() const { return broken; }
+    bool keepAlive() const { return keep_alive; }
+
+private:
+    bool flushBuffer();
+    bool sendAll(const char *data, size_t length);
+
+    int socket_fd;
+    bool chunked;
+    bool keep_alive;
+    bool begun;
+    bool finished;
+    bool broken;
+    std::string buffer;
+};
+
+
 typedef struct {
-    int status;
+    int status = 0;
     std::string content_type;
     std::string body;
     std::vector<HTTP_HEADER> headers;        // extra response headers
+
+    /// Available to every handler. Fill in body for an ordinary response, or use
+    /// this to stream one; doing both is a mistake and the buffered body is
+    /// ignored once streaming has started.
+    HttpStream *stream = NULL;
 } HTTP_RESPONSE;
 
 

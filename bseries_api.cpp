@@ -30,6 +30,38 @@ std::string apiToHex(const void *data, size_t length){
 }
 
 
+/// Hex encodes onto a stream a slice at a time, so a large blob never exists as a
+/// second full sized copy in memory alongside the points themselves.
+
+static bool streamHex(HttpStream *stream, const void *data, size_t length){
+
+    const unsigned char *bytes = (const unsigned char*)data;
+    char buffer[8192];
+    size_t position = 0;
+
+    while(position < length){
+
+        size_t take = length - position;
+
+        if(take > sizeof(buffer) / 2)
+            take = sizeof(buffer) / 2;
+
+        for(size_t i = 0; i < take; i++){
+            unsigned char value = bytes[position + i];
+            buffer[i*2]     = HEX_DIGITS[value >> 4];
+            buffer[i*2 + 1] = HEX_DIGITS[value & 0x0F];
+        }
+
+        if(!stream->write(buffer,take * 2))
+            return false;
+
+        position += take;
+    }
+
+    return true;
+}
+
+
 static int hexValue(char c){
 
     if(c >= '0' && c <= '9') return c - '0';
@@ -732,54 +764,111 @@ void BSeriesApi::handleSeriesInfo(uint32_t key, HTTP_RESPONSE &response){
 
 void BSeriesApi::handleListSeries(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
-    unsigned long after = 0;
-    unsigned long limit = 100;
-
-    std::string after_text = httpQueryParam(request,"after");
-    std::string limit_text = httpQueryParam(request,"limit");
-
-    if(!after_text.empty() && !parseUnsigned(after_text,&after)){
-        jsonError(response,400,"bad_parameter","after must be an unsigned number");
-        return;
-    }
-
-    if(!limit_text.empty() && (!parseUnsigned(limit_text,&limit) || limit == 0 || limit > 10000)){
-        jsonError(response,400,"bad_parameter","limit must be between 1 and 10000");
-        return;
-    }
-
     std::vector<uint32_t> keys;
-    int rc = db->listSeriesKeys(&keys,(uint32_t)after,(int)limit);
+    bool selected = false;
 
-    if(rc < 0){
-        jsonDatabaseError(response,rc,"listing series");
-        return;
+    // keys= selects specific series, the same selector every read endpoint takes:
+    // a comma separated list which may contain N-M ranges. Without it the data
+    // directory is walked in key order.
+    std::string keys_text = httpQueryParam(request,"keys");
+
+    if(!keys_text.empty()){
+
+        std::string parse_error;
+
+        if(!parseKeyList(keys_text,config.max_series_per_read,&keys,&parse_error)){
+            jsonError(response,400,"bad_parameter",parse_error);
+            return;
+        }
+
+        selected = true;
+
+    } else {
+
+        unsigned long after = 0;
+        unsigned long limit = 100;
+
+        std::string after_text = httpQueryParam(request,"after");
+        std::string limit_text = httpQueryParam(request,"limit");
+
+        if(!after_text.empty() && !parseUnsigned(after_text,&after)){
+            jsonError(response,400,"bad_parameter","after must be an unsigned number");
+            return;
+        }
+
+        if(!limit_text.empty() && (!parseUnsigned(limit_text,&limit) || limit == 0 || limit > 10000)){
+            jsonError(response,400,"bad_parameter","limit must be between 1 and 10000");
+            return;
+        }
+
+        int rc = db->listSeriesKeys(&keys,(uint32_t)after,(int)limit);
+
+        if(rc < 0){
+            jsonDatabaseError(response,rc,"listing series");
+            return;
+        }
     }
 
-    response.status = 200;
-    response.body = "{\"series\":[";
+    bool skip_missing = false;
+    std::string skip_text = httpQueryParam(request,"skip_missing");
+
+    if(!skip_text.empty() && skip_text != "0" && skip_text != "false")
+        skip_missing = true;
+
+    HttpStream *stream = response.stream;
+
+    stream->begin(200,"application/json",response.headers);
+    stream->write("{\"series\":[",11);
+
+    size_t returned = 0;
+    uint32_t last_key = 0;
 
     for(size_t i = 0; i < keys.size(); i++){
 
         SERIES header;
         int64_t file_size = 0;
 
-        if(db->seriesInfo(keys[i],&header,&file_size) != NO_ERROR)
-            continue; // vanished or unreadable between the listing and now
+        int info = db->seriesInfo(keys[i],&header,&file_size);
 
-        if(response.body[response.body.size()-1] != '[')
-            response.body += ",";
+        // A key from a directory walk that has vanished since is simply gone; one
+        // the caller named explicitly is reported unless they asked otherwise.
+        if(info != NO_ERROR && (skip_missing || !selected))
+            continue;
 
-        appendSeriesJson(response.body,keys[i],header,file_size);
+        if(returned > 0)
+            stream->write(",",1);
+
+        if(info != NO_ERROR){
+
+            char entry[256];
+            snprintf(entry,sizeof(entry),"{\"key\":%lu,\"error\":\"%s\",\"status\":%d}",
+                     (unsigned long)keys[i],databaseErrorSlug(info),info);
+            stream->write(entry,strlen(entry));
+
+        } else {
+
+            std::string object;
+            appendSeriesJson(object,keys[i],header,file_size);
+            stream->write(object);
+        }
+
+        last_key = keys[i];
+        returned++;
     }
 
     char tail[128];
-    snprintf(tail,sizeof(tail),"],\"count\":%lu,\"next\":%lu}",
-             (unsigned long)keys.size(),
-             (unsigned long)(keys.empty() ? 0 : keys[keys.size()-1]));
 
-    response.body += tail;
+    if(selected)
+        snprintf(tail,sizeof(tail),"],\"count\":%lu}",(unsigned long)returned);
+    else
+        snprintf(tail,sizeof(tail),"],\"count\":%lu,\"next\":%lu}",
+                 (unsigned long)returned,(unsigned long)last_key);
+
+    stream->write(tail,strlen(tail));
 }
+
+
+
 
 
 void BSeriesApi::handleCreateSeries(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
@@ -854,17 +943,21 @@ void BSeriesApi::handleDeleteSeries(uint32_t key, HTTP_RESPONSE &response){
     response.body = buffer;
 }
 
-
-/// Builds the JSON object for one series over one time range, data blob and all.
+/// Streams the JSON object for one series over one time range, data blob and all.
 ///
 /// The whole range comes back as a single hex blob rather than a point per array
 /// element: a day of one second points is 86400 values, and wrapping each in JSON
 /// punctuation costs several times what the data itself does. The array in a multi
 /// series response holds one of these objects per series, not one per point.
 ///
-/// Returns a database status. On NO_ERROR the object is appended to out.
+/// Writes the object's fields without the surrounding braces, so the single series
+/// response can carry them flattened alongside the range while the multi series
+/// response wraps each set in its own object.
+///
+/// Returns a database status. Nothing is written to the stream unless it is
+/// NO_ERROR, so a caller can still turn a failure into an error entry.
 
-int BSeriesApi::buildSeriesData(uint32_t key, long long start_time, long long end_time, std::string &out){
+int BSeriesApi::streamSeriesData(uint32_t key, long long start_time, long long end_time, HttpStream *stream){
 
     SERIES header;
     int64_t file_size = 0;
@@ -931,7 +1024,7 @@ int BSeriesApi::buildSeriesData(uint32_t key, long long start_time, long long en
     char head[512];
 
     snprintf(head,sizeof(head),
-        "{\"key\":%lu,\"type\":\"%s\",\"datasize\":%lu,\"interval\":%lld,"
+        "\"key\":%lu,\"type\":\"%s\",\"datasize\":%lu,\"interval\":%lld,"
         "\"first_point_timestamp\":%lld,\"n_points\":%lld,\"real_points\":%lld,"
         "\"null_fill\":\"%s\",\"data\":\"",
         (unsigned long)key,
@@ -943,14 +1036,15 @@ int BSeriesApi::buildSeriesData(uint32_t key, long long start_time, long long en
         (long long)recorded,
         nullFillPattern(fill,datasize).c_str());
 
-    out += head;
-    out += apiToHex(result,(size_t)(n_points * datasize));
-    out += "\"}";
+    stream->write(head,strlen(head));
+    streamHex(stream,result,(size_t)(n_points * datasize));
+    stream->write("\"",1);
 
     delete[] (char*)result;
 
     return NO_ERROR;
 }
+
 
 
 /// Reads start and end from the query string. end defaults to now.
@@ -1023,22 +1117,38 @@ void BSeriesApi::handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_
         return;
     }
 
-    std::string object;
-    int rc = buildSeriesData(key,start_time,end_time,object);
+    // Everything that could turn this into an error has to be settled before the
+    // response head goes out, because streaming cannot take it back. A series that
+    // cannot be read at all is caught here.
+    SERIES probe;
+    int64_t probe_size = 0;
+    int info = db->seriesInfo(key,&probe,&probe_size);
 
-    if(rc != NO_ERROR){
-        jsonDatabaseError(response,rc,"reading points");
+    if(info != NO_ERROR){
+        jsonDatabaseError(response,info,"reading the series header");
         return;
     }
+
+    HttpStream *stream = response.stream;
 
     char head[256];
     snprintf(head,sizeof(head),"{\"start\":%lld,\"end\":%lld,",start_time,end_time);
 
-    // The single series response carries the range alongside the series object's
-    // own fields, flattened, so it keeps the shape it has always had.
-    response.status = 200;
-    response.body = head;
-    response.body += object.substr(1); // drop the object's opening brace
+    stream->begin(200,"application/json",response.headers);
+    stream->write(head,strlen(head));
+
+    int rc = streamSeriesData(key,start_time,end_time,stream);
+
+    if(rc != NO_ERROR){
+        // The head is already on the wire, so a failure this late can only be
+        // reported inside the body.
+        char entry[256];
+        snprintf(entry,sizeof(entry),"\"key\":%lu,\"error\":\"%s\",\"status\":%d",
+                 (unsigned long)key,databaseErrorSlug(rc),rc);
+        stream->write(entry,strlen(entry));
+    }
+
+    stream->write("}",1);
 }
 
 
@@ -1093,43 +1203,50 @@ void BSeriesApi::handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &res
         return;
     }
 
+    HttpStream *stream = response.stream;
+
     char head[256];
     snprintf(head,sizeof(head),"{\"start\":%lld,\"end\":%lld,\"series\":[",start_time,end_time);
 
-    response.status = 200;
-    response.body = head;
+    stream->begin(200,"application/json",response.headers);
+    stream->write(head,strlen(head));
 
     size_t returned = 0;
 
     for(size_t i = 0; i < keys.size(); i++){
 
-        std::string object;
-        int rc = buildSeriesData(keys[i],start_time,end_time,object);
+        // Probed before anything is written, because a separator cannot be taken
+        // back once it is on the wire and skip_missing has to omit the entry
+        // entirely rather than leave a hole in the array.
+        SERIES probe;
+        int64_t probe_size = 0;
+        int info = db->seriesInfo(keys[i],&probe,&probe_size);
 
-        if(rc != NO_ERROR){
-
-            if(skip_missing && (rc == SERIES_NOT_FOUND || rc == FAILED_TO_OPEN_FILE))
-                continue;
-
-            char entry[256];
-            snprintf(entry,sizeof(entry),
-                     "{\"key\":%lu,\"error\":\"%s\",\"status\":%d}",
-                     (unsigned long)keys[i],
-                     (rc == SERIES_NOT_FOUND || rc == FAILED_TO_OPEN_FILE) ? "series_not_found" : "database_error",
-                     rc);
-            object = entry;
-        }
+        if(info != NO_ERROR && skip_missing)
+            continue;
 
         if(returned > 0)
-            response.body += ",";
+            stream->write(",",1);
 
-        response.body += object;
+        stream->write("{",1);
+
+        int rc = (info == NO_ERROR) ? streamSeriesData(keys[i],start_time,end_time,stream) : info;
+
+        if(rc != NO_ERROR){
+            char entry[256];
+            snprintf(entry,sizeof(entry),
+                     "\"key\":%lu,\"error\":\"%s\",\"status\":%d",
+                     (unsigned long)keys[i],databaseErrorSlug(rc),rc);
+            stream->write(entry,strlen(entry));
+        }
+
+        stream->write("}",1);
         returned++;
     }
 
     char tail[128];
     snprintf(tail,sizeof(tail),"],\"count\":%lu}",(unsigned long)returned);
-    response.body += tail;
+    stream->write(tail,strlen(tail));
 }
 
 

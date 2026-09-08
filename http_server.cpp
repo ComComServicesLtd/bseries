@@ -210,6 +210,7 @@ static bool parseRequestHead(const std::string &head, HTTP_REQUEST &request){
         return false;
 
     request.method = request_line.substr(0,first_space);
+    request.version = request_line.substr(second_space + 1);
 
     std::string target = request_line.substr(first_space + 1, second_space - first_space - 1);
 
@@ -264,6 +265,146 @@ static bool parseRequestHead(const std::string &head, HTTP_REQUEST &request){
     }
 
     return true;
+}
+
+
+#define HTTP_STREAM_BUFFER 65536
+
+
+HttpStream::HttpStream(int fd, const std::string &http_version, bool allow_keep_alive)
+{
+    socket_fd = fd;
+
+    // Only HTTP/1.1 can be sent chunked. A 1.0 client gets a close delimited body,
+    // which means the connection cannot then be reused.
+    chunked = (http_version == "HTTP/1.1");
+    keep_alive = allow_keep_alive && chunked;
+
+    begun = false;
+    finished = false;
+    broken = false;
+}
+
+
+bool HttpStream::sendAll(const char *data, size_t length){
+
+    size_t sent = 0;
+
+    while(sent < length){
+
+        ssize_t wrote = send(socket_fd,data + sent,length - sent,0);
+
+        if(wrote <= 0){
+            broken = true;
+            return false;
+        }
+
+        sent += (size_t)wrote;
+    }
+
+    return true;
+}
+
+
+void HttpStream::begin(int status, const char *content_type, const std::vector<HTTP_HEADER> &headers){
+
+    if(begun || broken)
+        return;
+
+    begun = true;
+
+    char head[1024];
+
+    int length = snprintf(head,sizeof(head),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Connection: %s\r\n",
+        status, httpStatusText(status),
+        content_type ? content_type : "application/json",
+        keep_alive ? "keep-alive" : "close");
+
+    if(length < 0 || length >= (int)sizeof(head)){
+        broken = true;
+        return;
+    }
+
+    std::string out(head,(size_t)length);
+
+    if(chunked)
+        out += "Transfer-Encoding: chunked\r\n";
+
+    for(size_t i = 0; i < headers.size(); i++){
+        // a header value carrying CR or LF would let a handler forge a response
+        if(headers[i].value.find_first_of("\r\n") != std::string::npos)
+            continue;
+        out += headers[i].name + ": " + headers[i].value + "\r\n";
+    }
+
+    out += "\r\n";
+
+    sendAll(out.data(),out.size());
+}
+
+
+bool HttpStream::flushBuffer(){
+
+    if(buffer.empty())
+        return !broken;
+
+    if(chunked){
+
+        char size_line[32];
+        int length = snprintf(size_line,sizeof(size_line),"%lx\r\n",(unsigned long)buffer.size());
+
+        if(!sendAll(size_line,(size_t)length))
+            return false;
+
+        if(!sendAll(buffer.data(),buffer.size()))
+            return false;
+
+        if(!sendAll("\r\n",2))
+            return false;
+
+    } else if(!sendAll(buffer.data(),buffer.size())){
+        return false;
+    }
+
+    buffer.clear();
+    return true;
+}
+
+
+bool HttpStream::write(const char *data, size_t length){
+
+    if(broken || !begun)
+        return false;
+
+    buffer.append(data,length);
+
+    if(buffer.size() >= HTTP_STREAM_BUFFER)
+        return flushBuffer();
+
+    return true;
+}
+
+
+bool HttpStream::write(const std::string &text){
+    return write(text.data(),text.size());
+}
+
+
+void HttpStream::finish(){
+
+    if(!begun || finished)
+        return;
+
+    finished = true;
+
+    if(!flushBuffer())
+        return;
+
+    if(chunked)
+        sendAll("0\r\n\r\n",5);
 }
 
 
@@ -414,11 +555,8 @@ void HttpServer::serveConnection(int client_socket, const std::string &client_ad
             request.body.append(buffer,(size_t)got);
         }
 
-        HTTP_RESPONSE response;
-        response.status = 0;
-
-        handler(request,response,context);
-
+        // Decided before the handler runs, because a streaming handler sends the
+        // response head itself and needs to know what to put in Connection.
         std::string connection_header = httpHeader(request,"connection");
         bool keep_alive = true;
 
@@ -434,10 +572,31 @@ void HttpServer::serveConnection(int client_socket, const std::string &client_ad
         if(!running.load())
             keep_alive = false;
 
-        writeResponse(client_socket,response,keep_alive);
+        if(request.version != "HTTP/1.1")
+            keep_alive = false;
 
-        if(!keep_alive)
-            return;
+        HttpStream stream(client_socket,request.version,keep_alive);
+
+        HTTP_RESPONSE response;
+        response.status = 0;
+        response.stream = &stream;
+
+        handler(request,response,context);
+
+        if(stream.started()){
+
+            stream.finish();
+
+            if(stream.failed() || !stream.keepAlive())
+                return;
+
+        } else {
+
+            writeResponse(client_socket,response,keep_alive);
+
+            if(!keep_alive)
+                return;
+        }
     }
 }
 

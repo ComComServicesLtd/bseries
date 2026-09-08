@@ -103,7 +103,40 @@ int main(int argc, char**argv){
     }
 
     // ---- 6. read on a key that has no file: must not unlock an unlocked mutex ----
-    printf("[6] read of a missing series\n");
+    printf("[6] reads spanning the write ahead boundary\n");
+    {
+        // Regression: buffer_output_points subtracted one too many, so the last
+        // point of the file region read back as null fill. Nothing under
+        // write_ahead_size points ever touches the file, which is why smaller
+        // round trips did not show it.
+        BSeries db; db.data_directory = dir; db.default_seconds_per_point = 1;
+        db.write_ahead_size = 64;                 // small, so the boundary comes fast
+        uint32_t t0 = time(NULL);
+        const int total = 64 * 5 + 7;             // several full buffers plus a tail
+
+        for(int i = 0; i < total; i++){
+            unsigned char v = (unsigned char)(i % 251);
+            if(db.write(600, &v, 1, t0 + i) != NO_ERROR){ CHECK(false,"write"); break; }
+        }
+
+        int64_t n=0,r=0,spp=0,fpt=0; uint32_t ds=0; void *res=NULL;
+        int rc = db.read(600, t0, t0 + total, &n,&r,&spp,&fpt,&ds,&res);
+        CHECK(rc==NO_ERROR && res != NULL, "read back across the boundary");
+        CHECK(n==total, "every requested point returned");
+
+        int wrong = -1;
+        unsigned char *out = (unsigned char*)res;
+        for(int i = 0; i < total && res; i++){
+            if(out[i] != (unsigned char)(i % 251)){ wrong = i; break; }
+        }
+        if(wrong >= 0) printf("   first wrong point: %d (got %u)\n", wrong, out[wrong]);
+        CHECK(wrong < 0, "no point was dropped at a flush boundary");
+        CHECK(r==total, "real_points counts them all");
+        delete[] (char*)res;
+        db.close();
+    }
+
+    printf("[7] read of a missing series\n");
     {
         BSeries db; db.data_directory = dir; db.default_seconds_per_point = 1;
         int64_t n,r,spp,fpt; uint32_t ds; void*res=NULL;

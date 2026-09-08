@@ -51,13 +51,11 @@ write_key             CHANGE_ME_read_write_key
 # --- limits ---------------------------------------------------------------
 
 # max_points_per_read is a budget for a whole request, not per series, so that
-# asking for more series in one call cannot multiply it. Size it with the peak
-# memory in mind: a request holds roughly
+# asking for more series in one call cannot multiply it.
 #
-#     max_points_per_read x datasize x 3
-#
-# while it is being answered (the raw points, their hex, and the response being
-# assembled), and up to max_connections of those can be in flight at once.
+# Read responses are streamed, so a request no longer holds its whole answer in
+# memory. Peak is one series' points plus a 64KB buffer, not the size of the
+# response, which is what makes a large limit here affordable.
 
 max_points_per_read   1000000       # a wider range is refused with 413
 max_series_per_read   500           # keys= may name at most this many series

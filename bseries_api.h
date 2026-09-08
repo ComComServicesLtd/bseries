@@ -92,7 +92,7 @@ private:
     void handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
-    int buildSeriesData(uint32_t key, long long start_time, long long end_time, std::string &out);
+    int streamSeriesData(uint32_t key, long long start_time, long long end_time, HttpStream *stream);
     bool readTimeRange(const HTTP_REQUEST &request, HTTP_RESPONSE &response, long long *start_time, long long *end_time);
     int64_t pointsInRange(uint32_t key, long long start_time, long long end_time);
     void handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);

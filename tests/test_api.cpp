@@ -20,7 +20,42 @@ typedef struct {
     int status;
     std::string body;
     std::string head;
+    bool chunked;
 } REPLY;
+
+
+// Reassembles a chunked body. Returns false if the framing is malformed, which is
+// itself worth catching: the server writes these chunk headers by hand.
+static bool decodeChunked(const std::string &raw, std::string *out){
+
+    size_t position = 0;
+
+    for(;;){
+
+        size_t line_end = raw.find("\r\n",position);
+        if(line_end == std::string::npos)
+            return false;
+
+        std::string size_line = raw.substr(position,line_end - position);
+
+        char *end = NULL;
+        unsigned long size = strtoul(size_line.c_str(),&end,16);
+
+        if(end == size_line.c_str())
+            return false;
+
+        position = line_end + 2;
+
+        if(size == 0)
+            return true;                      // terminating chunk
+
+        if(position + size > raw.size())
+            return false;
+
+        out->append(raw,position,size);
+        position += size + 2;                 // the chunk's own trailing CRLF
+    }
+}
 
 
 static REPLY request(const char *method, const std::string &path, const char *api_key,
@@ -28,6 +63,7 @@ static REPLY request(const char *method, const std::string &path, const char *ap
 
     REPLY reply;
     reply.status = -1;
+    reply.chunked = false;
 
     int fd = socket(AF_INET,SOCK_STREAM,0);
     if(fd < 0) return reply;
@@ -70,9 +106,22 @@ static REPLY request(const char *method, const std::string &path, const char *ap
         reply.status = atoi(raw.c_str() + 9);
 
     size_t split = raw.find("\r\n\r\n");
+
     if(split != std::string::npos){
+
         reply.head = raw.substr(0,split);
-        reply.body = raw.substr(split + 4);
+        std::string body = raw.substr(split + 4);
+
+        reply.chunked = reply.head.find("Transfer-Encoding: chunked") != std::string::npos;
+
+        if(reply.chunked){
+            if(!decodeChunked(body,&reply.body)){
+                printf("  (malformed chunked framing in a response)\n");
+                test_failures++;
+            }
+        } else {
+            reply.body = body;
+        }
     }
 
     return reply;
@@ -101,8 +150,10 @@ int main(int argc, char **argv){
     config.read_key  = "read-only-key";
     config.write_key = "read-write-key";
     config.cors_origins.push_back("https://dashboard.example.com");
-    config.max_points_per_read = 10000;
-    config.max_body_bytes = 4096;
+    // Large enough that a streamed response exceeds the stream's own buffer, so
+    // the chunking is actually exercised, and still small enough to test the caps.
+    config.max_points_per_read = 100000;
+    config.max_body_bytes = 262144;
     config.default_interval = 10;
 
     BSeries db;
@@ -201,7 +252,7 @@ int main(int argc, char **argv){
         r = request("GET","/v1/series/10500/data?start=1&end=2000000000","read-only-key");
         CHECK(r.status==413 && bodyHas(r,"range_too_large"), "an oversized range is refused before allocating");
 
-        std::string huge(9000,'a');
+        std::string huge(300000,'a');
         r = request("POST","/v1/series/10500/data?timestamp=1700000000","read-write-key",huge);
         CHECK(r.status==413, "an oversized body is refused");
     }
@@ -383,7 +434,51 @@ int main(int argc, char **argv){
         CHECK(r.status==404, "deleting twice is 404");
     }
 
-    printf("[11] method handling\n");
+    printf("[11] keys selector on every read, and streaming\n");
+    {
+        // keys=1,4,5 style selection on the listing endpoint
+        REPLY r = request("GET","/v1/series?keys=10500,10502","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"count\":2"), "keys= selects specific series to list");
+        CHECK(bodyHas(r,"\"key\":10500") && bodyHas(r,"\"key\":10502"), "the named ones");
+        CHECK(!bodyHas(r,"\"key\":10501"), "and only those");
+
+        r = request("GET","/v1/series?keys=10500,999999","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"series_not_found"), "a named key that is missing is reported");
+        r = request("GET","/v1/series?keys=10500,999999&skip_missing=1","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"count\":1") && !bodyHas(r,"series_not_found"), "skip_missing omits it");
+        r = request("GET","/v1/series?keys=notakey","read-only-key");
+        CHECK(r.status==400, "a bad selector is 400");
+
+        // the same selector shape on the data endpoint
+        r = request("GET","/v1/data?keys=10500,10502&start=1700000000&end=1700000300","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"count\":2"), "keys=a,b on the data endpoint");
+
+        // responses are chunked, and survive a size that would not fit one buffer
+        r = request("GET","/v1/series?keys=10500","read-only-key");
+        CHECK(headHas(r,"Transfer-Encoding: chunked"), "reads are streamed chunked");
+        CHECK(!headHas(r,"Content-Length"), "and carry no Content-Length");
+
+        // a body larger than the stream buffer must reassemble exactly
+        r = request("POST","/v1/series/50000?type=uint8&interval=1&start=1700000000","read-write-key");
+        CHECK(r.status==201, "create a byte series for a large read");
+        std::string big;
+        for(int i = 0; i < 40000; i++) big += "ab";      // 40000 points
+        r = request("POST","/v1/series/50000/data?timestamp=1700000000","read-write-key",big);
+        CHECK(r.status==200 && bodyHas(r,"\"points_written\":40000"), "40000 points written");
+        r = request("GET","/v1/series/50000/data?start=1700000000&end=1700040000","read-only-key");
+        CHECK(r.status==200, "large read succeeds");
+        size_t data_at = r.body.find("\"data\":\"");
+        std::string blob;
+        if(data_at != std::string::npos){
+            size_t from = data_at + 8;
+            size_t to = r.body.find('"',from);
+            if(to != std::string::npos) blob = r.body.substr(from,to - from);
+        }
+        CHECK(blob.size() == 80000, "the streamed blob is exactly the expected length");
+        CHECK(blob.compare(0,80000,big) == 0, "and its bytes survived chunking intact");
+    }
+
+    printf("[12] method handling\n");
     {
         REPLY r = request("DELETE","/v1/series","read-write-key");
         CHECK(r.status==405, "DELETE on the collection is 405");

@@ -1132,8 +1132,13 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
                 file_end_point = points_in_file;
             }
 
-            buffer_output_points = file_end_point - file_start_point - 1;
-            // THE FILE READ COMMAND WAS COPYING TOO MANY BYTES...
+            // file_end_point is exclusive, so the count is the plain difference.
+            // This used to subtract one more, which dropped the last point of the
+            // file region on every read: with a 4096 point write ahead buffer,
+            // point 4095 of every flushed block read back as null fill instead of
+            // its value. The subtraction was standing in for the missing bounds
+            // check below, which now does that job properly.
+            buffer_output_points = file_end_point - file_start_point;
 
             int64_t  buffer_output_timestamp = series->header.timestamp + (file_start_point * series->header.interval);
             buffer_output_pos = (buffer_output_timestamp - start_time) / series->header.interval;

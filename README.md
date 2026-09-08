@@ -75,7 +75,7 @@ because a series holds raw binary of whatever width it was defined with.
 | Method | Path | Key | |
 |---|---|---|---|
 | GET | `/v1/health` | none | liveness |
-| GET | `/v1/series?limit=&after=` | read | list series |
+| GET | `/v1/series?keys=` or `?limit=&after=` | read | list series |
 | GET | `/v1/series/{key}` | read | header and size |
 | POST | `/v1/series/{key}?type=&interval=&start=` | write | create |
 | DELETE | `/v1/series/{key}` | write | delete |
@@ -104,6 +104,22 @@ $ curl -H 'X-API-Key: $READ_KEY' \
 {"key":10500,"type":"float32","interval":60,"n_points":5,"real_points":3,
  "null_fill":"ffffffff","data":"0000a4410000aa4100000c42ffffffffffffffff"}
 ```
+
+### Selecting series
+
+Every read takes the same `keys` selector: a comma separated list which may contain
+`N-M` ranges.
+
+```
+keys=1,4,5          three specific series
+keys=1-500          a range
+keys=1-500,10500    both
+```
+
+It works on `/v1/data` and on `/v1/series`, so the same selection can fetch metadata
+or data. Without `keys`, `/v1/series` walks the data directory in key order and
+takes `limit` and `after` for paging. `skip_missing=1` omits absent series instead
+of returning an entry naming the error.
 
 ### Reading several series at once
 
@@ -174,6 +190,20 @@ Pass `verbose=1` to get `results` on success too.
 ```
 
 `max_points_per_write` caps the total points one request may carry.
+
+### Streaming
+
+Read responses are written out as they are produced, using chunked transfer
+encoding, rather than assembled in memory first. A response therefore costs one
+series' points plus a 64KB buffer, not the size of the whole answer, and that no
+longer multiplies by `max_connections`. Hex encoding happens a slice at a time for
+the same reason.
+
+The consequence is that a read carries no `Content-Length`, and that the status is
+committed before the body is produced: anything that could make a read fail is
+checked up front, and a series that fails after that point is reported as an entry
+inside the array. An HTTP/1.0 client gets a close delimited body instead of chunked
+encoding, and that connection is not reused.
 
 ### Timestamps and how far a series can grow
 
