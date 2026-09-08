@@ -4,6 +4,7 @@
 
 
 #include <map>
+#include <vector>
 #include <string.h>
 #include <thread>
 #include <mutex>
@@ -12,6 +13,7 @@
 
 
 #include "debug.h"
+#include "bseries_types.h"
 
 
 #define NO_ERROR 0
@@ -24,6 +26,9 @@
 #define FILE_OPEN_FAILURE -7
 #define WRITE_BEFORE_SERIES_START -8
 #define INVALID_SERIES_INTERVAL -9
+#define SERIES_TYPE_MISMATCH -10
+#define INVALID_SERIES_DEFINITION -11
+#define DEFINITIONS_FILE_UNREADABLE -12
 
 
 #define INVALID_TIME_RANGE -1
@@ -52,15 +57,59 @@ union BType {
 };
 
 
+#define SERIES_VERSION_LEGACY 1
+#define SERIES_VERSION_TYPED  2
+
+
+/// On disk series header. Fixed at 20 bytes: every data point is addressed as
+/// sizeof(SERIES) + point * datasize, so the size of this struct is part of the
+/// file format and must not change.
 
 typedef struct _SERIES
 {
-     uint32_t version; // = 1, version code. only 1 currently valid
+     uint32_t version;   // 1 = legacy, typecode is a plain byte width
+                         // 2 = typecode packs the datatype class and the byte width
      uint32_t timestamp; // First point timestamp (Unix Epoch)
-     uint32_t interval; // = 10 for every 10 seconds
-     uint32_t datasize;
-     uint32_t checksum; // = 1234567890 + ((version ^ timestamp) ^ (interval ^ datatype);
+     uint32_t interval;  // = 10 for every 10 seconds
+     uint32_t typecode;  // see bsPackTypeCode(), was called datasize in version 1
+     uint32_t checksum;  // = 1234567890 + ((version ^ timestamp) ^ (interval ^ typecode));
 } SERIES;
+
+
+/// Version 2 packs the datatype class and the byte width into the single 32 bit
+/// field version 1 used for the byte width alone. A version 1 width of 1, 2, 4 or 8
+/// therefore reads back as a version 2 code with width 0, which is not a storable
+/// type, so the two are never confused even before the version field is consulted.
+
+inline uint32_t bsPackTypeCode(uint8_t datatype, uint8_t datasize){
+    return (uint32_t)datatype | ((uint32_t)datasize << 8);
+}
+
+inline uint8_t bsTypeCodeDataType(uint32_t typecode){
+    return (uint8_t)(typecode & 0xFF);
+}
+
+inline uint8_t bsTypeCodeDataSize(uint32_t typecode){
+    return (uint8_t)((typecode >> 8) & 0xFF);
+}
+
+
+/// Declares the shape of a series before it exists on disk: how often a point is
+/// recorded and what each point is. Keys in [key_first,key_last] use this shape.
+///
+/// A definition only applies at creation time. Once a series file exists its own
+/// header is the authority, because the data already on disk was laid out to it.
+
+typedef struct
+{
+     uint32_t key_first;
+     uint32_t key_last;
+     uint32_t interval;             // seconds per point
+     uint8_t  datatype;             // BS_UNSIGNED / BS_SIGNED / BS_FLOAT
+     uint8_t  datasize;             // bytes per point
+     unsigned char null_fill_byte;  // byte written for "no point here"
+     char name[32];                 // for diagnostics only
+} SERIES_DEFINITION;
 
 
 typedef struct
@@ -72,6 +121,13 @@ typedef struct
      uint32_t last_commit;
      uint32_t cache_start_timestamp;
      char* write_ahead_cache;
+
+     /// Decoded from the header by bindHeader() once it has been loaded, so the
+     /// point loops do not unpack the typecode on every point. Zero until then,
+     /// which is how the cache allocation knows the header is not ready yet.
+     uint32_t datasize;
+     uint8_t  datatype;
+     unsigned char null_fill_byte;
 } ENTRY;
 
 
@@ -94,11 +150,36 @@ public:
     bool flushBuffer(ENTRY *entry, FILE *file);
 
 
-    int createSeries(FILE *file, SERIES *series, uint32_t datasize);
+    int createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize); // NO_ERROR, or negative
     uint32_t getChecksum(SERIES *series);
+    bool bindHeader(ENTRY *entry, uint32_t key);
 
     int write(uint32_t key, void *value, uint32_t datasize, uint32_t timestamp = 0);
-    int read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n_points, int64_t *r_points, int64_t *seconds_per_point, int64_t *first_point_timestamp, uint32_t *datasize, void **result);
+    int read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n_points, int64_t *r_points, int64_t *seconds_per_point, int64_t *first_point_timestamp, uint32_t *datasize, void **result, uint8_t *datatype = NULL);
+
+
+    /// Series definitions. Declare the interval and datatype for a key range and
+    /// any series created in that range takes that shape, instead of every series
+    /// in the database sharing default_seconds_per_point and the datasize that
+    /// happened to be passed to the first write.
+    ///
+    /// Ranges are searched in the order they were declared and the first match
+    /// wins, so declare narrow ranges before wide ones. Keys matching no
+    /// definition fall back to default_seconds_per_point and the caller's
+    /// datasize, which is what the database did before definitions existed.
+    ///
+    /// Definitions are meant to be installed once at startup before any read or
+    /// write. They are mutex guarded so that a later reload is not a data race,
+    /// but a reload cannot retype series that already exist on disk.
+
+    int defineSeries(uint32_t key_first, uint32_t key_last, uint32_t interval, uint8_t datatype, uint8_t datasize, const char *name = NULL, int null_fill_byte = -1);
+    int loadDefinitions(const char *path);
+    bool definitionForKey(uint32_t key, SERIES_DEFINITION *out);
+    void clearDefinitions();
+
+    vector<SERIES_DEFINITION> definitions;
+    mutex definitions_access;
+
 
     map<uint32_t,ENTRY> series_list;
     const char *data_directory;

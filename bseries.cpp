@@ -20,16 +20,52 @@ BSeries::BSeries()
 
 
 uint32_t BSeries::getChecksum(SERIES *series){
-    return 1234567890 + ((series->version ^ series->timestamp) ^ (series->interval ^ series->datasize));
+    return 1234567890 + ((series->version ^ series->timestamp) ^ (series->interval ^ series->typecode));
 }
 
 
-int BSeries::createSeries(FILE *file, SERIES *series, uint32_t datasize){
+/// Lays down the header for a series that does not exist yet.
+///
+/// If a definition covers this key it decides the interval and the datatype, and
+/// the header is written in the typed version 2 format. With no definition we know
+/// the point width the caller is writing but not what the bytes mean, so the
+/// version 1 header is written instead of claiming a datatype nobody supplied.
+/// A database with no definitions file therefore produces byte identical files to
+/// the ones it produced before definitions existed.
+///
+/// Returns NO_ERROR, or a negative error code.
 
-    series->version = 1;
+int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize){
+
+    SERIES_DEFINITION def;
+
+    if(definitionForKey(key,&def)){
+
+        if(datasize && datasize != def.datasize){
+            _ERROR("\t Series %u is defined as %s but the write supplied %u byte points\n",
+                   key,bsTypeName(def.datatype,def.datasize),datasize);
+            return SERIES_TYPE_MISMATCH;
+        }
+
+        series->version = SERIES_VERSION_TYPED;
+        series->interval = def.interval;
+        series->typecode = bsPackTypeCode(def.datatype,def.datasize);
+
+        _DEBUG("\t Creating series %u as %s every %u seconds\n",key,bsTypeName(def.datatype,def.datasize),def.interval);
+
+    } else {
+
+        if(!bsTypeValid(BS_UNSIGNED,(uint8_t)datasize)){
+            _ERROR("\t Series %u has no definition and %u is not a storable point width\n",key,datasize);
+            return SERIES_TYPE_MISMATCH;
+        }
+
+        series->version = SERIES_VERSION_LEGACY;
+        series->interval = default_seconds_per_point;
+        series->typecode = datasize;
+    }
+
     series->timestamp = time(NULL);
-    series->interval = default_seconds_per_point;
-    series->datasize = datasize;
     series->checksum = getChecksum(series);
 
     fseek(file,0,SEEK_SET);
@@ -37,12 +73,359 @@ int BSeries::createSeries(FILE *file, SERIES *series, uint32_t datasize){
 
 
     if(size == 1)
-        return 1;
+        return NO_ERROR;
 
-    return 0;
+    return CREATE_NEW_HEADER_FAIL;
 }
 
 
+/// Decodes a header that has just been loaded or created into the entry fields the
+/// point loops use, and rejects a header describing something this build cannot
+/// address. Must be called before an entry is used for anything.
+
+bool BSeries::bindHeader(ENTRY *entry, uint32_t key){
+
+    SERIES_DEFINITION def;
+    bool have_def = definitionForKey(key,&def);
+
+    uint8_t datatype;
+    uint32_t datasize;
+
+    if(entry->header.version == SERIES_VERSION_TYPED){
+
+        datatype = bsTypeCodeDataType(entry->header.typecode);
+        datasize = bsTypeCodeDataSize(entry->header.typecode);
+
+    } else if(entry->header.version == SERIES_VERSION_LEGACY){
+
+        // Version 1 recorded the point width but not what the points meant. The
+        // only widths this database ever wrote were 1 (unsigned char) and 4
+        // (float), so infer from the width and let a definition for the key
+        // correct the guess where one has been installed.
+        datasize = entry->header.typecode;
+        datatype = (datasize == 4) ? BS_FLOAT : BS_UNSIGNED;
+
+        if(have_def && def.datasize == datasize)
+            datatype = def.datatype;
+
+    } else {
+
+        _ERROR("\t Series %u has header version %u, this build understands %d and %d\n",
+               key,entry->header.version,SERIES_VERSION_LEGACY,SERIES_VERSION_TYPED);
+        return false;
+    }
+
+    if(!bsTypeValid(datatype,(uint8_t)datasize)){
+        _ERROR("\t Series %u header describes an unstorable type (class %u, %u byte points)\n",key,datatype,datasize);
+        return false;
+    }
+
+    if(entry->header.interval == 0){
+        _ERROR("\t Series %u header has a zero interval\n",key);
+        return false;
+    }
+
+    entry->datasize = datasize;
+    entry->datatype = datatype;
+
+    // An explicit null fill in the definition beats the default for the type, and a
+    // version 1 file keeps the database wide default it was written with.
+    if(have_def && def.datasize == datasize)
+        entry->null_fill_byte = def.null_fill_byte;
+    else if(entry->header.version == SERIES_VERSION_TYPED)
+        entry->null_fill_byte = bsTypeNullFill(datatype,(uint8_t)datasize);
+    else
+        entry->null_fill_byte = (unsigned char)default_null_fill_byte;
+
+    // The file always wins over the definition: the points already on disk were
+    // laid out to the header's interval and width, so honouring the definition
+    // instead would misread every one of them. Say so loudly, it means the
+    // definitions file and the data have drifted apart.
+    if(have_def){
+
+        if(def.interval != entry->header.interval)
+            _WARN("\t Warning: series %u is defined with a %u second interval but its file says %u, using the file\n",
+                  key,def.interval,entry->header.interval);
+
+        if(def.datasize != datasize || def.datatype != datatype)
+            _WARN("\t Warning: series %u is defined as %s but its file says %s, using the file\n",
+                  key,bsTypeName(def.datatype,def.datasize),bsTypeName(datatype,(uint8_t)datasize));
+    }
+
+    return true;
+}
+
+
+
+
+
+
+/// ===========================================================================
+/// Series definitions
+///
+/// Without these, every series in the database shares default_seconds_per_point
+/// and takes whatever point width the first write happened to pass. A definition
+/// declares the interval and the datatype for a range of keys up front, so one
+/// database can hold one second ping bytes alongside, say, sixty second
+/// temperature floats.
+/// ===========================================================================
+
+
+/// Parses "1234", "1000-1999" or "*" into an inclusive key range.
+
+static bool parseKeyRange(const char *text, uint32_t *first, uint32_t *last){
+
+    if(strcmp(text,"*") == 0){
+        *first = 0;
+        *last = 0xFFFFFFFFu;
+        return true;
+    }
+
+    char *end = NULL;
+    unsigned long low = strtoul(text,&end,10);
+
+    if(end == text || low > 0xFFFFFFFFu)
+        return false;
+
+    if(*end == 0){ // a single key
+        *first = (uint32_t)low;
+        *last = (uint32_t)low;
+        return true;
+    }
+
+    if(*end != '-')
+        return false;
+
+    const char *high_text = end + 1;
+    unsigned long high = strtoul(high_text,&end,10);
+
+    if(end == high_text || *end != 0 || high > 0xFFFFFFFFu || high < low)
+        return false;
+
+    *first = (uint32_t)low;
+    *last = (uint32_t)high;
+    return true;
+}
+
+
+/// Parses "10", "30s", "5m" or "1h" into seconds.
+
+static bool parseInterval(const char *text, uint32_t *seconds){
+
+    char *end = NULL;
+    unsigned long value = strtoul(text,&end,10);
+
+    if(end == text || value == 0)
+        return false;
+
+    unsigned long multiplier = 1;
+
+    if(*end == 's' && end[1] == 0)      multiplier = 1;
+    else if(*end == 'm' && end[1] == 0) multiplier = 60;
+    else if(*end == 'h' && end[1] == 0) multiplier = 3600;
+    else if(*end != 0)                  return false;
+
+    if(value > 0xFFFFFFFFuL / multiplier)
+        return false;
+
+    *seconds = (uint32_t)(value * multiplier);
+    return true;
+}
+
+
+void BSeries::clearDefinitions(){
+
+    definitions_access.lock();
+    definitions.clear();
+    definitions_access.unlock();
+}
+
+
+/// Declares the shape of every series whose key falls in [key_first,key_last].
+/// Pass null_fill_byte as -1 to take the default for the type.
+
+int BSeries::defineSeries(uint32_t key_first, uint32_t key_last, uint32_t interval, uint8_t datatype, uint8_t datasize, const char *name, int null_fill_byte){
+
+    if(key_first > key_last){
+        _ERROR("Series definition has an inverted key range %u-%u\n",key_first,key_last);
+        return INVALID_SERIES_DEFINITION;
+    }
+
+    if(interval == 0){
+        _ERROR("Series definition for keys %u-%u has a zero interval\n",key_first,key_last);
+        return INVALID_SERIES_DEFINITION;
+    }
+
+    if(!bsTypeValid(datatype,datasize)){
+        _ERROR("Series definition for keys %u-%u names an unstorable type (class %u, %u byte points)\n",key_first,key_last,datatype,datasize);
+        return INVALID_SERIES_DEFINITION;
+    }
+
+    if(null_fill_byte > 255){
+        _ERROR("Series definition for keys %u-%u has a null fill outside a byte\n",key_first,key_last);
+        return INVALID_SERIES_DEFINITION;
+    }
+
+    SERIES_DEFINITION def;
+    memset(&def,0,sizeof(def));
+
+    def.key_first = key_first;
+    def.key_last = key_last;
+    def.interval = interval;
+    def.datatype = datatype;
+    def.datasize = datasize;
+    def.null_fill_byte = (null_fill_byte < 0) ? bsTypeNullFill(datatype,datasize) : (unsigned char)null_fill_byte;
+
+    if(name != NULL){
+        strncpy(def.name,name,sizeof(def.name)-1);
+        def.name[sizeof(def.name)-1] = 0;
+    }
+
+    definitions_access.lock();
+    definitions.push_back(def);
+    definitions_access.unlock();
+
+    return NO_ERROR;
+}
+
+
+/// Returns the first definition covering key, so narrower ranges have to be
+/// declared before wider ones.
+
+bool BSeries::definitionForKey(uint32_t key, SERIES_DEFINITION *out){
+
+    bool found = false;
+
+    definitions_access.lock();
+
+    for(size_t i = 0; i < definitions.size(); i++){
+        if(key >= definitions[i].key_first && key <= definitions[i].key_last){
+            if(out != NULL)
+                *out = definitions[i];
+            found = true;
+            break;
+        }
+    }
+
+    definitions_access.unlock();
+
+    return found;
+}
+
+
+/// Loads a definitions file, replacing any definitions already installed.
+///
+/// One series family per line:
+///
+///     <name>  <keys>  <interval>  <type>  [null_fill]
+///
+/// keys is a single key, an inclusive N-M range, or * for everything. interval is
+/// in seconds and may be suffixed s, m or h. type is a name from bseries_types.h
+/// (uint8, int32, float32, ...). null_fill optionally overrides the default fill
+/// byte for the type. Everything after a # is a comment.
+///
+/// Returns the number of definitions loaded, or a negative error code. A malformed
+/// line fails the whole load rather than being skipped: a typo in a database's type
+/// configuration must not quietly change how points are stored.
+
+int BSeries::loadDefinitions(const char *path){
+
+    FILE *file = fopen(path,"r");
+
+    if(file == NULL){
+        _ERROR("Could not open series definitions file %s\n",path);
+        return DEFINITIONS_FILE_UNREADABLE;
+    }
+
+    vector<SERIES_DEFINITION> parsed;
+    char line[512];
+    int line_number = 0;
+    int status = NO_ERROR;
+
+    while(fgets(line,sizeof(line),file) != NULL){
+
+        line_number++;
+
+        char *comment = strchr(line,'#');
+        if(comment != NULL)
+            *comment = 0;
+
+        char name[64], keys[64], interval_text[64], type_text[64], fill_text[64];
+
+        int fields = sscanf(line,"%63s %63s %63s %63s %63s",name,keys,interval_text,type_text,fill_text);
+
+        if(fields <= 0) // blank line, or a line that was nothing but a comment
+            continue;
+
+        if(fields < 4){
+            _ERROR("%s line %d: expected <name> <keys> <interval> <type> [null_fill]\n",path,line_number);
+            status = INVALID_SERIES_DEFINITION;
+            break;
+        }
+
+        uint32_t key_first, key_last, interval;
+        uint8_t datatype, datasize;
+
+        if(!parseKeyRange(keys,&key_first,&key_last)){
+            _ERROR("%s line %d: '%s' is not a key, an N-M range or *\n",path,line_number,keys);
+            status = INVALID_SERIES_DEFINITION;
+            break;
+        }
+
+        if(!parseInterval(interval_text,&interval)){
+            _ERROR("%s line %d: '%s' is not an interval, expected seconds optionally suffixed s, m or h\n",path,line_number,interval_text);
+            status = INVALID_SERIES_DEFINITION;
+            break;
+        }
+
+        if(!bsTypeFromName(type_text,&datatype,&datasize)){
+            _ERROR("%s line %d: '%s' is not a known datatype\n",path,line_number,type_text);
+            status = INVALID_SERIES_DEFINITION;
+            break;
+        }
+
+        int null_fill = -1;
+
+        if(fields >= 5){
+            char *end = NULL;
+            long value = strtol(fill_text,&end,0);
+            if(end == fill_text || *end != 0 || value < 0 || value > 255){
+                _ERROR("%s line %d: '%s' is not a byte value for the null fill\n",path,line_number,fill_text);
+                status = INVALID_SERIES_DEFINITION;
+                break;
+            }
+            null_fill = (int)value;
+        }
+
+        SERIES_DEFINITION def;
+        memset(&def,0,sizeof(def));
+
+        def.key_first = key_first;
+        def.key_last = key_last;
+        def.interval = interval;
+        def.datatype = datatype;
+        def.datasize = datasize;
+        def.null_fill_byte = (null_fill < 0) ? bsTypeNullFill(datatype,datasize) : (unsigned char)null_fill;
+
+        strncpy(def.name,name,sizeof(def.name)-1);
+        def.name[sizeof(def.name)-1] = 0;
+
+        parsed.push_back(def);
+    }
+
+    fclose(file);
+
+    if(status != NO_ERROR)
+        return status;
+
+    definitions_access.lock();
+    definitions = parsed;
+    definitions_access.unlock();
+
+    _DEBUG("Loaded %d series definitions from %s\n",(int)parsed.size(),path);
+
+    return (int)parsed.size();
+}
 
 
 
@@ -154,18 +537,18 @@ bool BSeries::flushBuffer(ENTRY *series,FILE *file){
 
     _DEBUG("\tFlushing current buffer\n");
     // Write are buffer to the file
-    size_t size = fwrite(series->write_ahead_cache,series->header.datasize,write_ahead_size,file); // Write the data point
+    size_t size = fwrite(series->write_ahead_cache,series->datasize,write_ahead_size,file); // Write the data point
 
     if(size != write_ahead_size){
         _ERROR("\t Failed to flush write ahead buffer to file");
         return false;
     }
-    series->file_size += write_ahead_size * series->header.datasize; // Our file has grown!
+    series->file_size += write_ahead_size * series->datasize; // Our file has grown!
     _DEBUG("\tNew File Size = %d\n",series->file_size);
 
 
     // Reset our buffer with null fill
-    memset(series->write_ahead_cache,default_null_fill_byte,write_ahead_size * series->header.datasize);
+    memset(series->write_ahead_cache,series->null_fill_byte,write_ahead_size * series->datasize);
 
     return true;
 }
@@ -175,8 +558,8 @@ bool BSeries::flushBuffer(ENTRY *series,FILE *file){
 
 bool BSeries::validateWriteAheadCache(ENTRY *series){
 
-    if(series->header.datasize == 0){
-        // The header has not been loaded yet. Allocating here would produce a zero
+    if(series->datasize == 0){
+        // The header has not been bound yet. Allocating here would produce a zero
         // sized cache that is never resized, because the NULL check below would then
         // consider it valid forever.
         _ERROR("Cache requested before the header was loaded\n");
@@ -185,7 +568,7 @@ bool BSeries::validateWriteAheadCache(ENTRY *series){
 
     // If our write ahead cache is NULL, malloc it and set it to our null fill
     if(series->write_ahead_cache == NULL){
-        series->write_ahead_cache = (char*)malloc(write_ahead_size * series->header.datasize);
+        series->write_ahead_cache = (char*)malloc(write_ahead_size * series->datasize);
 
         if(series->write_ahead_cache == NULL){
             _ERROR("Cache Malloc Failed, Fatal!\n");
@@ -193,7 +576,7 @@ bool BSeries::validateWriteAheadCache(ENTRY *series){
         }
         _DEBUG("Cache Malloc Success\n");
 
-        memset(series->write_ahead_cache,default_null_fill_byte,write_ahead_size * series->header.datasize);
+        memset(series->write_ahead_cache,series->null_fill_byte,write_ahead_size * series->datasize);
     }
 
     return true;
@@ -284,11 +667,12 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
             // If the header not read correctily, create the series
             if(size != 1){
                 /// Create header and continue write
-                if(!createSeries(file,&series->header,datasize)){ // attempt to create header, if failure, return error
+                int create_status = createSeries(file,&series->header,key,datasize);
+                if(create_status != NO_ERROR){
                     fclose(file);
                     file = NULL; // the exit path below closes file, don't close it twice
                     _ERROR("\t Failed to create new File/header\n");
-                    status = CREATE_NEW_HEADER_FAIL;
+                    status = create_status; // keeps a type mismatch distinct from a write failure
                     break;
                 }
                 _DEBUG("\t Created New File\n");
@@ -306,10 +690,28 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
             }
 
 
+            // Decode the header into the entry before anything reads its width
+            if(!bindHeader(series,key)){
+                status = SERIES_TYPE_MISMATCH;
+                break;
+            }
+
+
             // Get our file size, we get the file size whenver we open a new file, when we update a file we also update the filesize
             fseek(file,0,SEEK_END);
             series->file_size = ftell(file);
             _DEBUG("\tFile size = %u\n",series->file_size);
+        }
+
+
+        // The caller's idea of the point width has to match the series it is
+        // writing to. Without this check a float written to a byte series is
+        // silently truncated to its first byte.
+        if(datasize != series->datasize){
+            _ERROR("\t Series %u holds %s but the write supplied %u byte points\n",
+                   key,bsTypeName(series->datatype,(uint8_t)series->datasize),datasize);
+            status = SERIES_TYPE_MISMATCH;
+            break;
         }
 
 
@@ -325,12 +727,6 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
 
         /// If we reach this point, we have a valid header and our pointer is on the first data point in the series
 
-        if(series->header.interval == 0){ // the point calculation below divides by this
-            _ERROR("\t INVALID_SERIES_INTERVAL\n");
-            status = INVALID_SERIES_INTERVAL;
-            break;
-        }
-
         if(timestamp < series->header.timestamp){
             // Both fields are uint32_t. An unsigned subtraction here wraps to about
             // four billion, and the null fill below would then try to grow the file
@@ -345,7 +741,7 @@ retry:
         int64_t point = ((int64_t)timestamp - (int64_t)series->header.timestamp)/(int64_t)series->header.interval;
         // Point since start of file
 
-        int64_t file_pos = point * series->header.datasize + sizeof(SERIES);
+        int64_t file_pos = point * series->datasize + sizeof(SERIES);
 
 
         if(file_pos >= series->file_size){ // Cached Write
@@ -353,7 +749,7 @@ retry:
             _DEBUG("\t ===== Performing Cached Write =======\n");
 
             // get total points in series
-            int64_t pointsInBuffer = point - ((series->file_size - sizeof(SERIES)) / series->header.datasize);
+            int64_t pointsInBuffer = point - ((series->file_size - sizeof(SERIES)) / series->datasize);
             //a int64_t pointsInBuffer = pointsInSeries - point;
 
             _DEBUG("\t Absolute point in series: %d,  buffer pos: %d, buffer size: %d\n",point,pointsInBuffer,write_ahead_size);
@@ -362,7 +758,7 @@ retry:
             // Check if this is a cache write or memory write
             if(pointsInBuffer < write_ahead_size){
                 // Write to buffer
-                memcpy(series->write_ahead_cache + (pointsInBuffer * series->header.datasize),value,series->header.datasize);
+                memcpy(series->write_ahead_cache + (pointsInBuffer * series->datasize),value,series->datasize);
                 _DEBUG("\t Writing to buffer at pos: %d\n",pointsInBuffer);
 
                 if(pointsInBuffer == (write_ahead_size-1)){ // If we've reached the end of our buffer, flush it.
@@ -418,7 +814,7 @@ retry:
 
 
                 // Create a temporary buffer to hold the data
-                char *nullFill = (char*)malloc(grow_by * series->header.datasize); // Allocate a temporary memory buffer to contain the null data points that we will write
+                char *nullFill = (char*)malloc(grow_by * series->datasize); // Allocate a temporary memory buffer to contain the null data points that we will write
                 if(nullFill == NULL){ // Could not allocate memory
                     _ERROR("\t WAL_MEMORY_ALLOCATION_FAILURE\n");
                     status = WAL_MEMORY_ALLOCATION_FAILURE;
@@ -426,11 +822,11 @@ retry:
                 }
 
                 // Set the buffer to our null fill
-                memset(nullFill,0xFF,grow_by * series->header.datasize); // Set to the null fill, for char a value of '0' is used, for float a value of 'FFFFFFFF' is used which represents 'Nan'
+                memset(nullFill,series->null_fill_byte,grow_by * series->datasize); // the fill byte for this series' type, see bsTypeNullFill()
 
                 _DEBUG("\Writing null fill to end of file\n");
                 // Write it to disk
-                if(fwrite(nullFill,series->header.datasize,grow_by,file) != (size_t)grow_by){ // Write the null points
+                if(fwrite(nullFill,series->datasize,grow_by,file) != (size_t)grow_by){ // Write the null points
                     free(nullFill);
                     _ERROR("\t WAL_WRITE_FAILURE\n");
                     status = WAL_WRITE_FAILURE;
@@ -439,7 +835,7 @@ retry:
                 _DEBUG("\t freeing null buffer\n");
                 free(nullFill);
 
-                series->file_size += grow_by * series->header.datasize; // Our new filesize
+                series->file_size += grow_by * series->datasize; // Our new filesize
                 _DEBUG("\tNew File Size = %d\n",series->file_size);
 
 
@@ -467,8 +863,8 @@ retry:
 
             _DEBUG("\t seeking to current writing position: %d\n",file_pos);
             fseek(file,file_pos,SEEK_SET); // Seek to the current writing position, this is based on the timestamp and interval
-            _DEBUG("\t Datapoint Size = %d\n",series->header.datasize);
-            size = fwrite(value,series->header.datasize,1,file); // Write the data point
+            _DEBUG("\t Datapoint Size = %d\n",series->datasize);
+            size = fwrite(value,series->datasize,1,file); // Write the data point
             _DEBUG("\t Wrote %d points @ %d\n",size,file_pos);
 
             if(size != 1){ // Check that write completed with the correct number of bytes written
@@ -526,7 +922,7 @@ retry:
 
 
 
-int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n_points, int64_t *real_points, int64_t *seconds_per_point, int64_t *first_point_timestamp, uint32_t *datasize, void** result)
+int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n_points, int64_t *real_points, int64_t *seconds_per_point, int64_t *first_point_timestamp, uint32_t *datasize, void** result, uint8_t *datatype)
 { // Returns number of points if successful or -1 if error
 
 
@@ -544,6 +940,10 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
     *seconds_per_point = 0;
     *first_point_timestamp = 0;
     *result = NULL;
+    *datasize = 0;
+
+    if(datatype != NULL)
+        *datatype = BS_TYPE_INVALID;
 
     int status = NO_ERROR;
     FILE *file = NULL;
@@ -615,11 +1015,17 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
                 break;
             }
 
-            _DEBUG("%u\n\tVersion: %lu\n\tTimestamp: %lu\n\tInverval: %lu\n\tDatasize: %lu\n\tChecksum: %lu\n\n   ",key,series->header.version,series->header.timestamp,series->header.interval,series->header.datasize,series->header.checksum);
+            _DEBUG("%u\n\tVersion: %u\n\tTimestamp: %u\n\tInverval: %u\n\tTypecode: %u\n\tChecksum: %u\n\n   ",key,series->header.version,series->header.timestamp,series->header.interval,series->header.typecode,series->header.checksum);
 
             if(series->header.checksum != getChecksum(&series->header)){
                 _ERROR("\t INVALID_HEADER_CHECKSUM\n");
                 status = INVALID_HEADER_CHECKSUM;
+                break;
+            }
+
+            // Decode the header into the entry before anything reads its width
+            if(!bindHeader(series,key)){
+                status = SERIES_TYPE_MISMATCH;
                 break;
             }
 
@@ -637,13 +1043,13 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
         /// Calculate the position in the file (Byte) where we are going to write the data point,
         /// this is based on the start timestampfor the series and the number of seconds between points,
         /// the position is also offseted to account for the header size
-        if(series->header.interval == 0 || series->header.datasize == 0){ // both divide below
-            _ERROR("\t INVALID_SERIES_INTERVAL\n");
+        if(series->header.interval == 0 || series->datasize == 0){ // both divide below
+            _ERROR("\t INVALID_SERIES_INTERVAL\n"); // bindHeader should already have caught this
             status = INVALID_SERIES_INTERVAL;
             break;
         }
 
-        // Only now that the header is loaded is datasize known. Allocating the cache
+        // Only now that the header is bound is datasize known. Allocating the cache
         // any earlier sizes it as write_ahead_size * 0, and malloc(0) hands back a
         // non NULL pointer that this function then never grows.
         if(!validateWriteAheadCache(series)){
@@ -653,20 +1059,20 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
         }
 
         int64_t points = ( end_time - start_time) / series->header.interval;
-        int64_t points_in_file = (series->file_size - (int64_t)sizeof(SERIES))/series->header.datasize;
+        int64_t points_in_file = (series->file_size - (int64_t)sizeof(SERIES))/series->datasize;
         *seconds_per_point = series->header.interval;
 
         // output[0] corresponds to start_time: the mapping below places every file
         // and cache point at (its timestamp - start_time) / interval.
         *first_point_timestamp = start_time;
 
-        char *output = new (std::nothrow) char[points*series->header.datasize];
+        char *output = new (std::nothrow) char[points*series->datasize];
         if(output == NULL){
             _ERROR("\t MEMORY_ALLOCATION_FAILED\n");
             status = MEMORY_ALLOCATION_FAILED;
             break;
         }
-        memset(output,this->default_null_fill_byte,points*series->header.datasize); // Set to the null fill, for char a value of '0' is used, for float a value of 'FFFFFFFF' is used which represents 'Nan'
+        memset(output,series->null_fill_byte,points*series->datasize); // the fill byte for this series' type, see bsTypeNullFill()
 
 
         {
@@ -732,10 +1138,10 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
             if(buffer_output_points > 0 && file_start_point >= 0 && file_end_point >= 0){
 
 
-                fseek(file,((file_start_point*series->header.datasize)+sizeof(SERIES)),SEEK_SET); // Read Points
+                fseek(file,((file_start_point*series->datasize)+sizeof(SERIES)),SEEK_SET); // Read Points
 
 
-                int64_t file_points = fread(output+(buffer_output_pos*series->header.datasize),series->header.datasize,buffer_output_points,file);
+                int64_t file_points = fread(output+(buffer_output_pos*series->datasize),series->datasize,buffer_output_points,file);
 
              //   int64_t file_points = 0;
                 *real_points += file_points;
@@ -825,7 +1231,7 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
 
             if(buffer_output_points > 0 && series->write_ahead_cache != NULL && cache_start_point >= 0 && cache_end_point >= 0 && buffer_output_start_pos >= 0){
                 // cache_start_point counts points, the cache is addressed in bytes.
-                memcpy(output+(buffer_output_start_pos*series->header.datasize),series->write_ahead_cache + (cache_start_point*series->header.datasize),buffer_output_points*series->header.datasize);
+                memcpy(output+(buffer_output_start_pos*series->datasize),series->write_ahead_cache + (cache_start_point*series->datasize),buffer_output_points*series->datasize);
                 *real_points += buffer_output_points;
             }
 
@@ -835,7 +1241,10 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
 
         *result = output;
         *n_points = points;
-        *datasize = series->header.datasize;
+        *datasize = series->datasize;
+
+        if(datatype != NULL)
+            *datatype = series->datatype;
 
         status = NO_ERROR;
 

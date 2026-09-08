@@ -1,0 +1,59 @@
+# bseries series definitions
+#
+# Declares what a series holds and how often a point is recorded, per key range.
+# Without a definitions file every series in the database shares
+# default_seconds_per_point and takes whatever point width the first write passed,
+# which only works if the whole database stores one kind of measurement.
+#
+# Load with:
+#
+#     BSeries db;
+#     db.data_directory = "/var/lib/bseries";
+#     int loaded = db.loadDefinitions("/etc/bseries.conf");
+#     if(loaded < 0) { /* malformed file, do not start */ }
+#
+# Format, one series family per line:
+#
+#     <name>  <keys>  <interval>  <type>  [null_fill]
+#
+#   name       label used in log messages only
+#   keys       a single key, an inclusive N-M range, or * for everything
+#   interval   seconds between points, optionally suffixed s, m or h
+#   type       uint8 uint16 uint32 uint64
+#              int8  int16  int32  int64
+#              float32 float64
+#              (aliases: byte, uchar, char, float, double)
+#   null_fill  optional byte written for "no point recorded here",
+#              as 0xNN or decimal. Defaults to the value for the type.
+#
+# Ranges are matched in file order and the first match wins, so declare narrow
+# ranges before wide ones. Everything after a # is a comment.
+#
+# A definition applies when a series file is created. Once the file exists its own
+# header is the authority, because the points already on disk were laid out to it.
+# Changing a definition therefore does not retype existing series; the database
+# warns when a definition and a file disagree and keeps using the file.
+
+
+# name      keys            interval   type       null_fill
+
+ping        1-9999          1s         uint8
+temperature 10000-19999     60s        float32
+power_draw  20000-29999     10s        uint32
+door_state  30000-30999     5s         uint8      0x02
+
+
+# On null fill
+#
+# Series are dense, so every gap has to be spelled out in the file and one value
+# per type is reserved to mean "nothing was recorded". The defaults are:
+#
+#   float32 / float64   0xFF fill, which is a NaN. No real value is lost.
+#   unsigned integers   0xFF fill, the maximum value. A uint8 series cannot
+#                       store 255, a uint16 series cannot store 65535, and so on.
+#   signed integers     0x80 fill, a large negative number. There is no clean
+#                       sentinel for a signed type; pick one your data cannot
+#                       produce and set it explicitly.
+#
+# The door_state line above is an example: the sensor reports 0 or 1, so 0x02 is
+# free and makes a much better "no reading" marker than 255 would.
