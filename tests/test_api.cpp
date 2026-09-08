@@ -155,6 +155,7 @@ int main(int argc, char **argv){
     config.max_points_per_read = 100000;
     config.max_body_bytes = 262144;
     config.default_interval = 10;
+    config.condense_window_points = 64;   // small, so condensing crosses many windows
 
     BSeries db;
     db.data_directory = dir;
@@ -556,7 +557,102 @@ int main(int argc, char **argv){
         CHECK(r.status==200 && bodyHas(r,"\"overwritten\":1"), "so does the single series write");
     }
 
-    printf("[13] method handling\n");
+    printf("[13] condensing for visualisation\n");
+    {
+        const long long T = 1700000000;
+
+        // 600 one second slots: 0-99 hold 1..100, 100-199 are never written,
+        // 200-599 all hold 50. The empty stretch is the interesting part.
+        REPLY r = request("POST","/v1/series/70001?type=uint8&interval=1&start=1700000000","read-write-key");
+        CHECK(r.status==201, "create a 1s uint8 series");
+
+        std::string batch;
+        char line[128];
+        for(int i = 0; i < 600; i++){
+            if(i >= 100 && i < 200) continue;          // deliberate gap
+            snprintf(line,sizeof(line),"70001 %lld %02x\n", T + i, (i < 100) ? (i + 1) : 50);
+            batch += line;
+        }
+        r = request("POST","/v1/data","read-write-key",batch);
+        CHECK(r.status==200 && bodyHas(r,"\"records_written\":500"), "500 of 600 slots written");
+
+        // min: the empty slots must not become the minimum
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700000600&max_points=6&condense=min","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"condense\":\"min\"") && bodyHas(r,"\"factor\":100"), "min condenses to 6 buckets");
+        CHECK(bodyHas(r,"\"type\":\"uint8\""), "min keeps the series type");
+        CHECK(bodyHas(r,"\"data\":\"01ff32323232\""), "min: 1, gap, then 50s - the fill is not a minimum");
+
+        // max: the fill is 0xff, which is also the largest uint8, so this is the
+        // case where including empty slots would be silently wrong
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700000600&max_points=6&condense=max","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"data\":\"64ff32323232\""), "max: 100 not 255 - empty slots excluded");
+
+        // average: 1..100 averages 50.5, and the empty slots must not pull it down
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700000600&max_points=6&condense=average","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"type\":\"float64\""), "average promotes to float64");
+        CHECK(bodyHas(r,"\"datasize\":8"), "and says so");
+        {
+            size_t at = r.body.find("\"data\":\"");
+            std::string blob;
+            if(at != std::string::npos){
+                size_t from = at + 8, to = r.body.find('"',at + 8);
+                if(to != std::string::npos) blob = r.body.substr(from,to - from);
+            }
+            CHECK(blob.size() == 6 * 16, "six float64 buckets");
+            double values[6];
+            bool decoded = blob.size() == 96;
+            for(int b = 0; b < 6 && decoded; b++){
+                unsigned char bytes[8];
+                for(int j = 0; j < 8; j++)
+                    bytes[j] = (unsigned char)strtoul(blob.substr(b*16 + j*2,2).c_str(),NULL,16);
+                memcpy(&values[b],bytes,8);
+            }
+            CHECK(decoded && values[0] > 50.4 && values[0] < 50.6, "bucket 0 averages 50.5, the true mean of 1..100");
+            CHECK(decoded && values[1] != values[1], "the empty bucket is NaN, not 0 and not 255");
+            CHECK(decoded && values[5] > 49.9 && values[5] < 50.1, "the last bucket averages 50");
+        }
+
+        // a bucket wider than the condense window, so bucket state must survive
+        // several window reads (the window is 64 points in this test)
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700000600&max_points=2&condense=max","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"factor\":300"), "two buckets of 300 slots each");
+        CHECK(bodyHas(r,"\"data\":\"6432\""), "max survives buckets spanning several windows");
+
+        // partial buckets: some real points, some empty
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700000600&max_points=4&condense=average","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"n_points\":4"), "uneven bucketing still produces max_points buckets");
+
+        // reported counts
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700000600&max_points=6&condense=min","read-only-key");
+        CHECK(bodyHas(r,"\"real_points\":5"), "five of six buckets contain data");
+        CHECK(bodyHas(r,"\"points_scanned\":600"), "all 600 slots were walked");
+        CHECK(bodyHas(r,"\"source_points\":500"), "500 of them held a reading");
+        CHECK(bodyHas(r,"\"interval\":100") && bodyHas(r,"\"source_interval\":1"), "bucket and source intervals both given");
+
+        // the pair rule
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700000600&max_points=6","read-only-key");
+        CHECK(r.status==400 && bodyHas(r,"together"), "max_points without condense is refused");
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700000600&condense=min","read-only-key");
+        CHECK(r.status==400 && bodyHas(r,"together"), "condense without max_points is refused");
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700000600&max_points=6&condense=median","read-only-key");
+        CHECK(r.status==400, "an unknown operation is refused");
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700000600&max_points=0&condense=min","read-only-key");
+        CHECK(r.status==400, "max_points=0 is refused");
+
+        // condensing works on the multi series endpoint too
+        r = request("POST","/v1/series/70002?type=uint8&interval=1&start=1700000000","read-write-key");
+        r = request("POST","/v1/data","read-write-key","70002 1700000000 0a141e28\n");
+        CHECK(r.status==200, "seed a second series");
+        r = request("GET","/v1/data?keys=70001,70002&start=1700000000&end=1700000600&max_points=6&condense=max","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"count\":2"), "batch read condenses too");
+        CHECK(bodyHas(r,"\"condense\":\"max\""), "and reports the operation per series");
+
+        // a condensed range may exceed the raw read cap, since it is windowed
+        r = request("GET","/v1/series/70001/data?start=1&end=1700000600","read-only-key");
+        CHECK(r.status==413 && bodyHas(r,"max_points"), "a huge raw range is refused and suggests condensing");
+    }
+
+    printf("[14] method handling\n");
     {
         REPLY r = request("DELETE","/v1/series","read-write-key");
         CHECK(r.status==405, "DELETE on the collection is 405");

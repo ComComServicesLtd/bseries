@@ -44,6 +44,8 @@ typedef struct {
 
     int max_points_per_read;   // shared across every series in one request
     int max_series_per_read;
+    int max_condense_scan;     // input points a condensed request may walk
+    int condense_window_points; // input points held at once while condensing
     int max_points_per_write;  // total points one write request may carry
     int max_grow_points;       // how far past the end of a series one write may reach
     int max_body_bytes;
@@ -93,6 +95,9 @@ private:
     void handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
     int streamSeriesData(uint32_t key, long long start_time, long long end_time, HttpStream *stream);
+    int streamCondensedSeries(uint32_t key, long long start_time, long long end_time,
+                              int mode, long long max_points, HttpStream *stream, long long *scanned_out);
+    bool readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE &response, int *mode, long long *max_points);
     bool readTimeRange(const HTTP_REQUEST &request, HTTP_RESPONSE &response, long long *start_time, long long *end_time);
     int64_t pointsInRange(uint32_t key, long long start_time, long long end_time);
     void handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);

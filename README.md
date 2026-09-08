@@ -298,6 +298,69 @@ If sub-interval placement matters for your data, the fix is a shorter interval,
 not a rounding rule: a series stores one value per slot and cannot represent two
 readings inside one.
 
+### Condensing for charts
+
+`max_points` and `condense` downsample a range into at most that many buckets. They
+are **used as a pair** — a bucket count means nothing without saying how to combine
+what falls in a bucket, and vice versa — and supplying one alone is refused.
+`condense` is `min`, `max` or `average`. Both work on `/v1/series/{key}/data` and on
+`/v1/data`.
+
+```
+$ curl -H 'X-API-Key: $READ_KEY' \
+    'localhost:8086/v1/series/1/data?start=1700000000&end=1700300000&max_points=500&condense=average'
+{"key":1,"type":"float64","datasize":8,"interval":600,"source_interval":1,
+ "condense":"average","factor":600,"first_point_timestamp":1700000000,
+ "n_points":500,"data":"...","real_points":500,"points_scanned":300000,
+ "source_points":300000,"null_fill":"ffffffffffffffff"}
+```
+
+`interval` is the **bucket** width, so `first_point_timestamp + i * interval` still
+gives point `i`'s time; `source_interval` is the series' own. `factor` is how many
+slots went into each bucket. `real_points` counts buckets that contained at least
+one reading, `points_scanned` is how many slots were walked and `source_points`
+how many of those held a reading.
+
+`min` and `max` hand back a stored point untouched, so they keep the series' type.
+An average generally is not representable in it — the mean of two `uint8` readings
+usually is not a `uint8` — so `condense=average` promotes to `float64`, which holds
+every value of every narrower type exactly. The response's `type` and `datasize`
+say which you got.
+
+**A condensed read is windowed**, so it is not bounded by `max_points_per_read` the
+way a raw read is: the range is walked a window at a time and a bucket's running
+state carries across window boundaries. Condensing 300000 one second points into
+500 buckets returns 8KB and holds a few MB while doing it. `max_condense_scan`
+bounds the total slots a condensed request may walk, and `condense_window` sets how
+many are held at once.
+
+### How missing data is kept out of the aggregate
+
+A series is dense, so a month of one second slots contains a slot per second
+whether anything was recorded or not. Feeding the empty ones to an aggregate would
+be wrong three separate ways:
+
+* **average** would be dragged towards the fill value by however many slots were
+  empty, which for a sparsely written series is nearly all of them
+* **max** over an unsigned series would return the fill itself, since the fill is
+  the maximum value of the type
+* **min** over a float series would return NaN, and one NaN poisons every
+  comparison it takes part in
+
+So empty slots take no part in any aggregate. A bucket with no readings at all
+produces the null fill, which is what tells a chart to draw a gap rather than a
+line through an invented value. Non finite floats are treated as missing too: the
+float fill is a NaN, but a client can store a NaN or an infinity of its own and
+either would wreck an aggregate the same way.
+
+Over 600 slots holding `1..100`, then 100 empty, then `50` throughout:
+
+```
+condense=min      01 ff 32 32 32 32     1,   gap, 50 ...   the fill is not a minimum
+condense=max      64 ff 32 32 32 32     100, gap, 50 ...   not 255, which is the fill
+condense=average  50.5, NaN, 50, ...                       the true mean of 1..100
+```
+
 ### Gaps in a response
 
 `data` is the raw series content, so the points where nothing was recorded hold the

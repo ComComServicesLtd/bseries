@@ -62,6 +62,145 @@ static bool streamHex(HttpStream *stream, const void *data, size_t length){
 }
 
 
+// ===========================================================================
+// Condensing
+//
+// Downsampling a range into at most max_points buckets, for plotting a span far
+// wider than a chart has pixels.
+//
+// Missing data is the whole difficulty. A series is dense, so a range covering a
+// month of one second slots contains a slot for every second whether anything was
+// recorded or not, and the ones that were not hold the null fill. Feeding those to
+// an aggregate would be wrong in three separate ways:
+//
+//   * average would be pulled towards the fill value by however many slots were
+//     empty, which for a sparsely written series is nearly all of them
+//   * max over an unsigned series would return the fill itself, since the fill is
+//     the maximum value of the type
+//   * min over a float series would return NaN, and one NaN poisons every
+//     comparison it takes part in
+//
+// So empty slots are excluded from every aggregate rather than being treated as a
+// value. A bucket with no real points in it produces the fill, meaning "nothing was
+// recorded anywhere in this bucket", which is exactly what a chart needs in order
+// to draw a gap rather than a line through zero.
+//
+// Non finite floats are treated as missing too. The float fill is a NaN, but a
+// client can also store a NaN or an infinity of its own, and either would wreck an
+// aggregate the same way.
+// ===========================================================================
+
+#define CONDENSE_NONE 0
+#define CONDENSE_MIN  1
+#define CONDENSE_MAX  2
+#define CONDENSE_AVG  3
+
+static bool condenseModeFromName(const std::string &name, int *mode){
+
+    if(name == "min")                          { *mode = CONDENSE_MIN; return true; }
+    if(name == "max")                          { *mode = CONDENSE_MAX; return true; }
+    if(name == "avg" || name == "average")     { *mode = CONDENSE_AVG; return true; }
+
+    return false;
+}
+
+
+static const char *condenseModeName(int mode){
+
+    switch(mode){
+        case CONDENSE_MIN: return "min";
+        case CONDENSE_MAX: return "max";
+        case CONDENSE_AVG: return "average";
+        default:           return "none";
+    }
+}
+
+
+/// Reads one stored point as a double, for averaging.
+
+static double pointToDouble(const unsigned char *p, uint8_t datatype, uint32_t datasize){
+
+    if(datatype == BS_FLOAT){
+        if(datasize == 4){ float v;  memcpy(&v,p,4); return (double)v; }
+        double v; memcpy(&v,p,8); return v;
+    }
+
+    if(datatype == BS_SIGNED){
+        if(datasize == 1){ int8_t v;  memcpy(&v,p,1); return (double)v; }
+        if(datasize == 2){ int16_t v; memcpy(&v,p,2); return (double)v; }
+        if(datasize == 4){ int32_t v; memcpy(&v,p,4); return (double)v; }
+        int64_t v; memcpy(&v,p,8); return (double)v;
+    }
+
+    if(datasize == 1){ uint8_t v;  memcpy(&v,p,1); return (double)v; }
+    if(datasize == 2){ uint16_t v; memcpy(&v,p,2); return (double)v; }
+    if(datasize == 4){ uint32_t v; memcpy(&v,p,4); return (double)v; }
+
+    uint64_t v; memcpy(&v,p,8); return (double)v;
+}
+
+
+/// Orders two stored points in their own type, so min and max keep the exact bytes
+/// rather than a value that has been through a double.
+
+static int comparePoints(const unsigned char *a, const unsigned char *b, uint8_t datatype, uint32_t datasize){
+
+    if(datatype == BS_UNSIGNED || datatype == BS_SIGNED || datatype == BS_FLOAT){
+
+        double x = pointToDouble(a,datatype,datasize);
+        double y = pointToDouble(b,datatype,datasize);
+
+        // 64 bit integers can exceed what a double holds exactly, so those are
+        // compared in their own width.
+        if(datasize == 8 && datatype == BS_UNSIGNED){
+            uint64_t ua, ub;
+            memcpy(&ua,a,8); memcpy(&ub,b,8);
+            return ua < ub ? -1 : (ua > ub ? 1 : 0);
+        }
+
+        if(datasize == 8 && datatype == BS_SIGNED){
+            int64_t ia, ib;
+            memcpy(&ia,a,8); memcpy(&ib,b,8);
+            return ia < ib ? -1 : (ia > ib ? 1 : 0);
+        }
+
+        return x < y ? -1 : (x > y ? 1 : 0);
+    }
+
+    return 0;
+}
+
+
+/// True when a slot holds no reading: the series' null fill, or a float that is not
+/// finite. Either would corrupt an aggregate it took part in.
+
+static bool pointIsMissing(const unsigned char *p, uint8_t datatype, uint32_t datasize, unsigned char fill){
+
+    bool all_fill = true;
+
+    for(uint32_t i = 0; i < datasize; i++){
+        if(p[i] != fill){ all_fill = false; break; }
+    }
+
+    if(all_fill)
+        return true;
+
+    if(datatype == BS_FLOAT){
+
+        double value = pointToDouble(p,datatype,datasize);
+
+        // NaN != NaN, and an infinity would drag an average to infinity
+        if(value != value)
+            return true;
+
+        if(value > 1.7976931348623157e308 || value < -1.7976931348623157e308)
+            return true;
+    }
+
+    return false;
+}
+
+
 static int hexValue(char c){
 
     if(c >= '0' && c <= '9') return c - '0';
@@ -375,6 +514,8 @@ void apiConfigDefaults(API_CONFIG *config){
     config->max_series_per_read = 500;
     config->max_points_per_write = 500000;
     config->max_grow_points = 1000000;
+    config->max_condense_scan = 50000000;
+    config->condense_window_points = 262144;
     config->max_body_bytes = 1024 * 1024;
     config->max_connections = 64;
     config->write_ahead_size = 4096;
@@ -439,6 +580,8 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out){
         else if(key == "max_series_per_read"      && parseUnsigned(text,&number)) config->max_series_per_read = (int)number;
         else if(key == "max_points_per_write"     && parseUnsigned(text,&number)) config->max_points_per_write = (int)number;
         else if(key == "max_grow_points"          && parseUnsigned(text,&number)) config->max_grow_points = (int)number;
+        else if(key == "max_condense_scan"        && parseUnsigned(text,&number)) config->max_condense_scan = (int)number;
+        else if(key == "condense_window"          && parseUnsigned(text,&number)) config->condense_window_points = (int)number;
         else if(key == "max_body_bytes"           && parseUnsigned(text,&number)) config->max_body_bytes = (int)number;
         else if(key == "max_connections"          && parseUnsigned(text,&number)) config->max_connections = (int)number;
         else if(key == "write_ahead_size"         && parseUnsigned(text,&number)) config->write_ahead_size = (int)number;
@@ -1062,6 +1205,343 @@ int BSeriesApi::streamSeriesData(uint32_t key, long long start_time, long long e
 
 
 
+/// Appends one finished bucket's value.
+///
+/// A bucket with no real samples in it produces the null fill, which is what tells
+/// a chart to draw a gap rather than a line through some invented value.
+
+static void emitCondensedBucket(std::string &out, int mode, long long samples, double sum,
+                                const unsigned char *best, uint8_t src_datatype, uint32_t src_datasize,
+                                uint32_t out_datasize, unsigned char out_fill){
+
+    (void)src_datatype;
+    (void)src_datasize;
+
+    if(samples == 0){
+        out.append((size_t)out_datasize,(char)out_fill);
+        return;
+    }
+
+    if(mode == CONDENSE_AVG){
+        double average = sum / (double)samples;
+        char bytes[8];
+        memcpy(bytes,&average,8);
+        out.append(bytes,8);
+        return;
+    }
+
+    out.append((const char*)best,(size_t)out_datasize);
+}
+
+
+/// Streams one series condensed into at most max_points buckets.
+///
+/// The range is walked a window at a time rather than read whole, so a condensed
+/// read of a year of one second points costs a window of memory, not a year of it.
+/// A bucket's running state carries across window boundaries, so the window size
+/// does not have to be a multiple of anything.
+///
+/// Returns a database status. Nothing is written unless it is NO_ERROR.
+
+int BSeriesApi::streamCondensedSeries(uint32_t key, long long start_time, long long end_time,
+                                      int mode, long long max_points, HttpStream *stream,
+                                      long long *scanned_out){
+
+    SERIES header;
+    int64_t file_size = 0;
+
+    int info = db->seriesInfo(key,&header,&file_size);
+
+    if(info != NO_ERROR)
+        return info;
+
+    if(header.interval == 0)
+        return INVALID_SERIES_INTERVAL;
+
+    long long interval = (long long)header.interval;
+
+    // Align to the series' own grid, the same way a raw read does, so bucket
+    // boundaries land on slot boundaries.
+    long long base;
+    {
+        long long first_slot = (start_time <= (long long)header.timestamp)
+            ? -(((long long)header.timestamp - start_time) / interval)
+            : (start_time - (long long)header.timestamp) / interval;
+
+        base = (long long)header.timestamp + first_slot * interval;
+    }
+
+    long long total_slots = (end_time - start_time) / interval;
+
+    if(total_slots < 1)
+        total_slots = 1;
+
+    long long factor = (total_slots + max_points - 1) / max_points;
+
+    if(factor < 1)
+        factor = 1;
+
+    long long bucket_count = (total_slots + factor - 1) / factor;
+    long long bucket_interval = interval * factor;
+
+    // min and max hand back a stored point untouched, so they keep the series'
+    // own type. An average is not generally representable in it, so it is promoted
+    // to float64, which holds every value of every narrower type exactly.
+    uint8_t out_datatype = (mode == CONDENSE_AVG) ? BS_FLOAT : bsTypeCodeDataType(header.typecode);
+    uint32_t out_datasize = (mode == CONDENSE_AVG) ? 8 : bsTypeCodeDataSize(header.typecode);
+
+    if(header.version != SERIES_VERSION_TYPED){
+        uint32_t width = header.typecode;
+        out_datatype = (mode == CONDENSE_AVG) ? BS_FLOAT : ((width == 4) ? BS_FLOAT : BS_UNSIGNED);
+        out_datasize = (mode == CONDENSE_AVG) ? 8 : width;
+    }
+
+    unsigned char out_fill = (mode == CONDENSE_AVG) ? 0xFF : 0;
+    {
+        SERIES_DEFINITION definition;
+        uint32_t width = (header.version == SERIES_VERSION_TYPED)
+                       ? bsTypeCodeDataSize(header.typecode) : header.typecode;
+        uint8_t type = (header.version == SERIES_VERSION_TYPED)
+                     ? bsTypeCodeDataType(header.typecode) : ((width == 4) ? BS_FLOAT : BS_UNSIGNED);
+
+        if(db->definitionForKey(key,&definition) && definition.datasize == width)
+            out_fill = definition.null_fill_byte;
+        else if(header.version == SERIES_VERSION_TYPED)
+            out_fill = bsTypeNullFill(type,(uint8_t)width);
+        else
+            out_fill = (unsigned char)db->default_null_fill_byte;
+
+        // An averaged series is float64 whatever the source was, and 0xFF over a
+        // float64 is a NaN, which is the sentinel that costs nothing.
+        if(mode == CONDENSE_AVG)
+            out_fill = 0xFF;
+    }
+
+    // Everything below only appends, so build the head first.
+    char head[640];
+
+    snprintf(head,sizeof(head),
+        "\"key\":%lu,\"type\":\"%s\",\"datasize\":%lu,\"interval\":%lld,"
+        "\"source_interval\":%lld,\"condense\":\"%s\",\"factor\":%lld,"
+        "\"first_point_timestamp\":%lld,\"n_points\":%lld,",
+        (unsigned long)key,
+        bsTypeName(out_datatype,(uint8_t)out_datasize),
+        (unsigned long)out_datasize,
+        bucket_interval,
+        interval,
+        condenseModeName(mode),
+        factor,
+        base,
+        bucket_count);
+
+    std::string prefix = head;
+
+    // The counts are only known once every bucket has been walked, and the blob is
+    // streamed as it is produced, so they are reported after it rather than before.
+    stream->write(prefix);
+    stream->write("\"data\":\"",8);
+
+    uint8_t src_datatype = (header.version == SERIES_VERSION_TYPED)
+                         ? bsTypeCodeDataType(header.typecode)
+                         : ((header.typecode == 4) ? BS_FLOAT : BS_UNSIGNED);
+    uint32_t src_datasize = (header.version == SERIES_VERSION_TYPED)
+                          ? bsTypeCodeDataSize(header.typecode) : header.typecode;
+
+    unsigned char src_fill = out_fill;
+    {
+        SERIES_DEFINITION definition;
+        if(db->definitionForKey(key,&definition) && definition.datasize == src_datasize)
+            src_fill = definition.null_fill_byte;
+        else if(header.version == SERIES_VERSION_TYPED)
+            src_fill = bsTypeNullFill(src_datatype,(uint8_t)src_datasize);
+        else
+            src_fill = (unsigned char)db->default_null_fill_byte;
+    }
+
+    long long buckets_with_data = 0;
+    long long points_scanned = 0;
+    long long real_points = 0;
+
+    // State of the bucket currently being filled, carried across windows.
+    long long bucket_index = 0;
+    long long bucket_samples = 0;
+    double bucket_sum = 0.0;
+    unsigned char bucket_best[8];
+    bool bucket_has_best = false;
+
+    std::string out_bytes;
+    out_bytes.reserve(4096);
+
+    long long slot = 0;
+    int status = NO_ERROR;
+
+    while(slot < total_slots && status == NO_ERROR){
+
+        long long window_slots = (long long)config.condense_window_points;
+
+        if(window_slots < 1)
+            window_slots = 262144;
+
+        if(window_slots > total_slots - slot)
+            window_slots = total_slots - slot;
+
+        long long window_start = base + slot * interval;
+        long long window_end = window_start + window_slots * interval;
+
+        int64_t n=0, r=0, spp=0, fpt=0;
+        uint32_t ds=0;
+        uint8_t dt=0;
+        void *result = NULL;
+
+        int rc = db->read(key,window_start,window_end,&n,&r,&spp,&fpt,&ds,&result,&dt);
+
+        if(rc != NO_ERROR){
+            if(result) delete[] (char*)result;
+            status = rc;
+            break;
+        }
+
+        const unsigned char *bytes = (const unsigned char*)result;
+
+        for(int64_t i = 0; i < n && slot + i < total_slots; i++){
+
+            long long global_slot = slot + i;
+            long long belongs_to = global_slot / factor;
+
+            if(belongs_to != bucket_index){
+
+                // Emit the bucket that just closed
+                emitCondensedBucket(out_bytes,mode,bucket_samples,bucket_sum,
+                                    bucket_has_best ? bucket_best : NULL,
+                                    src_datatype,src_datasize,out_datasize,out_fill);
+
+                if(bucket_samples > 0)
+                    buckets_with_data++;
+
+                bucket_index = belongs_to;
+                bucket_samples = 0;
+                bucket_sum = 0.0;
+                bucket_has_best = false;
+
+                if(out_bytes.size() >= 4096){
+                    streamHex(stream,out_bytes.data(),out_bytes.size());
+                    out_bytes.clear();
+                }
+            }
+
+            const unsigned char *point = bytes + i * ds;
+            points_scanned++;
+
+            if(pointIsMissing(point,src_datatype,ds,src_fill))
+                continue;   // an empty slot takes no part in the aggregate
+
+            real_points++;
+            bucket_samples++;
+
+            if(mode == CONDENSE_AVG){
+
+                bucket_sum += pointToDouble(point,src_datatype,ds);
+
+            } else if(!bucket_has_best){
+
+                memcpy(bucket_best,point,ds);
+                bucket_has_best = true;
+
+            } else {
+
+                int order = comparePoints(point,bucket_best,src_datatype,ds);
+
+                if((mode == CONDENSE_MIN && order < 0) || (mode == CONDENSE_MAX && order > 0))
+                    memcpy(bucket_best,point,ds);
+            }
+        }
+
+        delete[] (char*)result;
+        slot += window_slots;
+    }
+
+    if(status != NO_ERROR)
+        return status;   // the head is already out, the caller reports it in the body
+
+    // The final bucket never sees a boundary, so it is closed here.
+    emitCondensedBucket(out_bytes,mode,bucket_samples,bucket_sum,
+                        bucket_has_best ? bucket_best : NULL,
+                        src_datatype,src_datasize,out_datasize,out_fill);
+
+    if(bucket_samples > 0)
+        buckets_with_data++;
+
+    if(!out_bytes.empty())
+        streamHex(stream,out_bytes.data(),out_bytes.size());
+
+    char tail[320];
+
+    snprintf(tail,sizeof(tail),
+        "\",\"real_points\":%lld,\"points_scanned\":%lld,\"source_points\":%lld,\"null_fill\":\"%s\"",
+        buckets_with_data,
+        points_scanned,
+        real_points,
+        nullFillPattern(out_fill,out_datasize).c_str());
+
+    stream->write(tail,strlen(tail));
+
+    if(scanned_out != NULL)
+        *scanned_out = points_scanned;
+
+    return NO_ERROR;
+}
+
+
+/// Reads max_points and condense from the query string.
+///
+/// They are a pair: a bucket count means nothing without saying how to combine
+/// what falls in a bucket, and an operation means nothing without a bucket count.
+/// Supplying one without the other is refused rather than guessed at.
+///
+/// Sets mode to CONDENSE_NONE when neither is present.
+
+bool BSeriesApi::readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE &response, int *mode, long long *max_points){
+
+    *mode = CONDENSE_NONE;
+    *max_points = 0;
+
+    std::string max_text = httpQueryParam(request,"max_points");
+    std::string condense_text = httpQueryParam(request,"condense");
+
+    if(max_text.empty() && condense_text.empty())
+        return true;
+
+    if(max_text.empty() || condense_text.empty()){
+        jsonError(response,400,"bad_parameter",
+                  "max_points and condense are used together; supply both or neither");
+        return false;
+    }
+
+    unsigned long value = 0;
+
+    if(!parseUnsigned(max_text,&value) || value == 0){
+        jsonError(response,400,"bad_parameter","max_points must be a positive number of buckets");
+        return false;
+    }
+
+    if(value > (unsigned long)config.max_points_per_read){
+        char message[192];
+        snprintf(message,sizeof(message),"max_points may not exceed max_points_per_read, which is %d",
+                 config.max_points_per_read);
+        jsonError(response,400,"bad_parameter",message);
+        return false;
+    }
+
+    if(!condenseModeFromName(condense_text,mode)){
+        jsonError(response,400,"bad_parameter","condense must be min, max or average");
+        return false;
+    }
+
+    *max_points = (long long)value;
+    return true;
+}
+
+
 /// Reads start and end from the query string. end defaults to now.
 
 bool BSeriesApi::readTimeRange(const HTTP_REQUEST &request, HTTP_RESPONSE &response, long long *start_time, long long *end_time){
@@ -1119,15 +1599,37 @@ void BSeriesApi::handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_
     if(!readTimeRange(request,response,&start_time,&end_time))
         return;
 
-    // Bound the response before allocating anything. The library will happily
-    // allocate a point for every interval in the range asked for.
+    int condense_mode = CONDENSE_NONE;
+    long long max_points = 0;
+
+    if(!readCondenseOptions(request,response,&condense_mode,&max_points))
+        return;
+
     int64_t points = pointsInRange(key,start_time,end_time);
 
-    if(points > (int64_t)config.max_points_per_read){
+    if(condense_mode == CONDENSE_NONE){
+
+        // Bound the response before allocating anything. The library will happily
+        // allocate a point for every interval in the range asked for.
+        if(points > (int64_t)config.max_points_per_read){
+            char message[256];
+            snprintf(message,sizeof(message),
+                     "the range covers %lld points, the limit is %d; narrow start and end, "
+                     "or pass max_points and condense to downsample it",
+                     (long long)points,config.max_points_per_read);
+            jsonError(response,413,"range_too_large",message);
+            return;
+        }
+
+    } else if(points > (int64_t)config.max_condense_scan){
+
+        // A condensed read walks the range a window at a time, so the response is
+        // bounded by max_points rather than by the range. The work still is not,
+        // hence a separate and much larger ceiling on what may be scanned.
         char message[256];
         snprintf(message,sizeof(message),
-                 "the range covers %lld points, the limit is %d; narrow start and end",
-                 (long long)points,config.max_points_per_read);
+                 "condensing would walk %lld points, the limit is %d; narrow start and end",
+                 (long long)points,config.max_condense_scan);
         jsonError(response,413,"range_too_large",message);
         return;
     }
@@ -1152,7 +1654,9 @@ void BSeriesApi::handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_
     stream->begin(200,"application/json",response.headers);
     stream->write(head,strlen(head));
 
-    int rc = streamSeriesData(key,start_time,end_time,stream);
+    int rc = (condense_mode == CONDENSE_NONE)
+           ? streamSeriesData(key,start_time,end_time,stream)
+           : streamCondensedSeries(key,start_time,end_time,condense_mode,max_points,stream,NULL);
 
     if(rc != NO_ERROR){
         // The head is already on the wire, so a failure this late can only be
@@ -1180,6 +1684,12 @@ void BSeriesApi::handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &res
     if(!readTimeRange(request,response,&start_time,&end_time))
         return;
 
+    int condense_mode = CONDENSE_NONE;
+    long long max_points = 0;
+
+    if(!readCondenseOptions(request,response,&condense_mode,&max_points))
+        return;
+
     std::string keys_text = httpQueryParam(request,"keys");
 
     if(keys_text.empty()){
@@ -1201,19 +1711,28 @@ void BSeriesApi::handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &res
     if(!skip_text.empty() && skip_text != "0" && skip_text != "false")
         skip_missing = true;
 
-    // The point budget is shared across the whole request. Applying it per series
-    // would let a caller multiply it by the number of series they ask for.
+    // The budget is shared across the whole request. Applying it per series would
+    // let a caller multiply it by the number of series they ask for.
     int64_t total_points = 0;
 
     for(size_t i = 0; i < keys.size(); i++)
         total_points += pointsInRange(keys[i],start_time,end_time);
 
-    if(total_points > (int64_t)config.max_points_per_read){
+    if(condense_mode == CONDENSE_NONE && total_points > (int64_t)config.max_points_per_read){
         char message[256];
         snprintf(message,sizeof(message),
                  "the request covers %lld points across %lu series, the limit is %d; "
-                 "narrow the range or ask for fewer series",
+                 "narrow the range, ask for fewer series, or pass max_points and condense",
                  (long long)total_points,(unsigned long)keys.size(),config.max_points_per_read);
+        jsonError(response,413,"range_too_large",message);
+        return;
+    }
+
+    if(condense_mode != CONDENSE_NONE && total_points > (int64_t)config.max_condense_scan){
+        char message[256];
+        snprintf(message,sizeof(message),
+                 "condensing would walk %lld points across %lu series, the limit is %d",
+                 (long long)total_points,(unsigned long)keys.size(),config.max_condense_scan);
         jsonError(response,413,"range_too_large",message);
         return;
     }
@@ -1245,7 +1764,12 @@ void BSeriesApi::handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &res
 
         stream->write("{",1);
 
-        int rc = (info == NO_ERROR) ? streamSeriesData(keys[i],start_time,end_time,stream) : info;
+        int rc = info;
+
+        if(info == NO_ERROR)
+            rc = (condense_mode == CONDENSE_NONE)
+               ? streamSeriesData(keys[i],start_time,end_time,stream)
+               : streamCondensedSeries(keys[i],start_time,end_time,condense_mode,max_points,stream,NULL);
 
         if(rc != NO_ERROR){
             char entry[256];

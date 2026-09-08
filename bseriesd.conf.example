@@ -57,8 +57,16 @@ write_key             CHANGE_ME_read_write_key
 # memory. Peak is one series' points plus a 64KB buffer, not the size of the
 # response, which is what makes a large limit here affordable.
 
-max_points_per_read   1000000       # a wider range is refused with 413
+max_points_per_read   1000000       # a wider raw range is refused with 413
 max_series_per_read   500           # keys= may name at most this many series
+
+# Condensed reads (max_points + condense) are windowed rather than read whole,
+# so they are not bounded by max_points_per_read. max_condense_scan bounds how
+# many stored slots one condensed request may walk, and condense_window how many
+# are held in memory at a time while doing it.
+
+max_condense_scan     50000000
+condense_window       262144
 max_points_per_write  500000        # total points one write request may carry
 max_body_bytes        1048576       # a larger request body is refused with 413
 max_connections       64            # further connections get 503
