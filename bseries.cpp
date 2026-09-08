@@ -586,32 +586,106 @@ FILE* BSeries::openFile(uint64_t key, bool writeMode){
 
 
 
-bool BSeries::flushBuffer(ENTRY *series,FILE *file){
+bool BSeries::flushBuffer(ENTRY *series,FILE *file,int64_t points){
 
     if(file == NULL || series->write_ahead_cache == NULL)
         return false;
 
+    // By default write only what has actually been written. Everything past that
+    // is still null fill, so writing it would put the file ahead of the data for
+    // no gain and cost every later write in this window a seek of its own.
+    if(points < 0)
+        points = series->buffer_points;
+
+    if(points > write_ahead_size)
+        points = write_ahead_size;
+
+    if(points <= 0){
+        // A clean buffer. Writing the whole thing here is how an idle series used
+        // to gain another buffer's worth of null points on every flush.
+        series->buffer_points = 0;
+        series->buffer_dirty_since = 0;
+        return true;
+    }
 
     _DEBUG("\tSeeking to end of file\n");
     // Seek to end of file
     fseek(file,0,SEEK_END);
 
-    _DEBUG("\tFlushing current buffer\n");
-    // Write are buffer to the file
-    size_t size = fwrite(series->write_ahead_cache,series->datasize,write_ahead_size,file); // Write the data point
+    _DEBUG("\tFlushing %ld buffered points\n",(long)points);
+    size_t size = fwrite(series->write_ahead_cache,series->datasize,(size_t)points,file);
 
-    if(size != (size_t)write_ahead_size){
+    if(size != (size_t)points){
         _ERROR("\t Failed to flush write ahead buffer to file");
         return false;
     }
-    series->file_size += write_ahead_size * series->datasize; // Our file has grown!
+
+    series->file_size += points * series->datasize; // Our file has grown!
     _DEBUG("\tNew File Size = %d\n",series->file_size);
 
-
-    // Reset our buffer with null fill
+    // Reset our buffer with null fill. The window has slid forward by the points
+    // just written, so the next point in sequence lands at the front of it again.
     memset(series->write_ahead_cache,series->null_fill_byte,write_ahead_size * series->datasize);
 
+    series->buffer_points = 0;
+    series->buffer_dirty_since = 0;
+
     return true;
+}
+
+
+/// Flushes series that have been holding buffered points for too long.
+///
+/// A series still being written to is never flushed by closeSeries, which only
+/// evicts idle ones, so without this it is the busiest series that hold the most
+/// unflushed data. Entries another thread is using are skipped rather than waited
+/// for; they will be caught on the next pass.
+
+int BSeries::flushAged(uint32_t max_age){
+
+    if(shuttingDown)
+        return 0;
+
+    uint32_t now = (uint32_t)time(NULL);
+    int flushed = 0;
+
+    index_access.lock();
+
+    for(map<uint32_t,ENTRY>::iterator it = series_list.begin(); it != series_list.end(); ++it){
+
+        if(!it->second.access.try_lock())
+            continue;
+
+        bool due = it->second.buffer_points > 0 &&
+                   it->second.buffer_dirty_since != 0 &&
+                   (int64_t)now - (int64_t)it->second.buffer_dirty_since >= (int64_t)max_age;
+
+        if(!due){
+            it->second.access.unlock();
+            continue;
+        }
+
+        FILE *file = openFile(it->first,true);
+
+        if(file != NULL){
+
+            if(flushBuffer(&it->second,file))
+                flushed++;
+            else
+                _ERROR("\t Failed to flush series %u on its timer\n",it->first);
+
+            fclose(file);
+
+        } else {
+            _ERROR("\t Could not open series %u to flush it on its timer\n",it->first);
+        }
+
+        it->second.access.unlock();
+    }
+
+    index_access.unlock();
+
+    return flushed;
 }
 
 
@@ -838,6 +912,12 @@ retry:
 
                 // Write to buffer
                 memcpy(slot,value,series->datasize);
+
+                if(pointsInBuffer + 1 > series->buffer_points)
+                    series->buffer_points = pointsInBuffer + 1;
+
+                if(series->buffer_dirty_since == 0)
+                    series->buffer_dirty_since = (uint32_t)time(NULL);
                 _DEBUG("\t Writing to buffer at pos: %d\n",pointsInBuffer);
 
                 if(pointsInBuffer == (write_ahead_size-1)){ // If we've reached the end of our buffer, flush it.

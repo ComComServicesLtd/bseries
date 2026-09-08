@@ -19,6 +19,7 @@
 #include "http_server.h"
 #include "table_set.h"
 #include "auth_store.h"
+#include "runtime_settings.h"
 
 
 static HttpServer *g_server = NULL;
@@ -33,26 +34,52 @@ static void handleSignal(int number){
 }
 
 
-/// Flushes and drops series that have gone quiet. Without this a long running
-/// server holds an entry, and a write ahead buffer, for every key it has ever
-/// touched, and buffered points sit in memory indefinitely.
+/// Two jobs, on their own schedules.
+///
+/// Flushing bounds how long a point can sit in memory. The write ahead buffer
+/// holds a number of points rather than a span of time, so on a slow series an
+/// actively written buffer can hold days of data; the flush timer is what turns
+/// that into a number of seconds an operator can state.
+///
+/// Eviction drops series that have gone quiet, so a long running server does not
+/// hold an entry and a buffer for every key it has ever touched.
+///
+/// The loop ticks every second and re-reads its intervals each time, so a change
+/// made through /v1/config takes effect on the next tick rather than after the
+/// old interval has run out.
 
-static void maintenanceThread(TableSet *tables, int idle_seconds, int interval_seconds){
+static void maintenanceThread(TableSet *tables, RUNTIME_SETTINGS *runtime){
 
-    if(idle_seconds <= 0 || interval_seconds <= 0)
-        return;
+    time_t last_flush = time(NULL);
+    time_t last_evict = time(NULL);
 
     while(!g_stopping.load()){
 
-        for(int waited = 0; waited < interval_seconds && !g_stopping.load(); waited++){
-            struct timespec pause = { 1, 0 };
-            nanosleep(&pause,NULL);
-        }
+        struct timespec pause = { 1, 0 };
+        nanosleep(&pause,NULL);
 
         if(g_stopping.load())
             break;
 
-        tables->maintain((uint32_t)idle_seconds);
+        time_t now = time(NULL);
+
+        int flush_interval = runtime->flush_interval.load();
+
+        if(flush_interval > 0 && now - last_flush >= (time_t)flush_interval){
+            tables->flushAged((uint32_t)flush_interval);
+            last_flush = now;
+        }
+
+        int idle = runtime->series_max_idle.load();
+        int tick = runtime->maintenance_interval.load();
+
+        if(tick < 1)
+            tick = 1;
+
+        if(idle > 0 && now - last_evict >= (time_t)tick){
+            tables->maintain((uint32_t)idle);
+            last_evict = now;
+        }
     }
 }
 
@@ -166,7 +193,16 @@ int main(int argc, char **argv){
         fprintf(stderr,"bseriesd: %lu table%s\n",(unsigned long)names.size(),names.size() == 1 ? "" : "s");
     }
 
-    BSeriesApi api(&tables,&auth,&config);
+    RUNTIME_SETTINGS runtime;
+    runtime.flush_interval.store(config.flush_interval);
+    runtime.series_max_idle.store(config.series_max_idle_seconds);
+    runtime.maintenance_interval.store(config.maintenance_interval_seconds);
+    runtime.max_points_per_read.store(config.max_points_per_read);
+    runtime.max_series_per_read.store(config.max_series_per_read);
+    runtime.max_points_per_write.store(config.max_points_per_write);
+    runtime.max_condense_scan.store(config.max_condense_scan);
+
+    BSeriesApi api(&tables,&auth,&runtime,&config);
 
     HttpServer server;
     server.max_connections = config.max_connections;
@@ -185,7 +221,12 @@ int main(int argc, char **argv){
     fprintf(stderr,"bseriesd: listening on %s port %d, data in %s\n",
             config.bind_address.c_str(),config.port,config.data_directory.c_str());
 
-    std::thread maintenance(maintenanceThread,&tables,config.series_max_idle_seconds,config.maintenance_interval_seconds);
+    if(config.flush_interval > 0)
+        fprintf(stderr,"bseriesd: buffered points are flushed after at most %d seconds\n",config.flush_interval);
+    else
+        fprintf(stderr,"bseriesd: flush timer disabled; points sit in memory until their buffer fills\n");
+
+    std::thread maintenance(maintenanceThread,&tables,&runtime);
 
     server.run(BSeriesApi::handle,&api);
 

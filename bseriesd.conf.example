@@ -101,10 +101,21 @@ max_grow_points       1000000
 
 # --- maintenance ----------------------------------------------------------
 #
-# A series untouched for series_max_idle seconds is flushed to disk and dropped
-# from memory. Without this the server keeps an entry and a write ahead buffer
-# for every key it has ever touched, and buffered points sit in memory
-# indefinitely. Set series_max_idle to 0 to disable.
+# flush_interval bounds how long a point may sit in memory before reaching the
+# disk, in seconds. The write ahead buffer holds a number of points rather than a
+# span of time, so on a 60 second series an actively written buffer can hold
+# nearly three days of data; this is what turns that into a number you can state.
+# A flush writes only the points actually buffered, so an early flush is cheap and
+# later writes stay buffered. 0 disables the timer. SIGTERM and SIGINT flush
+# everything regardless, so a clean restart never loses points.
+#
+# A series untouched for series_max_idle seconds is flushed and dropped from
+# memory, so the server does not keep a buffer for every key it has ever touched.
+# Note that eviction only catches idle series; flush_interval is what covers the
+# busy ones. Set either to 0 to disable it.
+#
+# All three can be changed while the server runs, through POST /v1/config.
 
+flush_interval        60
 series_max_idle       900
 maintenance_interval  60

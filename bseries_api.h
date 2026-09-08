@@ -8,6 +8,7 @@
 #include "http_server.h"
 #include "table_set.h"
 #include "auth_store.h"
+#include "runtime_settings.h"
 
 
 /// HTTP CRUD interface to a BSeries database.
@@ -53,10 +54,13 @@ typedef struct {
     /// blocks browser callers and is the right default for a server side client.
     std::vector<std::string> cors_origins;
 
+    /// Starting values for the settings that can later be changed over HTTP; see
+    /// runtime_settings.h. Once the server is up, RUNTIME_SETTINGS is the truth.
     int max_points_per_read;   // shared across every series in one request
     int max_series_per_read;
     int max_condense_scan;     // input points a condensed request may walk
     int condense_window_points; // input points held at once while condensing
+    int flush_interval;        // seconds a series may hold buffered points
     int max_points_per_write;  // total points one write request may carry
     int max_grow_points;       // how far past the end of a series one write may reach
     int max_body_bytes;
@@ -89,13 +93,14 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out);
 class BSeriesApi
 {
 public:
-    BSeriesApi(TableSet *table_set, AuthStore *auth_store, const API_CONFIG *config);
+    BSeriesApi(TableSet *table_set, AuthStore *auth_store, RUNTIME_SETTINGS *settings, const API_CONFIG *config);
 
     /// The HTTP_HANDLER entry point. Pass the BSeriesApi instance as context.
     static void handle(const HTTP_REQUEST &request, HTTP_RESPONSE &response, void *context);
 
     TableSet *tables;
     AuthStore *auth;
+    RUNTIME_SETTINGS *runtime;
     API_CONFIG config;
 
 private:
@@ -114,6 +119,9 @@ private:
     void handleListKeys(HTTP_RESPONSE &response);
     void handleCreateKey(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleRevokeKey(const std::string &name, HTTP_RESPONSE &response);
+
+    void handleReadSettings(HTTP_RESPONSE &response);
+    void handleUpdateSettings(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
     /// allow_bootstrap is true only for creating the first key. The bootstrap
     /// token is printed to the server's log, so it must not double as a general

@@ -67,6 +67,10 @@ public:
     int loadDefinitions(const char *path, std::string *error);
 
     void maintain(uint32_t idle_seconds);
+
+    /// Flushes buffered points older than max_age across every open table.
+    /// Returns how many series were flushed.
+    int flushAged(uint32_t max_age);
     void closeAll();
 
     std::string root;

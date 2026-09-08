@@ -514,6 +514,7 @@ void apiConfigDefaults(API_CONFIG *config){
     config->max_series_per_read = 500;
     config->max_points_per_write = 500000;
     config->max_grow_points = 1000000;
+    config->flush_interval = 60;
     config->max_condense_scan = 50000000;
     config->condense_window_points = 262144;
     config->auto_create_tables = false;
@@ -582,6 +583,7 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out){
         else if(key == "max_series_per_read"      && parseUnsigned(text,&number)) config->max_series_per_read = (int)number;
         else if(key == "max_points_per_write"     && parseUnsigned(text,&number)) config->max_points_per_write = (int)number;
         else if(key == "max_grow_points"          && parseUnsigned(text,&number)) config->max_grow_points = (int)number;
+        else if(key == "flush_interval"           && parseUnsigned(text,&number)) config->flush_interval = (int)number;
         else if(key == "max_condense_scan"        && parseUnsigned(text,&number)) config->max_condense_scan = (int)number;
         else if(key == "condense_window"          && parseUnsigned(text,&number)) config->condense_window_points = (int)number;
         else if(key == "auto_create_tables"       && parseUnsigned(text,&number)) config->auto_create_tables = (number != 0);
@@ -610,11 +612,90 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out){
 // API
 // ===========================================================================
 
-BSeriesApi::BSeriesApi(TableSet *table_set, AuthStore *auth_store, const API_CONFIG *configuration)
+BSeriesApi::BSeriesApi(TableSet *table_set, AuthStore *auth_store, RUNTIME_SETTINGS *settings, const API_CONFIG *configuration)
 {
     tables = table_set;
     auth = auth_store;
+    runtime = settings;
     config = *configuration;
+}
+
+
+void BSeriesApi::handleReadSettings(HTTP_RESPONSE &response){
+
+    response.status = 200;
+    response.body = "{\"settings\":{";
+
+    for(unsigned i = 0; i < RUNTIME_SETTING_FIELD_COUNT; i++){
+
+        char entry[192];
+        snprintf(entry,sizeof(entry),"%s\"%s\":%d",
+                 i > 0 ? "," : "",
+                 RUNTIME_SETTING_FIELDS[i].name,
+                 (runtime->*(RUNTIME_SETTING_FIELDS[i].field)).load());
+
+        response.body += entry;
+    }
+
+    response.body += "}}";
+}
+
+
+/// Changes settings while the server runs. Every named setting is validated before
+/// any is applied, so a request that names one bad value changes nothing rather
+/// than leaving the server half configured.
+///
+/// These live only in memory; the configuration file is not rewritten, so a
+/// restart returns to what is written there.
+
+void BSeriesApi::handleUpdateSettings(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+
+    int wanted[16];
+    bool given[16];
+    unsigned count = RUNTIME_SETTING_FIELD_COUNT;
+    unsigned named = 0;
+
+    for(unsigned i = 0; i < count && i < 16; i++){
+
+        given[i] = false;
+
+        bool present = false;
+        std::string text = httpQueryParam(request,RUNTIME_SETTING_FIELDS[i].name,&present);
+
+        if(!present)
+            continue;
+
+        unsigned long value = 0;
+
+        if(!parseUnsigned(text,&value) || (long long)value < RUNTIME_SETTING_FIELDS[i].minimum ||
+           (long long)value > RUNTIME_SETTING_FIELDS[i].maximum){
+
+            char message[256];
+            snprintf(message,sizeof(message),"%s must be between %d and %d",
+                     RUNTIME_SETTING_FIELDS[i].name,
+                     RUNTIME_SETTING_FIELDS[i].minimum,
+                     RUNTIME_SETTING_FIELDS[i].maximum);
+
+            jsonError(response,400,"bad_parameter",message);
+            return;
+        }
+
+        wanted[i] = (int)value;
+        given[i] = true;
+        named++;
+    }
+
+    if(named == 0){
+        jsonError(response,400,"bad_parameter","name at least one setting to change");
+        return;
+    }
+
+    for(unsigned i = 0; i < count && i < 16; i++){
+        if(given[i])
+            (runtime->*(RUNTIME_SETTING_FIELDS[i].field)).store(wanted[i]);
+    }
+
+    handleReadSettings(response);
 }
 
 
@@ -1149,6 +1230,25 @@ void BSeriesApi::route(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
         return;
     }
 
+    // /v1/config - settings that can change while the server runs
+    if(segments[1] == "config" && segments.size() == 2){
+
+        if(request.method == "GET"){
+            if(!authorise(request,false,response)) return;
+            handleReadSettings(response);
+            return;
+        }
+
+        if(request.method == "POST" || request.method == "PUT" || request.method == "PATCH"){
+            if(!authorise(request,true,response)) return;
+            handleUpdateSettings(request,response);
+            return;
+        }
+
+        jsonError(response,405,"method_not_allowed","GET to read, POST to change");
+        return;
+    }
+
     // /v1/auth - the API keys themselves
     if(segments[1] == "auth"){
 
@@ -1338,7 +1438,7 @@ void BSeriesApi::handleListSeries(BSeries *db, const HTTP_REQUEST &request, HTTP
 
         std::string parse_error;
 
-        if(!parseKeyList(keys_text,config.max_series_per_read,&keys,&parse_error)){
+        if(!parseKeyList(keys_text,runtime->max_series_per_read.load(),&keys,&parse_error)){
             jsonError(response,400,"bad_parameter",parse_error);
             return;
         }
@@ -1882,10 +1982,10 @@ bool BSeriesApi::readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE 
         return false;
     }
 
-    if(value > (unsigned long)config.max_points_per_read){
+    if(value > (unsigned long)runtime->max_points_per_read.load()){
         char message[192];
         snprintf(message,sizeof(message),"max_points may not exceed max_points_per_read, which is %d",
-                 config.max_points_per_read);
+                 runtime->max_points_per_read.load());
         jsonError(response,400,"bad_parameter",message);
         return false;
     }
@@ -1969,17 +2069,17 @@ void BSeriesApi::handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &r
 
         // Bound the response before allocating anything. The library will happily
         // allocate a point for every interval in the range asked for.
-        if(points > (int64_t)config.max_points_per_read){
+        if(points > (int64_t)runtime->max_points_per_read.load()){
             char message[256];
             snprintf(message,sizeof(message),
                      "the range covers %lld points, the limit is %d; narrow start and end, "
                      "or pass max_points and condense to downsample it",
-                     (long long)points,config.max_points_per_read);
+                     (long long)points,runtime->max_points_per_read.load());
             jsonError(response,413,"range_too_large",message);
             return;
         }
 
-    } else if(points > (int64_t)config.max_condense_scan){
+    } else if(points > (int64_t)runtime->max_condense_scan.load()){
 
         // A condensed read walks the range a window at a time, so the response is
         // bounded by max_points rather than by the range. The work still is not,
@@ -1987,7 +2087,7 @@ void BSeriesApi::handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &r
         char message[256];
         snprintf(message,sizeof(message),
                  "condensing would walk %lld points, the limit is %d; narrow start and end",
-                 (long long)points,config.max_condense_scan);
+                 (long long)points,runtime->max_condense_scan.load());
         jsonError(response,413,"range_too_large",message);
         return;
     }
@@ -2058,7 +2158,7 @@ void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_
     std::vector<uint32_t> keys;
     std::string parse_error;
 
-    if(!parseKeyList(keys_text,config.max_series_per_read,&keys,&parse_error)){
+    if(!parseKeyList(keys_text,runtime->max_series_per_read.load(),&keys,&parse_error)){
         jsonError(response,400,"bad_parameter",parse_error);
         return;
     }
@@ -2076,21 +2176,21 @@ void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_
     for(size_t i = 0; i < keys.size(); i++)
         total_points += pointsInRange(db,keys[i],start_time,end_time);
 
-    if(condense_mode == CONDENSE_NONE && total_points > (int64_t)config.max_points_per_read){
+    if(condense_mode == CONDENSE_NONE && total_points > (int64_t)runtime->max_points_per_read.load()){
         char message[256];
         snprintf(message,sizeof(message),
                  "the request covers %lld points across %lu series, the limit is %d; "
                  "narrow the range, ask for fewer series, or pass max_points and condense",
-                 (long long)total_points,(unsigned long)keys.size(),config.max_points_per_read);
+                 (long long)total_points,(unsigned long)keys.size(),runtime->max_points_per_read.load());
         jsonError(response,413,"range_too_large",message);
         return;
     }
 
-    if(condense_mode != CONDENSE_NONE && total_points > (int64_t)config.max_condense_scan){
+    if(condense_mode != CONDENSE_NONE && total_points > (int64_t)runtime->max_condense_scan.load()){
         char message[256];
         snprintf(message,sizeof(message),
                  "condensing would walk %lld points across %lu series, the limit is %d",
-                 (long long)total_points,(unsigned long)keys.size(),config.max_condense_scan);
+                 (long long)total_points,(unsigned long)keys.size(),runtime->max_condense_scan.load());
         jsonError(response,413,"range_too_large",message);
         return;
     }
@@ -2303,10 +2403,10 @@ void BSeriesApi::handleWriteData(BSeries *db, uint32_t key, const HTTP_REQUEST &
 
     int64_t count = (int64_t)(points.size() / datasize);
 
-    if(count > (int64_t)config.max_points_per_write){
+    if(count > (int64_t)runtime->max_points_per_write.load()){
         char message[192];
         snprintf(message,sizeof(message),"%lld points in one request, the limit is %d",
-                 (long long)count,config.max_points_per_write);
+                 (long long)count,runtime->max_points_per_write.load());
         jsonError(response,413,"too_many_points",message);
         return;
     }
@@ -2509,9 +2609,9 @@ void BSeriesApi::handleWriteNow(BSeries *db, const HTTP_REQUEST &request, HTTP_R
         record.count = 1;
         records.push_back(record);
 
-        if(records.size() > (size_t)config.max_series_per_read){
+        if(records.size() > (size_t)runtime->max_series_per_read.load()){
             char message[192];
-            snprintf(message,sizeof(message),"more than %d series in one request",config.max_series_per_read);
+            snprintf(message,sizeof(message),"more than %d series in one request",runtime->max_series_per_read.load());
             jsonError(response,413,"too_many_points",message);
             return;
         }
@@ -2715,10 +2815,10 @@ void BSeriesApi::handleBatchWrite(BSeries *db, const HTTP_REQUEST &request, HTTP
         record.count = (int64_t)(record.points.size() / record.datasize);
         total_points += record.count;
 
-        if(total_points > (int64_t)config.max_points_per_write){
+        if(total_points > (int64_t)runtime->max_points_per_write.load()){
             char message[192];
             snprintf(message,sizeof(message),
-                     "more than %d points in one request; split the batch",config.max_points_per_write);
+                     "more than %d points in one request; split the batch",runtime->max_points_per_write.load());
             jsonError(response,413,"too_many_points",message);
             return;
         }

@@ -359,6 +359,26 @@ void TableSet::maintain(uint32_t idle_seconds){
 }
 
 
+int TableSet::flushAged(uint32_t max_age){
+
+    std::vector<BSeries*> databases;
+
+    access.lock();
+
+    for(std::map<std::string,TABLE*>::iterator it = open_tables.begin(); it != open_tables.end(); ++it)
+        databases.push_back(&it->second->db);
+
+    access.unlock();
+
+    int flushed = 0;
+
+    for(size_t i = 0; i < databases.size(); i++)
+        flushed += databases[i]->flushAged(max_age);
+
+    return flushed;
+}
+
+
 void TableSet::closeAll(){
 
     access.lock();

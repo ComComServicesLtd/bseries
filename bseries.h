@@ -169,6 +169,16 @@ typedef struct
      uint32_t datasize;
      uint8_t  datatype;
      unsigned char null_fill_byte;
+
+     /// How much of the write ahead buffer has been written since the last flush,
+     /// and when the first of those points arrived. Together they let a flush
+     /// write only the points that exist rather than the whole buffer, and let a
+     /// timed flush know how long a series has been holding data.
+     ///
+     /// Zero points means the buffer is clean, so nothing is written for a series
+     /// that has taken no writes since its last flush.
+     int64_t buffer_points;
+     uint32_t buffer_dirty_since;
 } ENTRY;
 
 
@@ -188,7 +198,13 @@ public:
     BSeries();
 
     FILE* openFile(uint64_t key, bool writeMode);
-    bool flushBuffer(ENTRY *entry, FILE *file);
+    /// Writes points from the front of the write ahead buffer to the end of the
+    /// file. points of -1 means however many have actually been written since the
+    /// last flush, which is what every caller wants: flushing the whole buffer
+    /// would advance the file past slots nothing has been written to yet, and
+    /// every later write into that window would then take the direct path, one
+    /// open and seek per point.
+    bool flushBuffer(ENTRY *entry, FILE *file, int64_t points = -1);
 
 
     int createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize, uint32_t start_timestamp); // NO_ERROR, or negative
@@ -276,6 +292,13 @@ public:
     /// information the entry is already holding.
     bool seriesShape(uint32_t key, SERIES *header_out);
     int listSeriesKeys(vector<uint32_t> *keys, uint32_t after, int limit);
+
+    /// Flushes every series whose buffer has been holding points for at least
+    /// max_age seconds, whether or not it is still being written to. The write
+    /// ahead buffer holds a number of points rather than a span of time, so
+    /// without this an actively written series can hold hours of data in memory.
+    /// Returns how many series were flushed.
+    int flushAged(uint32_t max_age);
 
     void flush();
     void close();

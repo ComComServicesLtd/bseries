@@ -81,6 +81,8 @@ table name.
 | POST | `/v1/auth/keys?role=&name=` | write | mint an API key |
 | GET | `/v1/auth/keys` | write | list keys (never the secrets) |
 | DELETE | `/v1/auth/keys/{name}` | write | revoke a key |
+| GET | `/v1/config` | read | read the runtime settings |
+| POST | `/v1/config?<setting>=<value>` | write | change them, no restart |
 | GET | `/v1/tables` | read | list tables |
 | GET | `/v1/tables/{t}` | read | table info |
 | POST | `/v1/tables/{t}` | write | create a table |
@@ -356,29 +358,57 @@ Getting there needs `seriesShape()` rather than `seriesInfo()` on any write path
 cannot grow the in memory index; calling it per point cost an open, two reads, a
 seek and a close for something the open series already knew.
 
-### Durability: what an unclean shutdown loses
+### Durability: the flush timer
 
-The other side of that: points sit in memory until their buffer fills. A `kill -9`
-or a power loss discards whatever has not flushed. Demonstrated — 3000 points
-written and readable, the file still 20 bytes, and nothing left after a restart.
+A buffer holds `write_ahead_size` **points**, not a span of time, so on a slow
+series it can hold days of data. `flush_interval` bounds that in seconds: any
+series holding buffered points for longer is written out, whether or not it is
+still being written to. This matters because eviction only touches series that have
+gone *idle* — without the timer it is the busiest series that hold the most
+unflushed data, which is backwards.
 
-How long points sit there depends on the series interval, because a buffer holds
-`write_ahead_size` **points**, not seconds:
+Default 60 seconds; `0` disables it. `SIGTERM` and `SIGINT` still flush everything,
+so a normal restart loses nothing either way.
 
-| interval | points held before a flush | worst case age of unflushed data |
-|---|---|---|
-| 1s | 4096 | 1.1 hours |
-| 10s | 4096 | 11.4 hours |
-| 60s | 4096 | 68 hours |
-| 5m | 4096 | 342 hours |
+```
+wrote 3000 points          file: 20 bytes      (buffer holds 4096, nothing due yet)
+after the timer            file: 3020 bytes
+kill -9, restart           3000 of 3000 points survived
+```
 
-`SIGTERM` and `SIGINT` flush everything, so a normal restart loses nothing. The
-maintenance thread flushes series that have gone idle for `series_max_idle`, but an
-**actively written** series is never flushed early — it is the busy series whose
-data is at risk, not the quiet one.
+A flush writes **only the points actually buffered**, not the whole buffer. That is
+not a detail: flushing the whole buffer would advance the file past slots nothing
+has been written to yet, and every later write into that window would take the
+direct path with an open and a seek of its own. Measured over 1000 points spanning
+a mid-stream flush:
 
-Lower `write_ahead_size` to trade syscalls for exposure: it is points per flush, so
-halving it halves both the buffered window and the points per disk write.
+```
+flushing what was written    1 write syscall
+flushing the whole buffer  901 write syscalls
+```
+
+The same change means a clean buffer costs nothing to flush, where an idle series
+used to gain a whole buffer of null fill every time.
+
+### Changing settings while it runs
+
+`/v1/config` reads and changes the settings worth tuning against a live workload:
+
+```
+$ curl -XPOST -H 'X-API-Key: $WRITE_KEY' 'localhost:8086/v1/config?flush_interval=15'
+{"settings":{"flush_interval":15,"series_max_idle":900,…}}
+```
+
+`flush_interval`, `series_max_idle`, `maintenance_interval`, `max_points_per_read`,
+`max_series_per_read`, `max_points_per_write` and `max_condense_scan`. The
+maintenance thread re-reads its intervals every second, so a change takes effect on
+the next tick rather than after the old interval expires.
+
+A request that names one out-of-range value changes **nothing** — everything is
+validated before anything is applied. Changes live in memory only; the
+configuration file is not rewritten, so a restart returns to what is written there.
+Everything else — the listening address, the data directory, the keys — still needs
+a restart.
 
 ### Timestamps and how far a series can grow
 

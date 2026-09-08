@@ -176,5 +176,77 @@ int main(int argc, char**argv){
         db.close();
     }
 
+    printf("[8] timed flush\n");
+    {
+        BSeries db; db.data_directory = dir; db.default_seconds_per_point = 1;
+        uint32_t t0 = 1700000000;
+        db.createSeriesFile(800,1,BS_UNSIGNED,1,t0);
+
+        char path[512];
+        snprintf(path,sizeof(path),"%s/800",dir);
+
+        for(int i = 0; i < 100; i++){
+            unsigned char v = (unsigned char)(i % 250);
+            db.write(800,&v,1,t0+i);
+        }
+
+        FILE *f = fopen(path,"rb"); fseek(f,0,SEEK_END); long before = ftell(f); fclose(f);
+        CHECK(before == (long)sizeof(SERIES), "100 points are still only in memory");
+
+        CHECK(db.flushAged(3600) == 0, "a young buffer is not flushed");
+        CHECK(db.flushAged(0) == 1, "an aged one is");
+        CHECK(db.flushAged(0) == 0, "and is not flushed twice");
+
+        f = fopen(path,"rb"); fseek(f,0,SEEK_END); long after = ftell(f); fclose(f);
+        CHECK(after == (long)sizeof(SERIES) + 100, "only the 100 written points reached the file");
+
+        // the buffer window slid, so the next points are still cached writes
+        for(int i = 100; i < 900; i++){
+            unsigned char v = (unsigned char)(i % 250);
+            db.write(800,&v,1,t0+i);
+        }
+
+        f = fopen(path,"rb"); fseek(f,0,SEEK_END); long later = ftell(f); fclose(f);
+        CHECK(later == after, "writes after the flush went back to the buffer, not the file");
+
+        // and everything reads back
+        int64_t n=0,r=0,spp=0,fpt=0; uint32_t ds=0; void *res=NULL;
+        db.read(800,t0,t0+900,&n,&r,&spp,&fpt,&ds,&res);
+        int wrong = -1;
+        unsigned char *o = (unsigned char*)res;
+        for(int i = 0; i < 900 && res; i++)
+            if(o[i] != (unsigned char)(i % 250)){ wrong = i; break; }
+        if(wrong >= 0) printf("   first wrong point: %d\n", wrong);
+        CHECK(wrong < 0, "every point survives a flush mid stream");
+        delete[] (char*)res;
+
+        db.close();
+    }
+
+    printf("[9] a clean buffer costs nothing to flush\n");
+    {
+        // Flushing used to append a whole buffer of null fill whether or not
+        // anything had been written, so an idle series grew on every flush.
+        BSeries db; db.data_directory = dir; db.default_seconds_per_point = 1;
+        uint32_t t0 = 1700000000;
+        db.createSeriesFile(801,1,BS_UNSIGNED,1,t0);
+        unsigned char v = 5;
+        db.write(801,&v,1,t0);
+        db.flushAged(0);
+
+        char path[512];
+        snprintf(path,sizeof(path),"%s/801",dir);
+        FILE *f = fopen(path,"rb"); fseek(f,0,SEEK_END); long one = ftell(f); fclose(f);
+
+        db.flushAged(0);
+        db.flushAged(0);
+        db.flush();
+
+        f = fopen(path,"rb"); fseek(f,0,SEEK_END); long three = ftell(f); fclose(f);
+        CHECK(one == (long)sizeof(SERIES) + 1, "one point flushed is one point on disk");
+        CHECK(three == one, "flushing a clean buffer again adds nothing");
+        db.close();
+    }
+
     return testReport();
 }

@@ -5,6 +5,7 @@
 #include "bseries_api.h"
 #include "table_set.h"
 #include "auth_store.h"
+#include "runtime_settings.h"
 #include "http_server.h"
 #include "test_util.h"
 #include <time.h>
@@ -165,7 +166,16 @@ int main(int argc, char **argv){
     AuthStore auth;
     auth.load(std::string(dir) + "/auth.keys");
 
-    BSeriesApi api(&tables,&auth,&config);
+    RUNTIME_SETTINGS runtime;
+    runtime.flush_interval.store(60);
+    runtime.series_max_idle.store(900);
+    runtime.maintenance_interval.store(60);
+    runtime.max_points_per_read.store(config.max_points_per_read);
+    runtime.max_series_per_read.store(config.max_series_per_read);
+    runtime.max_points_per_write.store(config.max_points_per_write);
+    runtime.max_condense_scan.store(config.max_condense_scan);
+
+    BSeriesApi api(&tables,&auth,&runtime,&config);
 
     HttpServer server;
     server.max_body_bytes = config.max_body_bytes;
@@ -792,7 +802,54 @@ int main(int argc, char **argv){
         CHECK(r.status==200, "the store's only write key may go while a config one exists");
     }
 
-    printf("[16] method handling\n");
+    printf("[16] runtime settings\n");
+    {
+        REPLY r = request("GET","/v1/config","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"flush_interval\":60"), "settings are readable");
+        CHECK(bodyHas(r,"\"series_max_idle\":900"), "all of them");
+
+        r = request("POST","/v1/config?flush_interval=15","read-write-key");
+        CHECK(r.status==200 && bodyHas(r,"\"flush_interval\":15"), "the flush interval can be changed");
+        CHECK(runtime.flush_interval.load()==15, "and the change reaches the maintenance thread");
+
+        r = request("GET","/v1/config","read-only-key");
+        CHECK(bodyHas(r,"\"flush_interval\":15"), "and is what a later read returns");
+
+        r = request("POST","/v1/config?flush_interval=0","read-write-key");
+        CHECK(r.status==200 && runtime.flush_interval.load()==0, "0 disables the timer");
+        r = request("POST","/v1/config?flush_interval=60","read-write-key");
+        CHECK(runtime.flush_interval.load()==60, "and it can be turned back on");
+
+        // several at once, and the request limits are live too
+        r = request("POST","/v1/config?max_points_per_read=1234&series_max_idle=300","read-write-key");
+        CHECK(r.status==200 && runtime.max_points_per_read.load()==1234, "several settings in one call");
+        CHECK(runtime.series_max_idle.load()==300, "both applied");
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700010000","read-only-key");
+        CHECK(r.status==413, "a lowered read ceiling takes effect immediately");
+        r = request("POST","/v1/config?max_points_per_read=100000","read-write-key");
+        CHECK(runtime.max_points_per_read.load()==100000, "put back");
+
+        // validation, and all-or-nothing
+        int before = runtime.flush_interval.load();
+        r = request("POST","/v1/config?flush_interval=5&max_points_per_read=0","read-write-key");
+        CHECK(r.status==400, "an out of range value is refused");
+        CHECK(runtime.flush_interval.load()==before, "and nothing in that request was applied");
+        r = request("POST","/v1/config?flush_interval=notanumber","read-write-key");
+        CHECK(r.status==400, "a non numeric value is refused");
+        r = request("POST","/v1/config?nosuchsetting=1","read-write-key");
+        CHECK(r.status==400 && bodyHas(r,"at least one"), "an unknown setting changes nothing");
+        r = request("POST","/v1/config","read-write-key");
+        CHECK(r.status==400, "naming no setting is refused");
+
+        r = request("POST","/v1/config?flush_interval=30","read-only-key");
+        CHECK(r.status==403, "changing settings needs a write key");
+        r = request("GET","/v1/config",NULL);
+        CHECK(r.status==401, "and reading them needs a key");
+        r = request("DELETE","/v1/config","read-write-key");
+        CHECK(r.status==405, "DELETE is 405");
+    }
+
+    printf("[17] method handling\n");
     {
         REPLY r = request("DELETE","/v1/series","read-write-key");
         CHECK(r.status==405, "DELETE on the collection is 405");
