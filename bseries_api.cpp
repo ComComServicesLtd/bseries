@@ -514,7 +514,7 @@ void apiConfigDefaults(API_CONFIG *config){
     config->max_series_per_read = 500;
     config->max_points_per_write = 500000;
     config->max_grow_points = 1000000;
-    config->flush_interval = 60;
+    config->flush_interval = 3600;
     config->max_condense_scan = 50000000;
     config->condense_window_points = 262144;
     config->auto_create_tables = false;

@@ -102,7 +102,19 @@ max_grow_points       1000000
 # --- maintenance ----------------------------------------------------------
 #
 # flush_interval bounds how long a point may sit in memory before reaching the
-# disk, in seconds. The write ahead buffer holds a number of points rather than a
+# disk, in seconds. Note that a block flushing when it fills bounds it too, so
+# what a series actually gets is whichever comes first:
+#
+#     exposure = min(flush_interval, write_ahead_size x series interval)
+#
+# At 1024 point blocks a 1 second series fills a block in 17 minutes, so it is
+# already better than an hourly timer without one. The timer is what covers the
+# slower series, whose blocks would otherwise hold hours or days.
+#
+# Padding a partly filled block is what the timer costs: the rest of that block
+# is then in the file, so the points that follow are written straight through.
+# On a 1 second series, measured per point: 0.001 write syscalls with no timer,
+# 0.139 hourly, 0.96 at a minute. The write ahead buffer holds a number of points rather than a
 # span of time, so on a 60 second series an actively written buffer can hold
 # nearly three days of data; this is what turns that into a number you can state.
 # A flush writes only the points actually buffered, so an early flush is cheap and
@@ -116,6 +128,6 @@ max_grow_points       1000000
 #
 # All three can be changed while the server runs, through POST /v1/config.
 
-flush_interval        60
+flush_interval        3600
 series_max_idle       900
 maintenance_interval  60

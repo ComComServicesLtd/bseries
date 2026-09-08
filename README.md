@@ -367,8 +367,40 @@ still being written to. This matters because eviction only touches series that h
 gone *idle* — without the timer it is the busiest series that hold the most
 unflushed data, which is backwards.
 
-Default 60 seconds; `0` disables it. `SIGTERM` and `SIGINT` still flush everything,
-so a normal restart loses nothing either way.
+Default 3600 seconds; `0` disables it. `SIGTERM` and `SIGINT` still flush
+everything, so a normal restart loses nothing either way, and `series_max_idle`
+already flushes anything that stops being written — the timer is specifically about
+series that are *continuously* written.
+
+What a series actually gets is whichever bound comes first:
+
+```
+exposure = min(flush_interval, write_ahead_size x series interval)
+```
+
+That second term matters more than it looks. At 1024 point blocks:
+
+| interval | block fills in | what bounds exposure at a 1 hour timer |
+|---|---|---|
+| 1s | 17 min | the block — the timer never improves on it |
+| 5s | 85 min | the timer |
+| 10s | 2.8 h | the timer |
+| 60s | 17.1 h | the timer |
+| 5m | 85.3 h | the timer |
+
+So on a 1 second series an hourly timer buys no durability the block was not
+already giving, and costs the padding. Measured per point on a 1s series:
+
+| flush interval | write syscalls per point |
+|---|---|
+| off | 0.001 |
+| 1 hour | 0.139 |
+| 10 min | 0.661 |
+| 1 min | 0.961 |
+
+The slower series are where the timer earns its cost, and they are cheap to flush
+precisely because they are slow: a 60 second series doing write through is about 56
+file writes an hour.
 
 ```
 wrote 3000 points          file: 20 bytes      (nothing due yet)
