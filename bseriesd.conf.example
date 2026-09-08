@@ -35,17 +35,26 @@ default_interval      10            # seconds per point for keys with no definit
 
 # --- authentication -------------------------------------------------------
 #
-# Keys are presented as  X-API-Key: <key>  (Authorization: Bearer <key> also
-# works). read_key may call the GET endpoints; write_key may call everything.
-# Leave one empty to disable that level of access. They must differ.
+# Keys can be managed entirely over HTTP and none need be set here. Start the
+# server with no keys and it prints a one time bootstrap token; POST that to
+# /v1/auth/keys to mint the first write key, and everything else follows from
+# there. Minted keys are kept salted and hashed in the keystore below.
 #
-# Generate with:  head -c 32 /dev/urandom | base64
-#
-# This file holds secrets. chmod 600 it; bseriesd warns on startup if other
-# users can read it.
+# keystore defaults to auth.keys in the data directory.
 
-read_key              CHANGE_ME_read_only_key
-write_key             CHANGE_ME_read_write_key
+# keystore            /var/lib/bseries/auth.keys
+
+# Static keys, the way this worked before keys could be minted over HTTP. They
+# still work and sit alongside the keystore. Presented as X-API-Key: <key>
+# (Authorization: Bearer <key> also works). read_key may call the GET endpoints;
+# write_key may call everything. They must differ.
+#
+# Unlike minted keys these are stored in the clear, so prefer minting. If you do
+# set them, chmod 600 this file; bseriesd warns on startup if other users can
+# read it.
+
+# read_key            CHANGE_ME_read_only_key
+# write_key           CHANGE_ME_read_write_key
 
 
 # --- CORS -----------------------------------------------------------------

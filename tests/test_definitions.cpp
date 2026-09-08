@@ -117,33 +117,140 @@ int main(int argc,char**argv){
     }
 
     // ---- version 1 files written before definitions existed still read ----
-    printf("[F] legacy version 1 files\n");
+    printf("[F] older header versions still read\n");
     {
+        // Version 3 is what gets written now: the null fill lives in the header, so
+        // a series is readable correctly from its own file with no config.
         uint32_t t0=time(NULL);
-        {   // no definitions loaded: writes a version 1 header, as before
+        {
             BSeries db; db.data_directory=dir; db.default_seconds_per_point=10;
             unsigned char b=77;
-            CHECK(db.write(777,&b,1,t0)==NO_ERROR,"legacy style write");
+            CHECK(db.write(777,&b,1,t0)==NO_ERROR,"write with no definition");
             db.close();
         }
         char path[512]; snprintf(path,sizeof(path),"%s/777",dir);
         FILE*f=fopen(path,"rb"); SERIES h; size_t got=fread(&h,sizeof(h),1,f); fclose(f);
-        CHECK(got==1 && h.version==SERIES_VERSION_LEGACY,"header written as version 1");
-        CHECK(h.typecode==1,"typecode holds the plain width");
-        CHECK(sizeof(SERIES)==20,"header is still 20 bytes");
-        {   // and it still reads, with the type inferred
+        CHECK(got==1 && h.version==SERIES_VERSION_FILLED,"header is version 3");
+        CHECK(sizeof(SERIES)==20,"and is still 20 bytes");
+        CHECK(bsTypeCodeDataSize(h.typecode)==1,"width recorded");
+        CHECK(bsTypeCodeDataType(h.typecode)==BS_UNSIGNED,"type recorded");
+        CHECK(bsTypeCodeNullFill(h.typecode)==0xFF,"fill recorded");
+
+        // Hand build a genuine version 1 header, as releases before typed headers
+        // wrote them, and check it still reads.
+        {
+            SERIES v1;
+            memset(&v1,0,sizeof(v1));
+            v1.version = SERIES_VERSION_LEGACY;
+            v1.timestamp = t0;
+            v1.interval = 10;
+            v1.typecode = 1;                 // a plain width
+            BSeries tmp; tmp.data_directory = dir;
+            v1.checksum = tmp.getChecksum(&v1);
+            snprintf(path,sizeof(path),"%s/778",dir);
+            FILE *w=fopen(path,"wb");
+            fwrite(&v1,sizeof(v1),1,w);
+            unsigned char point=42; fwrite(&point,1,1,w);
+            fclose(w);
+            tmp.close();
+        }
+        {
             BSeries db; db.data_directory=dir; db.default_seconds_per_point=10;
             int64_t n=0,r=0,spp=0,fpt=0; uint32_t ds=0; uint8_t dt=0; void*res=NULL;
-            CHECK(db.read(777,t0,t0+30,&n,&r,&spp,&fpt,&ds,&res,&dt)==NO_ERROR,"legacy file reads");
-            CHECK(ds==1 && dt==BS_UNSIGNED,"legacy 1 byte inferred as uint8");
-            CHECK(spp==10,"legacy interval preserved");
-            CHECK(res && ((unsigned char*)res)[0]==77,"legacy point value");
+            CHECK(db.read(778,t0,t0+30,&n,&r,&spp,&fpt,&ds,&res,&dt)==NO_ERROR,"a version 1 file still reads");
+            CHECK(ds==1 && dt==BS_UNSIGNED,"its width and inferred type");
+            CHECK(spp==10,"its interval");
+            CHECK(res && ((unsigned char*)res)[0]==42,"and its point");
+            delete[] (char*)res;
+            db.close();
+        }
+
+        // A genuine version 2 header: typed, but with the fill byte left spare.
+        // Its fill must come from the type, not be read as 0x00.
+        {
+            SERIES v2;
+            memset(&v2,0,sizeof(v2));
+            v2.version = SERIES_VERSION_TYPED;
+            v2.timestamp = t0;
+            v2.interval = 10;
+            v2.typecode = (uint32_t)BS_UNSIGNED | (1u << 8);   // spare byte zero
+            BSeries tmp; tmp.data_directory = dir;
+            v2.checksum = tmp.getChecksum(&v2);
+            snprintf(path,sizeof(path),"%s/779",dir);
+            FILE *w=fopen(path,"wb");
+            fwrite(&v2,sizeof(v2),1,w);
+            unsigned char point=7; fwrite(&point,1,1,w);
+            fclose(w);
+            CHECK(tmp.resolveNullFill(779,&v2)==0xFF,"a version 2 fill comes from the type, not the spare byte");
+            tmp.close();
+        }
+        {
+            BSeries db; db.data_directory=dir; db.default_seconds_per_point=10;
+            int64_t n=0,r=0,spp=0,fpt=0; uint32_t ds=0; void*res=NULL;
+            CHECK(db.read(779,t0,t0+30,&n,&r,&spp,&fpt,&ds,&res)==NO_ERROR,"a version 2 file still reads");
+            CHECK(res && ((unsigned char*)res)[0]==7 && ((unsigned char*)res)[1]==0xFF,
+                  "its point, and its gap as the type's fill");
+            delete[] (char*)res;
+            db.close();
+        }
+
+        // An unknown future version is refused rather than guessed at
+        {
+            SERIES v9;
+            memset(&v9,0,sizeof(v9));
+            v9.version = 9;
+            v9.timestamp = t0; v9.interval = 10;
+            v9.typecode = (uint32_t)BS_UNSIGNED | (1u << 8);
+            BSeries tmp; tmp.data_directory = dir;
+            v9.checksum = tmp.getChecksum(&v9);
+            snprintf(path,sizeof(path),"%s/780",dir);
+            FILE *w=fopen(path,"wb"); fwrite(&v9,sizeof(v9),1,w); fclose(w);
+            tmp.close();
+        }
+        {
+            BSeries db; db.data_directory=dir;
+            int64_t n=0,r=0,spp=0,fpt=0; uint32_t ds=0; void*res=NULL;
+            CHECK(db.read(780,t0,t0+30,&n,&r,&spp,&fpt,&ds,&res)!=NO_ERROR,"an unknown header version is refused");
             delete[] (char*)res;
             db.close();
         }
     }
 
-    // ---- the file wins over a definition that disagrees ----
+    printf("[F2] the null fill survives without a config\n");
+    {
+        // The bug this version was added for: a custom fill used to live only in
+        // the definitions file, so the same bytes meant different things depending
+        // on whether that file was present.
+        uint32_t t0 = 1700000000;
+        {
+            BSeries db; db.data_directory=dir;
+            db.defineSeries(900,900,5,BS_UNSIGNED,1,"door",0x02);
+            CHECK(db.createSeriesFile(900,5,BS_UNSIGNED,1,t0)==NO_ERROR,"create with a custom fill");
+            unsigned char a=0,b=1;
+            db.write(900,&a,1,t0);
+            db.write(900,&b,1,t0+5);
+            db.write(900,&b,1,t0+15);
+            db.close();
+        }
+        {
+            // no definitions installed at all this time
+            BSeries db; db.data_directory=dir;
+            int64_t n=0,r=0,spp=0,fpt=0; uint32_t ds=0; void*res=NULL;
+            CHECK(db.read(900,t0,t0+20,&n,&r,&spp,&fpt,&ds,&res)==NO_ERROR,"read it back with no config");
+            unsigned char *o=(unsigned char*)res;
+            CHECK(res && n==4 && o[2]==0x02,"the gap is still written as 0x02");
+            delete[] (char*)res;
+
+            // The header, not a definition, is what says so now
+            SERIES header; int64_t size=0;
+            CHECK(db.seriesInfo(900,&header,&size)==NO_ERROR,"header readable");
+            CHECK(header.version==SERIES_VERSION_FILLED,"written as version 3");
+            CHECK(db.resolveNullFill(900,&header)==0x02,"and the fill comes from the header");
+            CHECK(!db.definitionForKey(900,NULL),"with no definition installed at all");
+            db.close();
+        }
+    }
+
     printf("[G] definition drift\n");
     {
         uint32_t t0=time(NULL);

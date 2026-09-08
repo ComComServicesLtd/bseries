@@ -30,12 +30,13 @@ uint32_t BSeries::getChecksum(SERIES *series){
 
 /// Lays down the header for a series that does not exist yet.
 ///
-/// If a definition covers this key it decides the interval and the datatype, and
-/// the header is written in the typed version 2 format. With no definition we know
-/// the point width the caller is writing but not what the bytes mean, so the
-/// version 1 header is written instead of claiming a datatype nobody supplied.
-/// A database with no definitions file therefore produces byte identical files to
-/// the ones it produced before definitions existed.
+/// If a definition covers this key it decides the interval, the datatype and the
+/// null fill. With no definition the width is what the caller is writing, the
+/// datatype is inferred from it exactly as reading a version 1 file infers it, and
+/// the fill is the database wide default.
+///
+/// Either way the result is a version 3 header, which records all of it. A series
+/// is then readable correctly from its own file, with no configuration alongside.
 ///
 /// start_timestamp is where the series' first point sits. A series created by a
 /// write is stamped with that write's timestamp rather than with the current time:
@@ -57,22 +58,26 @@ int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t dat
             return SERIES_TYPE_MISMATCH;
         }
 
-        series->version = SERIES_VERSION_TYPED;
+        series->version = SERIES_VERSION_FILLED;
         series->interval = def.interval;
-        series->typecode = bsPackTypeCode(def.datatype,def.datasize);
+        series->typecode = bsPackTypeCode(def.datatype,def.datasize,def.null_fill_byte);
 
         _DEBUG("\t Creating series %u as %s every %u seconds\n",key,bsTypeName(def.datatype,def.datasize),def.interval);
 
     } else {
 
-        if(!bsTypeValid(BS_UNSIGNED,(uint8_t)datasize)){
+        // The same inference reading a version 1 file applies, made explicit here
+        // so it is recorded rather than repeated on every read.
+        uint8_t inferred = (datasize == 4) ? BS_FLOAT : BS_UNSIGNED;
+
+        if(!bsTypeValid(inferred,(uint8_t)datasize)){
             _ERROR("\t Series %u has no definition and %u is not a storable point width\n",key,datasize);
             return SERIES_TYPE_MISMATCH;
         }
 
-        series->version = SERIES_VERSION_LEGACY;
+        series->version = SERIES_VERSION_FILLED;
         series->interval = default_seconds_per_point;
-        series->typecode = datasize;
+        series->typecode = bsPackTypeCode(inferred,(uint8_t)datasize,(unsigned char)default_null_fill_byte);
     }
 
     series->timestamp = start_timestamp ? start_timestamp : (uint32_t)time(NULL);
@@ -89,6 +94,24 @@ int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t dat
 }
 
 
+unsigned char BSeries::resolveNullFill(uint32_t key, const SERIES *header){
+
+    if(header->version == SERIES_VERSION_FILLED)
+        return bsTypeCodeNullFill(header->typecode);
+
+    uint32_t datasize = bsHeaderDataSize(header);
+    SERIES_DEFINITION def;
+
+    if(definitionForKey(key,&def) && def.datasize == datasize)
+        return def.null_fill_byte;
+
+    if(header->version == SERIES_VERSION_TYPED)
+        return bsTypeNullFill(bsHeaderDataType(header),(uint8_t)datasize);
+
+    return (unsigned char)default_null_fill_byte;
+}
+
+
 /// Decodes a header that has just been loaded or created into the entry fields the
 /// point loops use, and rejects a header describing something this build cannot
 /// address. Must be called before an entry is used for anything.
@@ -101,7 +124,7 @@ bool BSeries::bindHeader(ENTRY *entry, uint32_t key){
     uint8_t datatype;
     uint32_t datasize;
 
-    if(entry->header.version == SERIES_VERSION_TYPED){
+    if(entry->header.version == SERIES_VERSION_FILLED || entry->header.version == SERIES_VERSION_TYPED){
 
         datatype = bsTypeCodeDataType(entry->header.typecode);
         datasize = bsTypeCodeDataSize(entry->header.typecode);
@@ -120,8 +143,8 @@ bool BSeries::bindHeader(ENTRY *entry, uint32_t key){
 
     } else {
 
-        _ERROR("\t Series %u has header version %u, this build understands %d and %d\n",
-               key,entry->header.version,SERIES_VERSION_LEGACY,SERIES_VERSION_TYPED);
+        _ERROR("\t Series %u has header version %u, this build understands %d to %d\n",
+               key,entry->header.version,SERIES_VERSION_LEGACY,SERIES_VERSION_FILLED);
         return false;
     }
 
@@ -138,14 +161,7 @@ bool BSeries::bindHeader(ENTRY *entry, uint32_t key){
     entry->datasize = datasize;
     entry->datatype = datatype;
 
-    // An explicit null fill in the definition beats the default for the type, and a
-    // version 1 file keeps the database wide default it was written with.
-    if(have_def && def.datasize == datasize)
-        entry->null_fill_byte = def.null_fill_byte;
-    else if(entry->header.version == SERIES_VERSION_TYPED)
-        entry->null_fill_byte = bsTypeNullFill(datatype,(uint8_t)datasize);
-    else
-        entry->null_fill_byte = (unsigned char)default_null_fill_byte;
+    entry->null_fill_byte = resolveNullFill(key,&entry->header);
 
     // The file always wins over the definition: the points already on disk were
     // laid out to the header's interval and width, so honouring the definition
@@ -1419,10 +1435,18 @@ int BSeries::createSeriesFile(uint32_t key, uint32_t interval, uint8_t datatype,
         SERIES header;
         memset(&header,0,sizeof(header));
 
-        header.version = SERIES_VERSION_TYPED;
+        // A definition for this key supplies the fill; otherwise the type's own
+        // default is used. Either way it is recorded in the header.
+        SERIES_DEFINITION def;
+        unsigned char fill = bsTypeNullFill(datatype,datasize);
+
+        if(definitionForKey(key,&def) && def.datasize == datasize)
+            fill = def.null_fill_byte;
+
+        header.version = SERIES_VERSION_FILLED;
         header.timestamp = start_timestamp ? start_timestamp : (uint32_t)time(NULL);
         header.interval = interval;
-        header.typecode = bsPackTypeCode(datatype,datasize);
+        header.typecode = bsPackTypeCode(datatype,datasize,fill);
         header.checksum = getChecksum(&header);
 
         fseek(file,0,SEEK_SET);

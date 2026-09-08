@@ -18,7 +18,7 @@
 /// endpoint and a table called "data".
 
 static const char *RESERVED_TABLE_NAMES[] = {
-    "health", "tables", "series", "data", "now", "v1"
+    "health", "tables", "series", "data", "now", "v1", "auth"
 };
 
 
@@ -58,9 +58,11 @@ bool TableSet::validName(const std::string &name, std::string *error){
         return false;
     }
 
-    // A leading letter keeps an all digit name from colliding with the series
-    // files in the default table's directory, and rules out "." and ".." along
-    // with every other way of walking out of the data directory.
+    // Digits are not allowed at all, so a table name can never look like a series
+    // file: the default table is the data directory itself, and series files are
+    // named for their key and nothing else. Requiring a letter first also keeps a
+    // name from starting with a hyphen, which turns into an option the first time
+    // anyone types it into a shell.
     if(!((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z'))){
         if(error) *error = "a table name must start with a letter";
         return false;
@@ -70,10 +72,10 @@ bool TableSet::validName(const std::string &name, std::string *error){
 
         char c = name[i];
         bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                       (c >= '0' && c <= '9') || c == '_' || c == '-';
+                       c == '_' || c == '-';
 
         if(!allowed){
-            if(error) *error = "a table name may only contain letters, digits, underscore and hyphen";
+            if(error) *error = "a table name may only contain letters, underscore and hyphen";
             return false;
         }
     }

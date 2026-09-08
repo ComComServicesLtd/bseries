@@ -7,6 +7,7 @@
 #include "bseries.h"
 #include "http_server.h"
 #include "table_set.h"
+#include "auth_store.h"
 
 
 /// HTTP CRUD interface to a BSeries database.
@@ -38,10 +39,14 @@ typedef struct {
     /// a database's data into a second copy nobody is reading.
     bool auto_create_tables;
 
-    /// read_key may call the GET endpoints. write_key may call everything.
-    /// An empty key disables that level of access entirely.
+    /// Static keys from the configuration file. Optional now that keys can be
+    /// managed over HTTP; when set they work alongside the keystore, which is what
+    /// keeps an existing deployment's configuration valid.
     std::string read_key;
     std::string write_key;
+
+    /// Where minted keys are kept. Defaults to auth.keys in the data directory.
+    std::string keystore_path;
 
     /// Origins allowed to call the API from a browser. A single entry of "*"
     /// allows any origin. Empty means no CORS headers are sent at all, which
@@ -84,12 +89,13 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out);
 class BSeriesApi
 {
 public:
-    BSeriesApi(TableSet *table_set, const API_CONFIG *config);
+    BSeriesApi(TableSet *table_set, AuthStore *auth_store, const API_CONFIG *config);
 
     /// The HTTP_HANDLER entry point. Pass the BSeriesApi instance as context.
     static void handle(const HTTP_REQUEST &request, HTTP_RESPONSE &response, void *context);
 
     TableSet *tables;
+    AuthStore *auth;
     API_CONFIG config;
 
 private:
@@ -105,7 +111,14 @@ private:
     void handleCreateTable(const std::string &name, HTTP_RESPONSE &response);
     void handleDropTable(const std::string &name, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
-    bool authorise(const HTTP_REQUEST &request, bool needs_write, HTTP_RESPONSE &response);
+    void handleListKeys(HTTP_RESPONSE &response);
+    void handleCreateKey(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void handleRevokeKey(const std::string &name, HTTP_RESPONSE &response);
+
+    /// allow_bootstrap is true only for creating the first key. The bootstrap
+    /// token is printed to the server's log, so it must not double as a general
+    /// write credential for the data endpoints.
+    bool authorise(const HTTP_REQUEST &request, bool needs_write, HTTP_RESPONSE &response, bool allow_bootstrap = false);
     void applyCors(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
     void handleHealth(const HTTP_REQUEST &request, HTTP_RESPONSE &response);

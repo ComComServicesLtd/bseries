@@ -62,6 +62,7 @@ union BType {
 
 #define SERIES_VERSION_LEGACY 1
 #define SERIES_VERSION_TYPED  2
+#define SERIES_VERSION_FILLED 3
 
 
 /// On disk series header. Fixed at 20 bytes: every data point is addressed as
@@ -72,6 +73,7 @@ typedef struct _SERIES
 {
      uint32_t version;   // 1 = legacy, typecode is a plain byte width
                          // 2 = typecode packs the datatype class and the byte width
+                         // 3 = typecode also carries the null fill byte
      uint32_t timestamp; // First point timestamp (Unix Epoch)
      uint32_t interval;  // = 10 for every 10 seconds
      uint32_t typecode;  // see bsPackTypeCode(), was called datasize in version 1
@@ -83,9 +85,17 @@ typedef struct _SERIES
 /// field version 1 used for the byte width alone. A version 1 width of 1, 2, 4 or 8
 /// therefore reads back as a version 2 code with width 0, which is not a storable
 /// type, so the two are never confused even before the version field is consulted.
+///
+/// Version 3 additionally records the null fill byte, in what version 2 left spare.
+/// That is the last piece of a series' meaning that used to live outside the file:
+/// with the fill in the header, a series file alone is enough to read the series
+/// correctly, and the definitions file goes back to being what shape to give new
+/// series rather than something reads depend on. A version 2 header left the spare
+/// byte zero, which is a legitimate fill value, so the version has to say whether
+/// the byte means anything rather than the byte speaking for itself.
 
-inline uint32_t bsPackTypeCode(uint8_t datatype, uint8_t datasize){
-    return (uint32_t)datatype | ((uint32_t)datasize << 8);
+inline uint32_t bsPackTypeCode(uint8_t datatype, uint8_t datasize, unsigned char null_fill = 0){
+    return (uint32_t)datatype | ((uint32_t)datasize << 8) | ((uint32_t)null_fill << 16);
 }
 
 inline uint8_t bsTypeCodeDataType(uint32_t typecode){
@@ -94,6 +104,34 @@ inline uint8_t bsTypeCodeDataType(uint32_t typecode){
 
 inline uint8_t bsTypeCodeDataSize(uint32_t typecode){
     return (uint8_t)((typecode >> 8) & 0xFF);
+}
+
+inline unsigned char bsTypeCodeNullFill(uint32_t typecode){
+    return (unsigned char)((typecode >> 16) & 0xFF);
+}
+
+
+/// Decoding a header, whatever version wrote it, in one place. Every caller that
+/// wants a series' width, type or fill goes through these rather than testing the
+/// version itself, which is how the fill came to be resolved three slightly
+/// different ways before it lived in the header at all.
+
+inline uint32_t bsHeaderDataSize(const SERIES *header){
+
+    if(header->version == SERIES_VERSION_LEGACY)
+        return header->typecode;      // version 1 stored a plain width
+
+    return bsTypeCodeDataSize(header->typecode);
+}
+
+inline uint8_t bsHeaderDataType(const SERIES *header){
+
+    if(header->version != SERIES_VERSION_LEGACY)
+        return bsTypeCodeDataType(header->typecode);
+
+    // Version 1 recorded the width but not what the points meant. The only widths
+    // those releases wrote were 1 (unsigned char) and 4 (float).
+    return (header->typecode == 4) ? BS_FLOAT : BS_UNSIGNED;
 }
 
 
@@ -156,6 +194,12 @@ public:
     int createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize, uint32_t start_timestamp); // NO_ERROR, or negative
     uint32_t getChecksum(SERIES *series);
     bool bindHeader(ENTRY *entry, uint32_t key);
+
+    /// The fill byte a series' gaps are written with. A version 3 header records
+    /// it, so the file decides. Older headers predate the field, and fall back to
+    /// a definition for the key, then to the default for the type, then to the
+    /// database wide default.
+    unsigned char resolveNullFill(uint32_t key, const SERIES *header);
 
     /// overwrote, when supplied, is set true if the slot this write lands in
     /// already held something other than the series' null fill, meaning a real

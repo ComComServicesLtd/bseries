@@ -78,6 +78,9 @@ table name.
 | Method | Path | Key | |
 |---|---|---|---|
 | GET | `/v1/health` | none | liveness |
+| POST | `/v1/auth/keys?role=&name=` | write | mint an API key |
+| GET | `/v1/auth/keys` | write | list keys (never the secrets) |
+| DELETE | `/v1/auth/keys/{name}` | write | revoke a key |
 | GET | `/v1/tables` | read | list tables |
 | GET | `/v1/tables/{t}` | read | table info |
 | POST | `/v1/tables/{t}` | write | create a table |
@@ -115,6 +118,9 @@ $ curl -H 'X-API-Key: $READ_KEY' \
 
 ### Tables
 
+A table name may contain **letters, underscore and hyphen**, must start with a
+letter, and is at most 64 characters.
+
 A table is an independent namespace of series, so one database can hold several
 unrelated collections without their keys colliding: device 1 in `network` and
 device 1 in `power` are different series with different intervals and types.
@@ -151,13 +157,13 @@ Dropping a table refuses while it still holds series. `force=1` deletes them wit
 it, and is the only way to destroy data through that endpoint. The default table
 cannot be dropped, since it is the data directory.
 
-A table name must start with a letter and continue with letters, digits,
-underscore or hyphen, at most 64 characters. The leading letter is not cosmetic:
-the default table is the root directory, so an all digit name would create a
-directory that the default table's own series listing would mistake for a series
-file. The character set also makes the name safe as a path component, which matters
-because it arrives from a URL — `..`, `/` and their percent encoded forms are all
-refused. `health`, `tables`, `series`, `data` and `now` are reserved.
+Digits are excluded deliberately: the default table is the data directory itself
+and series files are named for their key, so a name that could look like a number
+would be ambiguous. Requiring a letter first also keeps a name from starting with a
+hyphen, which becomes an option the first time anyone types it into a shell. The
+character set makes a name safe as a path component too, which matters because it
+arrives from a URL — `..`, `/` and their percent encoded forms are all refused.
+`health`, `tables`, `auth`, `series`, `data` and `now` are reserved.
 
 ### Definitions per table
 
@@ -448,11 +454,53 @@ is indistinguishable from a gap.** For float series the fill is a NaN and nothin
 is lost. For integer series pick a fill your data cannot produce, in the series
 definitions file. `real_points` counts the points that differ from the fill.
 
-### Authentication and CORS
+### Setting a database up from nothing
 
-Keys go in `X-API-Key` (`Authorization: Bearer` also works). `read_key` may call
-the GET endpoints, `write_key` may call everything; they must differ, and an unset
-key disables that level of access. Keys are compared in constant time.
+A database needs no configured keys to start. Where there is no write key the
+server mints a one time bootstrap token and prints it:
+
+```
+bseriesd: this database has no write key yet.
+  Create the first one with:
+
+    curl -XPOST -H 'X-API-Key: 6f2c…' \
+      '127.0.0.1:8086/v1/auth/keys?role=write&name=admin'
+
+  This token works only for that, and only until a write key exists.
+```
+
+```
+$ curl -XPOST -H 'X-API-Key: 6f2c…' '…/v1/auth/keys?role=write&name=admin'
+{"name":"admin","role":"write","key":"bsw_7319a9bb…",
+ "note":"this is the only time the key is shown; it is stored hashed"}
+```
+
+From there everything is an endpoint: mint more keys, create tables, create series,
+write and read. Nothing else needs editing on disk.
+
+The token is deliberately narrow. It is printed to the server's log, so it is
+accepted **only** for creating a key — not for any data endpoint — and it stops
+working the moment a write key exists. That closes the race where whoever reached a
+fresh port first would own the database.
+
+### Keys
+
+Keys go in `X-API-Key` (`Authorization: Bearer` also works). A `read` key may call
+the GET endpoints, a `write` key may call everything including key and table
+management. Keys are compared in constant time.
+
+Minted keys live in `auth.keys` in the data directory, **salted and hashed with
+SHA-256, never in the clear**. The server therefore cannot show a key again after
+minting it — a leaked keystore yields hashes to attack, not credentials. The file
+is written 0600 through a temporary file and renamed, so an interrupted write
+cannot leave a database with no way in.
+
+Revoking the last write key is refused rather than allowed to lock the database out
+of its own administration, unless a `write_key` in the configuration provides
+another way in.
+
+`read_key` and `write_key` in the configuration still work and sit alongside the
+keystore, so an existing deployment's configuration stays valid.
 
 `cors_origin` in the config allows a browser origin, and may be repeated; a single
 `*` allows any. With no `cors_origin` line no CORS headers are sent, which blocks
@@ -475,18 +523,31 @@ definition when the default collides with real data.
 ## File format
 
 The 20 byte header records the version, the creation timestamp, the interval, a
-typecode and a checksum. Two versions exist:
+typecode and a checksum. Three versions exist:
 
 * **Version 1** stores a plain point width and no datatype. Written by releases
-  before series definitions, and still written today for series created without a
-  matching definition. On read the datatype is inferred from the width (1 byte as
+  before typed headers. On read the datatype is inferred from the width (1 byte as
   `uint8`, 4 bytes as `float32`, matching the only two types those releases
-  supported); a definition for the key corrects the guess.
+  supported).
 * **Version 2** packs the datatype and the width into the same field, so the header
-  stayed 20 bytes and existing files are read at unchanged offsets. Written for any
-  series created with a definition.
+  stayed 20 bytes and existing files are read at unchanged offsets. Its fill comes
+  from the datatype.
+* **Version 3** additionally records the null fill byte, in what version 2 left
+  spare. This is what makes a series file sufficient on its own. Before it, a
+  custom fill lived only in the definitions file, so the same bytes meant different
+  things depending on whether that file was present — a stored `02` was a gap with
+  it and a reading without it. Written for every series created now.
 
-There is no migration step and no format flag day: version 1 files stay readable,
-and a database with no definitions file keeps producing them.
+There is no migration step and no format flag day. Version 1 and 2 files stay
+readable at unchanged offsets, and the header is still 20 bytes.
+
+The one thing this cannot fix retroactively: a version 2 series created with a
+**custom** fill never recorded it, so it still needs its definition until it is
+rewritten. A version 2 series using its type's default fill needs nothing.
+
+The definitions file is therefore no longer something reads depend on. It decides
+what shape to give a *new* series — worth keeping, since one line provisions ten
+thousand of them — but an existing series is read correctly from its own header
+alone.
 
 The format is native endian and 32 bit timestamps cap it at 2106.

@@ -4,6 +4,7 @@
 #include "bseries.h"
 #include "bseries_api.h"
 #include "table_set.h"
+#include "auth_store.h"
 #include "http_server.h"
 #include "test_util.h"
 #include <time.h>
@@ -161,7 +162,10 @@ int main(int argc, char **argv){
     TableSet tables;
     tables.configure(dir,4096,config.default_interval,1000000);
 
-    BSeriesApi api(&tables,&config);
+    AuthStore auth;
+    auth.load(std::string(dir) + "/auth.keys");
+
+    BSeriesApi api(&tables,&auth,&config);
 
     HttpServer server;
     server.max_body_bytes = config.max_body_bytes;
@@ -695,7 +699,7 @@ int main(int argc, char **argv){
         const char *escapes[] = {
             "/v1/../series", "/v1/..%2f..%2fetc/series", "/v1/.%2e/series",
             "/v1/a%2fb/series", "/v1/%2e%2e/series", "/v1/foo.bar/series",
-            "/v1/-lead/series", "/v1/9numeric/series"
+            "/v1/-lead/series", "/v1/9numeric/series", "/v1/net2/series"
         };
         for(unsigned i=0;i<sizeof(escapes)/sizeof(escapes[0]);i++){
             r = request("GET",escapes[i],"read-only-key");
@@ -729,7 +733,66 @@ int main(int argc, char **argv){
         CHECK(r.status==403, "creating a table needs the write key");
     }
 
-    printf("[15] method handling\n");
+    printf("[15] keys over the API\n");
+    {
+        REPLY r = request("POST","/v1/auth/keys?role=write&name=minted","read-write-key");
+        CHECK(r.status==201 && bodyHas(r,"\"key\":\"bsw_"), "mint a write key through the API");
+
+        std::string minted;
+        size_t at = r.body.find("\"key\":\"");
+        if(at != std::string::npos){
+            size_t from = at + 7, to = r.body.find('"',from);
+            if(to != std::string::npos) minted = r.body.substr(from,to - from);
+        }
+        CHECK(minted.size() > 8, "and it came back in the response");
+
+        r = request("GET","/v1/tables",minted.c_str());
+        CHECK(r.status==200, "the minted key works on the API");
+        r = request("POST","/v1/auth/keys?role=read&name=minted_reader",minted.c_str());
+        CHECK(r.status==201, "and can mint others");
+
+        std::string reader;
+        at = r.body.find("\"key\":\"");
+        if(at != std::string::npos){
+            size_t from = at + 7, to = r.body.find('"',from);
+            if(to != std::string::npos) reader = r.body.substr(from,to - from);
+        }
+        r = request("GET","/v1/tables",reader.c_str());
+        CHECK(r.status==200, "a minted read key reads");
+        r = request("POST","/v1/tables/blocked",reader.c_str());
+        CHECK(r.status==403, "but does not write");
+
+        r = request("GET","/v1/auth/keys","read-write-key");
+        CHECK(r.status==200 && bodyHas(r,"\"minted\"") && bodyHas(r,"\"minted_reader\""), "keys are listed");
+        CHECK(!bodyHas(r,"bsw_") && !bodyHas(r,"bsr_"), "and the listing never contains a secret");
+
+        r = request("GET","/v1/auth/keys",reader.c_str());
+        CHECK(r.status==403, "listing keys needs a write key");
+
+        r = request("POST","/v1/auth/keys?role=write&name=minted","read-write-key");
+        CHECK(r.status==409 && bodyHas(r,"key_exists"), "duplicate names are refused");
+        r = request("POST","/v1/auth/keys?role=admin&name=x","read-write-key");
+        CHECK(r.status==400, "an unknown role is refused");
+        r = request("POST","/v1/auth/keys?role=write&name=has%20space","read-write-key");
+        CHECK(r.status==400, "a bad key name is refused");
+        r = request("POST","/v1/auth/keys?role=write&name=nokey",NULL);
+        CHECK(r.status==401, "minting needs credentials");
+
+        r = request("DELETE","/v1/auth/keys/minted_reader","read-write-key");
+        CHECK(r.status==200 && bodyHas(r,"\"revoked\":true"), "revoke a key");
+        r = request("GET","/v1/tables",reader.c_str());
+        CHECK(r.status==401, "and it stops working immediately");
+        r = request("DELETE","/v1/auth/keys/minted_reader","read-write-key");
+        CHECK(r.status==404, "revoking it twice is 404");
+
+        // the config keys keep working alongside the store
+        r = request("GET","/v1/tables","read-only-key");
+        CHECK(r.status==200, "a configured key still works");
+        r = request("DELETE","/v1/auth/keys/minted","read-write-key");
+        CHECK(r.status==200, "the store's only write key may go while a config one exists");
+    }
+
+    printf("[16] method handling\n");
     {
         REPLY r = request("DELETE","/v1/series","read-write-key");
         CHECK(r.status==405, "DELETE on the collection is 405");

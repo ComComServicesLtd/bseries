@@ -18,6 +18,7 @@
 #include "bseries_api.h"
 #include "http_server.h"
 #include "table_set.h"
+#include "auth_store.h"
 
 
 static HttpServer *g_server = NULL;
@@ -103,18 +104,43 @@ int main(int argc, char **argv){
         return 1;
     }
 
-    if(config.read_key.empty() && config.write_key.empty()){
-        fprintf(stderr,"bseriesd: neither read_key nor write_key is set, nothing could authenticate\n");
-        return 1;
-    }
-
     if(config.read_key == config.write_key && !config.read_key.empty()){
         fprintf(stderr,"bseriesd: read_key and write_key are the same, the read only key would grant writes\n");
         return 1;
     }
 
-    if(config.write_key.empty())
-        fprintf(stderr,"bseriesd: no write_key set, the API is read only\n");
+    if(config.keystore_path.empty())
+        config.keystore_path = config.data_directory + "/auth.keys";
+
+    AuthStore auth;
+
+    if(auth.load(config.keystore_path) < 0){
+        fprintf(stderr,"bseriesd: could not read the keystore at %s\n",config.keystore_path.c_str());
+        return 1;
+    }
+
+    // A database with no write key anywhere cannot be administered, and letting
+    // whoever reaches the port first mint the first key would be a race worth
+    // losing. So a one time token is minted and printed here, where it takes
+    // access to the console or the logs to read it, and is accepted in place of a
+    // key only for creating that first key.
+    if(config.write_key.empty() && !auth.hasRole(AUTH_ROLE_WRITE)){
+
+        std::string token = auth.mintBootstrapToken();
+
+        if(token.empty()){
+            fprintf(stderr,"bseriesd: no write key, and no system randomness to mint a bootstrap token\n");
+            return 1;
+        }
+
+        fprintf(stderr,
+            "\nbseriesd: this database has no write key yet.\n"
+            "  Create the first one with:\n\n"
+            "    curl -XPOST -H 'X-API-Key: %s' \\\n"
+            "      '%s:%d/v1/auth/keys?role=write&name=admin'\n\n"
+            "  This token works only for that, and only until a write key exists.\n\n",
+            token.c_str(),config.bind_address.c_str(),config.port);
+    }
 
     TableSet tables;
     tables.configure(config.data_directory,config.write_ahead_size,config.default_interval,config.max_grow_points);
@@ -140,7 +166,7 @@ int main(int argc, char **argv){
         fprintf(stderr,"bseriesd: %lu table%s\n",(unsigned long)names.size(),names.size() == 1 ? "" : "s");
     }
 
-    BSeriesApi api(&tables,&config);
+    BSeriesApi api(&tables,&auth,&config);
 
     HttpServer server;
     server.max_connections = config.max_connections;

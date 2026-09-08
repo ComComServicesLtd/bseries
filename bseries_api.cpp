@@ -575,6 +575,7 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out){
         else if(key == "definitions")                  config->definitions_path = text;
         else if(key == "read_key")                     config->read_key = text;
         else if(key == "write_key")                    config->write_key = text;
+        else if(key == "keystore")                     config->keystore_path = text;
         else if(key == "cors_origin")                  config->cors_origins.push_back(text);
         else if(key == "port"                     && parseUnsigned(text,&number)) config->port = (int)number;
         else if(key == "max_points_per_read"      && parseUnsigned(text,&number)) config->max_points_per_read = (int)number;
@@ -609,9 +610,10 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out){
 // API
 // ===========================================================================
 
-BSeriesApi::BSeriesApi(TableSet *table_set, const API_CONFIG *configuration)
+BSeriesApi::BSeriesApi(TableSet *table_set, AuthStore *auth_store, const API_CONFIG *configuration)
 {
     tables = table_set;
+    auth = auth_store;
     config = *configuration;
 }
 
@@ -679,11 +681,14 @@ void BSeriesApi::applyCors(const HTTP_REQUEST &request, HTTP_RESPONSE &response)
 }
 
 
-/// Read endpoints accept either key, write endpoints require the write key. An
-/// unset key in the configuration disables that level of access rather than
-/// allowing everything through.
+/// Read endpoints accept either role, write endpoints require a write key.
+///
+/// Keys come from two places: the configuration file, which is how this worked
+/// before keys could be managed over HTTP and still works, and the keystore, which
+/// is where keys minted through the API live. An unset configuration key disables
+/// that level of access rather than allowing everything through.
 
-bool BSeriesApi::authorise(const HTTP_REQUEST &request, bool needs_write, HTTP_RESPONSE &response){
+bool BSeriesApi::authorise(const HTTP_REQUEST &request, bool needs_write, HTTP_RESPONSE &response, bool allow_bootstrap){
 
     std::string presented = httpHeader(request,"x-api-key");
 
@@ -700,22 +705,134 @@ bool BSeriesApi::authorise(const HTTP_REQUEST &request, bool needs_write, HTTP_R
         return false;
     }
 
-    bool has_write = secretsMatch(presented,config.write_key);
+    int granted = AUTH_ROLE_NONE;
 
-    if(has_write)
+    if(secretsMatch(presented,config.write_key))
+        granted = AUTH_ROLE_WRITE;
+    else if(secretsMatch(presented,config.read_key))
+        granted = AUTH_ROLE_READ;
+
+    if(granted == AUTH_ROLE_NONE && auth != NULL)
+        granted = auth->roleFor(presented);
+
+    // The bootstrap token exists only to create the first key. It is printed to
+    // the server's log, so it is not accepted anywhere else.
+    if(granted == AUTH_ROLE_NONE && allow_bootstrap && auth != NULL && auth->bootstrapTokenMatches(presented))
+        granted = AUTH_ROLE_WRITE;
+
+    if(granted == AUTH_ROLE_WRITE)
         return true;
 
     if(needs_write){
-        // Deliberately the same whether the key was the read key or nonsense
-        jsonError(response,403,"forbidden","this endpoint requires the write key");
+        // Deliberately the same whether a read key was presented or nonsense
+        jsonError(response,403,"forbidden","this endpoint requires a write key");
         return false;
     }
 
-    if(secretsMatch(presented,config.read_key))
+    if(granted == AUTH_ROLE_READ)
         return true;
 
     jsonError(response,401,"unauthorized","unrecognised API key");
     return false;
+}
+
+
+void BSeriesApi::handleListKeys(HTTP_RESPONSE &response){
+
+    std::vector<AUTH_KEY> keys;
+    auth->list(&keys);
+
+    response.status = 200;
+    response.body = "{\"keys\":[";
+
+    for(size_t i = 0; i < keys.size(); i++){
+
+        char entry[320];
+        snprintf(entry,sizeof(entry),"%s{\"name\":\"%s\",\"role\":\"%s\",\"created\":%lu}",
+                 i > 0 ? "," : "",
+                 jsonEscape(keys[i].name).c_str(),
+                 AuthStore::roleName(keys[i].role),
+                 (unsigned long)keys[i].created);
+
+        response.body += entry;
+    }
+
+    char tail[128];
+    snprintf(tail,sizeof(tail),"],\"count\":%lu}",(unsigned long)keys.size());
+    response.body += tail;
+}
+
+
+/// Mints a key. The secret is in the response and nowhere else: it is stored
+/// hashed, so this is the only time it can ever be read.
+
+void BSeriesApi::handleCreateKey(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+
+    std::string name = httpQueryParam(request,"name");
+    std::string role_text = httpQueryParam(request,"role");
+    std::string error;
+
+    if(!AuthStore::validKeyName(name,&error)){
+        jsonError(response,400,"bad_parameter",error);
+        return;
+    }
+
+    int role = AUTH_ROLE_NONE;
+
+    if(!AuthStore::roleFromName(role_text,&role)){
+        jsonError(response,400,"bad_parameter","role must be read or write");
+        return;
+    }
+
+    std::string secret;
+    int rc = auth->create(name,role,&secret);
+
+    if(rc == SERIES_ALREADY_EXISTS){
+        jsonError(response,409,"key_exists","a key named '" + name + "' already exists");
+        return;
+    }
+
+    if(rc != NO_ERROR){
+        jsonDatabaseError(response,rc,"creating the key");
+        return;
+    }
+
+    char buffer[512];
+    snprintf(buffer,sizeof(buffer),
+        "{\"name\":\"%s\",\"role\":\"%s\",\"key\":\"%s\","
+        "\"note\":\"this is the only time the key is shown; it is stored hashed\"}",
+        jsonEscape(name).c_str(),AuthStore::roleName(role),secret.c_str());
+
+    response.status = 201;
+    response.body = buffer;
+}
+
+
+void BSeriesApi::handleRevokeKey(const std::string &name, HTTP_RESPONSE &response){
+
+    int rc = auth->revoke(name,!config.write_key.empty());
+
+    if(rc == SERIES_NOT_FOUND){
+        jsonError(response,404,"key_not_found","no key named '" + name + "'");
+        return;
+    }
+
+    if(rc == SERIES_ALREADY_EXISTS){
+        jsonError(response,409,"last_write_key",
+                  "this is the only write key; revoking it would lock the database out of its own administration");
+        return;
+    }
+
+    if(rc != NO_ERROR){
+        jsonDatabaseError(response,rc,"revoking the key");
+        return;
+    }
+
+    char buffer[192];
+    snprintf(buffer,sizeof(buffer),"{\"name\":\"%s\",\"revoked\":true}",jsonEscape(name).c_str());
+
+    response.status = 200;
+    response.body = buffer;
 }
 
 
@@ -1032,6 +1149,43 @@ void BSeriesApi::route(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
         return;
     }
 
+    // /v1/auth - the API keys themselves
+    if(segments[1] == "auth"){
+
+        if(segments.size() < 3 || segments[2] != "keys"){
+            jsonError(response,404,"not_found","unknown endpoint");
+            return;
+        }
+
+        if(segments.size() == 3){
+
+            if(request.method == "GET"){
+                if(!authorise(request,true,response)) return;
+                handleListKeys(response);
+                return;
+            }
+
+            if(request.method == "POST" || request.method == "PUT"){
+                // The one place the bootstrap token is accepted
+                if(!authorise(request,true,response,true)) return;
+                handleCreateKey(request,response);
+                return;
+            }
+
+            jsonError(response,405,"method_not_allowed","GET to list, POST to create");
+            return;
+        }
+
+        if(segments.size() == 4 && request.method == "DELETE"){
+            if(!authorise(request,true,response)) return;
+            handleRevokeKey(segments[3],response);
+            return;
+        }
+
+        jsonError(response,404,"not_found","unknown endpoint");
+        return;
+    }
+
     // /v1/tables - the tables themselves
     if(segments[1] == "tables"){
 
@@ -1128,16 +1282,8 @@ static std::string nullFillPattern(unsigned char fill_byte, uint32_t datasize){
 
 static void appendSeriesJson(std::string &out, uint32_t key, const SERIES &header, int64_t file_size){
 
-    uint8_t datatype;
-    uint32_t datasize;
-
-    if(header.version == SERIES_VERSION_TYPED){
-        datatype = bsTypeCodeDataType(header.typecode);
-        datasize = bsTypeCodeDataSize(header.typecode);
-    } else {
-        datasize = header.typecode;
-        datatype = (datasize == 4) ? BS_FLOAT : BS_UNSIGNED;
-    }
+    uint8_t datatype = bsHeaderDataType(&header);
+    uint32_t datasize = bsHeaderDataSize(&header);
 
     int64_t points_in_file = 0;
     if(datasize > 0 && file_size >= (int64_t)sizeof(SERIES))
@@ -1400,17 +1546,7 @@ int BSeriesApi::streamSeriesData(BSeries *db, uint32_t key, long long start_time
         return rc;
     }
 
-    // The fill actually in use for this series, rather than one guessed from the
-    // type: a definition can override it.
-    unsigned char fill;
-    SERIES_DEFINITION definition;
-
-    if(db->definitionForKey(key,&definition) && definition.datasize == datasize)
-        fill = definition.null_fill_byte;
-    else if(header.version == SERIES_VERSION_TYPED)
-        fill = bsTypeNullFill(datatype,(uint8_t)datasize);
-    else
-        fill = (unsigned char)db->default_null_fill_byte;
+    unsigned char fill = db->resolveNullFill(key,&header);
 
     // real_points from the library counts every point the file and cache windows
     // cover, gaps included. Count the points that differ from the fill instead, so
@@ -1542,38 +1678,19 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
     long long bucket_count = (total_slots + factor - 1) / factor;
     long long bucket_interval = interval * factor;
 
-    // min and max hand back a stored point untouched, so they keep the series'
-    // own type. An average is not generally representable in it, so it is promoted
-    // to float64, which holds every value of every narrower type exactly.
-    uint8_t out_datatype = (mode == CONDENSE_AVG) ? BS_FLOAT : bsTypeCodeDataType(header.typecode);
-    uint32_t out_datasize = (mode == CONDENSE_AVG) ? 8 : bsTypeCodeDataSize(header.typecode);
+    // min and max hand back a stored point untouched, so the output keeps the
+    // source's type and fill. An average is not generally representable in the
+    // source type, so it is promoted to float64, which holds every value of every
+    // narrower type exactly; 0xFF over a float64 is a NaN, which is the sentinel
+    // that costs nothing.
+    uint8_t src_datatype = bsHeaderDataType(&header);
+    uint32_t src_datasize = bsHeaderDataSize(&header);
+    unsigned char src_fill = db->resolveNullFill(key,&header);
 
-    if(header.version != SERIES_VERSION_TYPED){
-        uint32_t width = header.typecode;
-        out_datatype = (mode == CONDENSE_AVG) ? BS_FLOAT : ((width == 4) ? BS_FLOAT : BS_UNSIGNED);
-        out_datasize = (mode == CONDENSE_AVG) ? 8 : width;
-    }
+    uint8_t out_datatype = (mode == CONDENSE_AVG) ? BS_FLOAT : src_datatype;
+    uint32_t out_datasize = (mode == CONDENSE_AVG) ? 8 : src_datasize;
+    unsigned char out_fill = (mode == CONDENSE_AVG) ? 0xFF : src_fill;
 
-    unsigned char out_fill = (mode == CONDENSE_AVG) ? 0xFF : 0;
-    {
-        SERIES_DEFINITION definition;
-        uint32_t width = (header.version == SERIES_VERSION_TYPED)
-                       ? bsTypeCodeDataSize(header.typecode) : header.typecode;
-        uint8_t type = (header.version == SERIES_VERSION_TYPED)
-                     ? bsTypeCodeDataType(header.typecode) : ((width == 4) ? BS_FLOAT : BS_UNSIGNED);
-
-        if(db->definitionForKey(key,&definition) && definition.datasize == width)
-            out_fill = definition.null_fill_byte;
-        else if(header.version == SERIES_VERSION_TYPED)
-            out_fill = bsTypeNullFill(type,(uint8_t)width);
-        else
-            out_fill = (unsigned char)db->default_null_fill_byte;
-
-        // An averaged series is float64 whatever the source was, and 0xFF over a
-        // float64 is a NaN, which is the sentinel that costs nothing.
-        if(mode == CONDENSE_AVG)
-            out_fill = 0xFF;
-    }
 
     // Everything below only appends, so build the head first.
     char head[640];
@@ -1598,23 +1715,6 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
     // streamed as it is produced, so they are reported after it rather than before.
     stream->write(prefix);
     stream->write("\"data\":\"",8);
-
-    uint8_t src_datatype = (header.version == SERIES_VERSION_TYPED)
-                         ? bsTypeCodeDataType(header.typecode)
-                         : ((header.typecode == 4) ? BS_FLOAT : BS_UNSIGNED);
-    uint32_t src_datasize = (header.version == SERIES_VERSION_TYPED)
-                          ? bsTypeCodeDataSize(header.typecode) : header.typecode;
-
-    unsigned char src_fill = out_fill;
-    {
-        SERIES_DEFINITION definition;
-        if(db->definitionForKey(key,&definition) && definition.datasize == src_datasize)
-            src_fill = definition.null_fill_byte;
-        else if(header.version == SERIES_VERSION_TYPED)
-            src_fill = bsTypeNullFill(src_datatype,(uint8_t)src_datasize);
-        else
-            src_fill = (unsigned char)db->default_null_fill_byte;
-    }
 
     long long buckets_with_data = 0;
     long long points_scanned = 0;
@@ -2061,10 +2161,7 @@ bool BSeriesApi::resolveWriteShape(BSeries *db, uint32_t key, size_t body_bytes,
 
     if(db->seriesInfo(key,&header,&file_size) == NO_ERROR){
 
-        *datasize = (header.version == SERIES_VERSION_TYPED)
-                  ? bsTypeCodeDataSize(header.typecode)
-                  : header.typecode;
-
+        *datasize = bsHeaderDataSize(&header);
         *interval = (int64_t)header.interval;
 
     } else {
