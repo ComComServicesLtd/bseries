@@ -180,6 +180,7 @@ int main(int argc, char**argv){
     {
         BSeries db; db.data_directory = dir; db.default_seconds_per_point = 1;
         uint32_t t0 = 1700000000;
+        db.write_ahead_size = 256;
         db.createSeriesFile(800,1,BS_UNSIGNED,1,t0);
 
         char path[512];
@@ -198,26 +199,41 @@ int main(int argc, char**argv){
         CHECK(db.flushAged(0) == 0, "and is not flushed twice");
 
         f = fopen(path,"rb"); fseek(f,0,SEEK_END); long after = ftell(f); fclose(f);
-        CHECK(after == (long)sizeof(SERIES) + 100, "only the 100 written points reached the file");
+        CHECK(after == (long)sizeof(SERIES) + db.write_ahead_size,
+              "a partly filled block is padded out with null fill, not left short");
 
-        // the buffer window slid, so the next points are still cached writes
-        for(int i = 100; i < 900; i++){
+        // the rest of that block is already in the file, so those points are
+        // written straight into it and the file does not grow
+        for(int i = 100; i < db.write_ahead_size; i++){
             unsigned char v = (unsigned char)(i % 250);
             db.write(800,&v,1,t0+i);
         }
 
         f = fopen(path,"rb"); fseek(f,0,SEEK_END); long later = ftell(f); fclose(f);
-        CHECK(later == after, "writes after the flush went back to the buffer, not the file");
+        CHECK(later == after, "filling the rest of a padded block does not grow the file");
+
+        // going past it starts a new block, which is buffered again
+        for(int i = db.write_ahead_size; i < db.write_ahead_size + 50; i++){
+            unsigned char v = (unsigned char)(i % 250);
+            db.write(800,&v,1,t0+i);
+        }
+
+        f = fopen(path,"rb"); fseek(f,0,SEEK_END); long next = ftell(f); fclose(f);
+        CHECK(next == later, "the next block is buffered until it is flushed");
+        CHECK(db.flushAged(0) == 1, "and the timer catches it");
+        f = fopen(path,"rb"); fseek(f,0,SEEK_END); long padded = ftell(f); fclose(f);
+        CHECK(padded == later + db.write_ahead_size, "padded out to a whole block again");
 
         // and everything reads back
+        int total = db.write_ahead_size + 50;
         int64_t n=0,r=0,spp=0,fpt=0; uint32_t ds=0; void *res=NULL;
-        db.read(800,t0,t0+900,&n,&r,&spp,&fpt,&ds,&res);
+        db.read(800,t0,t0+total,&n,&r,&spp,&fpt,&ds,&res);
         int wrong = -1;
         unsigned char *o = (unsigned char*)res;
-        for(int i = 0; i < 900 && res; i++)
+        for(int i = 0; i < total && res; i++)
             if(o[i] != (unsigned char)(i % 250)){ wrong = i; break; }
-        if(wrong >= 0) printf("   first wrong point: %d\n", wrong);
-        CHECK(wrong < 0, "every point survives a flush mid stream");
+        if(wrong >= 0) printf("   first wrong point: %d (got %u)\n", wrong, o[wrong]);
+        CHECK(wrong < 0, "every point survives flushes mid stream");
         delete[] (char*)res;
 
         db.close();
@@ -243,7 +259,7 @@ int main(int argc, char**argv){
         db.flush();
 
         f = fopen(path,"rb"); fseek(f,0,SEEK_END); long three = ftell(f); fclose(f);
-        CHECK(one == (long)sizeof(SERIES) + 1, "one point flushed is one point on disk");
+        CHECK(one == (long)sizeof(SERIES) + db.write_ahead_size, "one point flushed writes its whole block");
         CHECK(three == one, "flushing a clean buffer again adds nothing");
         db.close();
     }

@@ -14,7 +14,7 @@ BSeries::BSeries()
 
     this->default_seconds_per_point = 10;
     this->default_null_fill_byte = 0xFF;
-    this->write_ahead_size = 4096;
+    this->write_ahead_size = 1024;
     this->max_grow_points = 1000000;
 
     this->shuttingDown = false;
@@ -591,18 +591,24 @@ bool BSeries::flushBuffer(ENTRY *series,FILE *file,int64_t points){
     if(file == NULL || series->write_ahead_cache == NULL)
         return false;
 
-    // By default write only what has actually been written. Everything past that
-    // is still null fill, so writing it would put the file ahead of the data for
-    // no gain and cost every later write in this window a seek of its own.
+    // A block is always written whole. Where fewer points than that have been
+    // recorded the rest go down as null fill, so the file only ever grows by whole
+    // blocks and a partly filled one is padded ahead rather than left short.
+    //
+    // The consequence is worth knowing: the file now covers the whole block, so
+    // later points inside it are direct writes rather than buffered ones. They
+    // reach the disk as they arrive, which is why this costs syscalls and buys
+    // durability.
     if(points < 0)
-        points = series->buffer_points;
+        points = write_ahead_size;
 
     if(points > write_ahead_size)
         points = write_ahead_size;
 
-    if(points <= 0){
-        // A clean buffer. Writing the whole thing here is how an idle series used
-        // to gain another buffer's worth of null points on every flush.
+    if(series->buffer_points <= 0){
+        // Nothing has been recorded since the last flush. Writing a block here is
+        // how an idle series used to gain another block of null points every time
+        // anything flushed it.
         series->buffer_points = 0;
         series->buffer_dirty_since = 0;
         return true;
@@ -612,7 +618,7 @@ bool BSeries::flushBuffer(ENTRY *series,FILE *file,int64_t points){
     // Seek to end of file
     fseek(file,0,SEEK_END);
 
-    _DEBUG("\tFlushing %ld buffered points\n",(long)points);
+    _DEBUG("\tFlushing a %ld point block, %ld of them recorded\n",(long)points,(long)series->buffer_points);
     size_t size = fwrite(series->write_ahead_cache,series->datasize,(size_t)points,file);
 
     if(size != (size_t)points){
@@ -623,8 +629,8 @@ bool BSeries::flushBuffer(ENTRY *series,FILE *file,int64_t points){
     series->file_size += points * series->datasize; // Our file has grown!
     _DEBUG("\tNew File Size = %d\n",series->file_size);
 
-    // Reset our buffer with null fill. The window has slid forward by the points
-    // just written, so the next point in sequence lands at the front of it again.
+    // Reset our buffer with null fill. The window has slid forward by a whole
+    // block, so the next point in sequence lands at the front of it again.
     memset(series->write_ahead_cache,series->null_fill_byte,write_ahead_size * series->datasize);
 
     series->buffer_points = 0;

@@ -520,7 +520,7 @@ void apiConfigDefaults(API_CONFIG *config){
     config->auto_create_tables = false;
     config->max_body_bytes = 1024 * 1024;
     config->max_connections = 64;
-    config->write_ahead_size = 4096;
+    config->write_ahead_size = 1024;
     config->default_interval = 10;
     config->series_max_idle_seconds = 900;
     config->maintenance_interval_seconds = 60;
