@@ -3,6 +3,12 @@
 *.d
 *.a
 bseriesd
+
+# Generated inside the build stage. tools/embed especially: the host's copy is
+# built for the host, and this image is usually a different architecture.
+tools/embed
+web_assets.cpp
+bseries-*.tar
 tests/test_bseries
 tests/test_definitions
 tests/test_auth

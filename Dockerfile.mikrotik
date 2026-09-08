@@ -1,0 +1,62 @@
+# bseries as a MikroTik RouterOS container.
+#
+# Same idea as the main Dockerfile — alpine to build, scratch to run — with the
+# handful of changes RouterOS's container runtime actually needs. Build it for
+# the router's architecture rather than the host's:
+#
+#     docker buildx build --platform linux/arm64 -f Dockerfile.mikrotik .
+#
+# The Makefile already builds clean for arm, arm64 and x86, so the only thing
+# that changes between MikroTik models is that --platform.
+
+FROM alpine:3.20 AS build
+
+RUN apk add --no-cache g++ make
+
+WORKDIR /src
+COPY . .
+
+RUN make clean && make static && strip bseriesd
+
+# scratch has no shell to mkdir with, so the data directory is prepared here and
+# copied in. Unlike the main image it is left owned by root: see the USER note
+# in the final stage.
+RUN mkdir -p /prepared/data
+
+
+FROM scratch
+
+COPY --from=build /src/bseriesd /bseriesd
+COPY --from=build /prepared/data /data
+
+# No USER, and that is deliberate rather than an oversight.
+#
+# The main image runs as uid 10001. That works there because /data is a docker
+# volume, and docker chowns a fresh volume to match the image. RouterOS mounts a
+# directory out of its own flash instead, owned by root, and offers neither a
+# shell nor chown to change it — so a uid 10001 process cannot write to its own
+# database. The containers already shipping on these routers run as root for the
+# same reason. Root here is confined to the container's namespace, but it is a
+# real step down from the main image, so keep the mount read-write and nothing
+# else: the process never needs to write outside /data.
+
+# 0.0.0.0 because the loopback inside a container is reachable only from that
+# container. RouterOS gives the container its own veth address, and this is what
+# makes the server answer on it.
+ENV BSERIES_LISTEN=0.0.0.0 \
+    BSERIES_PORT=8086 \
+    BSERIES_DATA_DIRECTORY=/data
+
+EXPOSE 8086
+
+# No VOLUME: RouterOS ignores it and takes /container/mounts as the source of
+# truth. Leaving it in would suggest a persistence guarantee the router is not
+# the one making.
+
+# RouterOS does read the image's healthcheck — it surfaces as
+# default-healthcheck-cmd and drives stop-on-unhealthy. The binary probes
+# itself, so the image still needs no HTTP client of its own.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/bseriesd", "--health"]
+
+ENTRYPOINT ["/bseriesd"]
