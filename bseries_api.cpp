@@ -1845,11 +1845,31 @@ int BSeriesApi::streamSeriesData(BSeries *db, uint32_t key, long long start_time
 /// a chart to draw a gap rather than a line through some invented value.
 
 static void emitCondensedBucket(std::string &out, int mode, long long samples, double sum,
-                                const unsigned char *best, uint8_t src_datatype, uint32_t src_datasize,
-                                uint32_t out_datasize, unsigned char out_fill){
+                                const unsigned char *best, uint32_t out_datasize, unsigned char out_fill,
+                                long long reserved_count, const unsigned char *reserved_best,
+                                bool dominate, double threshold){
 
-    (void)src_datatype;
-    (void)src_datasize;
+    // A reserved value can take the bucket, when the caller asked for that and
+    // enough of the bucket was reserved.
+    //
+    // Only ever a maximum. A minimum is the other end of the range, where a "no
+    // reply" is exactly the wrong answer, and an average of a sentinel is not a
+    // number that means anything.
+    //
+    // The threshold is what stops this being useless at scale: with a tenth of a
+    // series reserved, every bucket of a year long window contains one, so
+    // dominating on sight would paint the whole chart as an outage and hide the
+    // trend it was meant to reveal. A threshold of 0 is that behaviour, kept
+    // because it is the right answer for a series where the value is rare.
+    if(mode == CONDENSE_MAX && dominate && reserved_count > 0 && reserved_best != NULL){
+
+        double share = (double)reserved_count / (double)(reserved_count + samples);
+
+        if(share >= threshold){
+            out.append((const char*)reserved_best,(size_t)out_datasize);
+            return;
+        }
+    }
 
     if(samples == 0){
         out.append((size_t)out_datasize,(char)out_fill);
@@ -1868,6 +1888,42 @@ static void emitCondensedBucket(std::string &out, int mode, long long samples, d
 }
 
 
+/// Appends a bucket's reserved count as little endian uint32, the same way every
+/// other array in a response is laid out. A count cannot exceed the bucket's slot
+/// count, and max_points_per_read bounds that well inside 32 bits.
+
+static void appendCount32(std::string &out, long long count){
+
+    uint32_t value = (uint32_t)(count < 0 ? 0 : count);
+    char bytes[4];
+    memcpy(bytes,&value,4);
+    out.append(bytes,4);
+}
+
+
+/// True when a point holds one of the values the caller reserved.
+///
+/// Compared as doubles, which is exact for every type the database stores except
+/// a 64 bit integer past 2^53. Sentinels are small by nature, so that limit has
+/// not been worth a second comparison path.
+
+static bool pointIsReserved(const unsigned char *p, uint8_t datatype, uint32_t datasize,
+                            const std::vector<double> &values){
+
+    if(values.empty())
+        return false;
+
+    double value = pointToDouble(p,datatype,datasize);
+
+    for(size_t i = 0; i < values.size(); i++){
+        if(value == values[i])
+            return true;
+    }
+
+    return false;
+}
+
+
 /// Streams one series condensed into at most max_points buckets.
 ///
 /// The range is walked a window at a time rather than read whole, so a condensed
@@ -1878,8 +1934,8 @@ static void emitCondensedBucket(std::string &out, int mode, long long samples, d
 /// Returns a database status. Nothing is written unless it is NO_ERROR.
 
 int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start_time, long long end_time,
-                                      int mode, long long max_points, HttpStream *stream,
-                                      long long *scanned_out){
+                                      int mode, long long max_points, const CONDENSE_RESERVED &reserved,
+                                      HttpStream *stream, long long *scanned_out){
 
     SERIES header;
     int64_t file_size = 0;
@@ -1959,6 +2015,7 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
     long long buckets_with_data = 0;
     long long points_scanned = 0;
     long long real_points = 0;
+    long long reserved_points = 0;
 
     // State of the bucket currently being filled, carried across windows.
     long long bucket_index = 0;
@@ -1966,6 +2023,18 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
     double bucket_sum = 0.0;
     unsigned char bucket_best[8];
     bool bucket_has_best = false;
+
+    long long bucket_reserved = 0;
+    unsigned char bucket_reserved_best[8];
+    bool bucket_has_reserved = false;
+
+    // One count per bucket, held until the data blob has finished streaming
+    // because JSON cannot have the field before the array it describes. Four
+    // bytes a bucket, and max_points is already capped by max_points_per_read.
+    std::string reserved_counts;
+
+    if(!reserved.values.empty())
+        reserved_counts.reserve((size_t)bucket_count * 4);
 
     std::string out_bytes;
     out_bytes.reserve(4096);
@@ -2011,7 +2080,13 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
                 // Emit the bucket that just closed
                 emitCondensedBucket(out_bytes,mode,bucket_samples,bucket_sum,
                                     bucket_has_best ? bucket_best : NULL,
-                                    src_datatype,src_datasize,out_datasize,out_fill);
+                                    out_datasize,out_fill,
+                                    bucket_reserved,
+                                    bucket_has_reserved ? bucket_reserved_best : NULL,
+                                    reserved.dominate,reserved.threshold);
+
+                if(!reserved.values.empty())
+                    appendCount32(reserved_counts,bucket_reserved);
 
                 if(bucket_samples > 0)
                     buckets_with_data++;
@@ -2020,6 +2095,8 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
                 bucket_samples = 0;
                 bucket_sum = 0.0;
                 bucket_has_best = false;
+                bucket_reserved = 0;
+                bucket_has_reserved = false;
 
                 if(out_bytes.size() >= 4096){
                     streamHex(stream,out_bytes.data(),out_bytes.size());
@@ -2034,6 +2111,24 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
                 continue;   // an empty slot takes no part in the aggregate
 
             real_points++;
+
+            // Recorded, but not a measurement. Counted, and then kept out of the
+            // aggregate so it cannot drag an average toward a latency nobody
+            // observed. Whether it may still take a maximum is decided when the
+            // bucket closes, since that depends on how much of the bucket it was.
+            if(pointIsReserved(point,src_datatype,ds,reserved.values)){
+
+                reserved_points++;
+                bucket_reserved++;
+
+                if(!bucket_has_reserved){
+                    memcpy(bucket_reserved_best,point,ds);
+                    bucket_has_reserved = true;
+                }
+
+                continue;
+            }
+
             bucket_samples++;
 
             if(mode == CONDENSE_AVG){
@@ -2064,7 +2159,13 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
     // The final bucket never sees a boundary, so it is closed here.
     emitCondensedBucket(out_bytes,mode,bucket_samples,bucket_sum,
                         bucket_has_best ? bucket_best : NULL,
-                        src_datatype,src_datasize,out_datasize,out_fill);
+                        out_datasize,out_fill,
+                        bucket_reserved,
+                        bucket_has_reserved ? bucket_reserved_best : NULL,
+                        reserved.dominate,reserved.threshold);
+
+    if(!reserved.values.empty())
+        appendCount32(reserved_counts,bucket_reserved);
 
     if(bucket_samples > 0)
         buckets_with_data++;
@@ -2083,6 +2184,32 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
 
     stream->write(tail,strlen(tail));
 
+    // Only when the caller named a reserved value, so a response that did not ask
+    // for any is byte for byte what it was before.
+    if(!reserved.values.empty()){
+
+        std::string list;
+
+        for(size_t i = 0; i < reserved.values.size(); i++){
+            char number[40];
+            snprintf(number,sizeof(number),"%s%.17g",i ? "," : "",reserved.values[i]);
+            list += number;
+        }
+
+        char head[224];
+        snprintf(head,sizeof(head),
+            ",\"reserved\":[%s],\"reserved_mode\":\"%s\",\"reserved_threshold\":%.17g,"
+            "\"reserved_points\":%lld,\"reserved_counts\":\"",
+            list.c_str(),
+            reserved.dominate ? "dominate" : "exclude",
+            reserved.threshold,
+            reserved_points);
+
+        stream->write(head,strlen(head));
+        streamHex(stream,reserved_counts.data(),reserved_counts.size());
+        stream->write("\"",1);
+    }
+
     if(scanned_out != NULL)
         *scanned_out = points_scanned;
 
@@ -2098,16 +2225,32 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
 ///
 /// Sets mode to CONDENSE_NONE when neither is present.
 
-bool BSeriesApi::readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE &response, int *mode, long long *max_points){
+bool BSeriesApi::readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE &response, int *mode,
+                                     long long *max_points, CONDENSE_RESERVED *reserved){
 
     *mode = CONDENSE_NONE;
     *max_points = 0;
 
+    reserved->values.clear();
+    reserved->dominate = false;
+    reserved->threshold = 0.0;
+
     std::string max_text = httpQueryParam(request,"max_points");
     std::string condense_text = httpQueryParam(request,"condense");
 
-    if(max_text.empty() && condense_text.empty())
+    if(max_text.empty() && condense_text.empty()){
+
+        // Raw reads hand back what was stored, so there is nothing for a reserved
+        // value to change. Refused rather than ignored: a caller who thought it
+        // applied would otherwise read the answer as though it had.
+        if(!httpQueryParam(request,"reserved").empty()){
+            jsonError(response,400,"bad_parameter",
+                      "reserved applies to a condensed read; supply max_points and condense too");
+            return false;
+        }
+
         return true;
+    }
 
     if(max_text.empty() || condense_text.empty()){
         jsonError(response,400,"bad_parameter",
@@ -2135,7 +2278,94 @@ bool BSeriesApi::readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE 
         return false;
     }
 
+    if(!readReservedOptions(request,response,reserved))
+        return false;
+
     *max_points = (long long)value;
+    return true;
+}
+
+
+/// Reads reserved, reserved_mode and reserved_threshold from the query string.
+///
+/// reserved is a comma separated list, so a prober can distinguish no reply from
+/// a timeout from a DNS failure and still have all of them treated alike.
+
+bool BSeriesApi::readReservedOptions(const HTTP_REQUEST &request, HTTP_RESPONSE &response, CONDENSE_RESERVED *reserved){
+
+    reserved->values.clear();
+    reserved->dominate = false;
+    reserved->threshold = 0.0;
+
+    std::string list = httpQueryParam(request,"reserved");
+
+    if(list.empty())
+        return true;                        // condensing behaves exactly as before
+
+    size_t at = 0;
+
+    while(at <= list.size()){
+
+        size_t comma = list.find(',',at);
+        std::string item = list.substr(at,comma == std::string::npos ? std::string::npos : comma - at);
+
+        // Trimmed so "1, 2" is accepted; a browser will not always strip it.
+        size_t first = item.find_first_not_of(" \t");
+        size_t last = item.find_last_not_of(" \t");
+
+        if(first == std::string::npos){
+            jsonError(response,400,"bad_parameter","reserved is a comma separated list of values");
+            return false;
+        }
+
+        item = item.substr(first,last - first + 1);
+
+        char *stop = NULL;
+        double value = strtod(item.c_str(),&stop);
+
+        if(stop == item.c_str() || *stop != '\0' || value != value){
+            jsonError(response,400,"bad_parameter","each reserved value must be a number");
+            return false;
+        }
+
+        reserved->values.push_back(value);
+
+        if(comma == std::string::npos)
+            break;
+
+        at = comma + 1;
+    }
+
+    std::string mode_text = httpQueryParam(request,"reserved_mode");
+
+    if(!mode_text.empty() && mode_text != "exclude" && mode_text != "dominate"){
+        jsonError(response,400,"bad_parameter","reserved_mode is exclude or dominate");
+        return false;
+    }
+
+    reserved->dominate = (mode_text == "dominate");
+
+    std::string threshold_text = httpQueryParam(request,"reserved_threshold");
+
+    if(!threshold_text.empty()){
+
+        if(!reserved->dominate){
+            jsonError(response,400,"bad_parameter",
+                      "reserved_threshold only means something with reserved_mode=dominate");
+            return false;
+        }
+
+        char *stop = NULL;
+        double value = strtod(threshold_text.c_str(),&stop);
+
+        if(stop == threshold_text.c_str() || *stop != '\0' || !(value >= 0.0 && value <= 1.0)){
+            jsonError(response,400,"bad_parameter","reserved_threshold is a fraction between 0 and 1");
+            return false;
+        }
+
+        reserved->threshold = value;
+    }
+
     return true;
 }
 
@@ -2200,7 +2430,9 @@ void BSeriesApi::handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &r
     int condense_mode = CONDENSE_NONE;
     long long max_points = 0;
 
-    if(!readCondenseOptions(request,response,&condense_mode,&max_points))
+    CONDENSE_RESERVED reserved;
+
+    if(!readCondenseOptions(request,response,&condense_mode,&max_points,&reserved))
         return;
 
     int64_t points = pointsInRange(db,key,start_time,end_time);
@@ -2254,7 +2486,7 @@ void BSeriesApi::handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &r
 
     int rc = (condense_mode == CONDENSE_NONE)
            ? streamSeriesData(db,key,start_time,end_time,stream)
-           : streamCondensedSeries(db,key,start_time,end_time,condense_mode,max_points,stream,NULL);
+           : streamCondensedSeries(db,key,start_time,end_time,condense_mode,max_points,reserved,stream,NULL);
 
     if(rc != NO_ERROR){
         // The head is already on the wire, so a failure this late can only be
@@ -2285,7 +2517,9 @@ void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_
     int condense_mode = CONDENSE_NONE;
     long long max_points = 0;
 
-    if(!readCondenseOptions(request,response,&condense_mode,&max_points))
+    CONDENSE_RESERVED reserved;
+
+    if(!readCondenseOptions(request,response,&condense_mode,&max_points,&reserved))
         return;
 
     std::string keys_text = httpQueryParam(request,"keys");
@@ -2367,7 +2601,7 @@ void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_
         if(info == NO_ERROR)
             rc = (condense_mode == CONDENSE_NONE)
                ? streamSeriesData(db,keys[i],start_time,end_time,stream)
-               : streamCondensedSeries(db,keys[i],start_time,end_time,condense_mode,max_points,stream,NULL);
+               : streamCondensedSeries(db,keys[i],start_time,end_time,condense_mode,max_points,reserved,stream,NULL);
 
         if(rc != NO_ERROR){
             char entry[256];

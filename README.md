@@ -662,6 +662,57 @@ state carries across window boundaries. Condensing 300000 one second points into
 bounds the total slots a condensed request may walk, and `condense_window` sets how
 many are held at once.
 
+### Values that are not measurements
+
+A prober that writes `1` for "no reply" is recording an outcome, not a latency.
+Averaged with milliseconds it is worse than noise: on a real series here 11% of
+readings were that `1`, and including them moved the mean **down** by 2.5ms, so a
+link losing a third of its packets read as the fastest week on the chart.
+
+`reserved` names such values, and they are then counted rather than aggregated.
+It takes a comma separated list, so a prober can tell no reply from a timeout
+from a DNS failure and still have all of them treated alike.
+
+```
+$ curl -H 'X-API-Key: $READ_KEY' \
+    'localhost:8086/v1/lab/series/531/data?start=…&end=…&max_points=12&condense=average&reserved=1'
+{"…","data":"…","reserved":[1],"reserved_mode":"exclude","reserved_threshold":0,
+ "reserved_points":910173,"reserved_counts":"…"}
+```
+
+`reserved_counts` is one little endian `uint32` per bucket, so loss can be drawn
+beside latency instead of hidden inside it. `reserved_points` is the total. Naming
+no reserved value leaves the response byte for byte what it was.
+
+**This is a property of the request, not of the series.** Whether `1` means "no
+reply" is the prober's convention, and another series may store `1` as an ordinary
+reading, so nothing about it is written to the file. It applies only to a
+condensed read — a raw read hands back what was stored — and passing it to a raw
+read is refused rather than quietly ignored.
+
+**`reserved_mode=dominate` lets a reserved value take a maximum.** Only a maximum:
+a minimum is the other end of the range, where "no reply" is exactly the wrong
+answer, and an average of a sentinel is not a number.
+
+`reserved_threshold` is the share of a bucket that has to be reserved before it
+does, and it is what stops the feature being useless at scale. With a tenth of a
+series reserved, every bucket of a year long window contains one, so the default
+threshold of `0` — dominate on sight — paints the whole chart as an outage:
+
+| bucket | 0 | 1 | … | 9 | 10 | 11 |
+|---|---|---|---|---|---|---|
+| loss | 0.1% | 0.1% | | 6.7% | 20.9% | 33.3% |
+| `condense=max` | 254 | 254 | | 254 | 254 | 254 |
+| `dominate`, threshold 0 | 1 | 1 | | 1 | 1 | 1 |
+| `dominate`, threshold 0.25 | 254 | 254 | | 254 | 254 | 1 |
+
+Threshold `0` is still the right answer when the value is genuinely rare; it is
+the default because it is the least surprising reading of "let it dominate".
+
+Reserved values are matched as doubles, which is exact for every type the database
+stores except a 64 bit integer past 2^53. Sentinels are small by nature, so that
+has not been worth a second comparison path.
+
 ### How missing data is kept out of the aggregate
 
 A series is dense, so a month of one second slots contains a slot per second

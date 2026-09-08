@@ -661,6 +661,67 @@ int main(int argc, char **argv){
         CHECK(r.status==200 && bodyHas(r,"\"count\":2"), "batch read condenses too");
         CHECK(bodyHas(r,"\"condense\":\"max\""), "and reports the operation per series");
 
+        // Reserved values.
+        //
+        // Bucket 0 holds 1..100, so reserving 1 removes exactly one point from it
+        // and leaves every other bucket alone: the arithmetic is checkable by hand.
+        const char *RANGE = "/v1/series/70001/data?start=1700000000&end=1700000600&max_points=6";
+
+        r = request("GET",(std::string(RANGE) + "&condense=min").c_str(),"read-only-key");
+        CHECK(bodyHas(r,"\"data\":\"01ff32323232\""), "without reserved, 1 is the minimum");
+
+        r = request("GET",(std::string(RANGE) + "&condense=min&reserved=1").c_str(),"read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"data\":\"02ff32323232\""), "reserved 1 is not a minimum, 2 is");
+        CHECK(bodyHas(r,"\"reserved\":[1]"), "the request's reserved list is echoed");
+        CHECK(bodyHas(r,"\"reserved_mode\":\"exclude\""), "exclude is the default mode");
+        CHECK(bodyHas(r,"\"reserved_points\":1"), "one reserved point in the whole range");
+        CHECK(bodyHas(r,"\"reserved_counts\":\"010000000000000000000000000000000000000000000000\""),
+              "and it is counted against bucket 0 alone");
+
+        // 1..100 averages 50.5; take the 1 out and 2..100 averages 51 exactly.
+        r = request("GET",(std::string(RANGE) + "&condense=average&reserved=1").c_str(),"read-only-key");
+        CHECK(r.status==200, "average accepts reserved");
+        {
+            size_t at = r.body.find("\"data\":\"");
+            double first = 0;
+            if(at != std::string::npos){
+                unsigned char bytes[8];
+                for(int j = 0; j < 8; j++)
+                    bytes[j] = (unsigned char)strtoul(r.body.substr(at + 8 + j*2,2).c_str(),NULL,16);
+                memcpy(&first,bytes,8);
+            }
+            CHECK(first > 50.99 && first < 51.01, "the mean of 2..100 is 51, not the 50.5 that included the 1");
+        }
+
+        // A tenth of a real series was a reserved value, so dominating on sight
+        // paints every bucket as an outage; the threshold is what makes it usable.
+        r = request("GET",(std::string(RANGE) + "&condense=max&reserved=1&reserved_mode=dominate").c_str(),"read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"data\":\"01ff32323232\""), "one reserved point takes the bucket at threshold 0");
+
+        r = request("GET",(std::string(RANGE) + "&condense=max&reserved=1&reserved_mode=dominate&reserved_threshold=0.5").c_str(),"read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"data\":\"64ff32323232\""), "one point in a hundred does not clear a half threshold");
+
+        r = request("GET",(std::string(RANGE) + "&condense=max&reserved=1,50").c_str(),"read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"reserved\":[1,50]"), "a comma separated list is accepted");
+        // 50 occurs once inside 1..100 and again in all 400 later slots, plus the
+        // single 1.
+        CHECK(bodyHas(r,"\"reserved_points\":402"), "both values are counted");
+
+        // A response that named none must be exactly what it always was.
+        r = request("GET",(std::string(RANGE) + "&condense=min").c_str(),"read-only-key");
+        CHECK(!bodyHas(r,"reserved"), "no reserved parameter means no reserved fields");
+
+        r = request("GET","/v1/series/70001/data?start=1700000000&end=1700000600&reserved=1","read-only-key");
+        CHECK(r.status==400, "reserved on a raw read is refused rather than ignored");
+        r = request("GET",(std::string(RANGE) + "&condense=min&reserved=nope").c_str(),"read-only-key");
+        CHECK(r.status==400, "a non numeric reserved value is refused");
+        r = request("GET",(std::string(RANGE) + "&condense=min&reserved=1&reserved_mode=sometimes").c_str(),"read-only-key");
+        CHECK(r.status==400, "an unknown reserved_mode is refused");
+        r = request("GET",(std::string(RANGE) + "&condense=min&reserved=1&reserved_threshold=0.5").c_str(),"read-only-key");
+        CHECK(r.status==400, "a threshold without dominate is refused");
+        r = request("GET",(std::string(RANGE) + "&condense=min&reserved=1&reserved_mode=dominate&reserved_threshold=7").c_str(),"read-only-key");
+        CHECK(r.status==400, "a threshold outside 0..1 is refused");
+
         // a condensed range may exceed the raw read cap, since it is windowed
         r = request("GET","/v1/series/70001/data?start=1&end=1700000600","read-only-key");
         CHECK(r.status==413 && bodyHas(r,"max_points"), "a huge raw range is refused and suggests condensing");

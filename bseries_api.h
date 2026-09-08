@@ -95,6 +95,29 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out);
 int apiApplyEnvironment(API_CONFIG *config, std::string *error_out);
 
 
+/// Values that are recorded, but are not measurements.
+///
+/// A prober that writes 1 for "no reply" is storing an outcome, not a latency,
+/// and averaging it with milliseconds is meaningless: on a real series here, 11%
+/// of readings were that 1, and including them moved the mean *down* by 2.5ms,
+/// making a lossy link look faster than a clean one.
+///
+/// Which value carries that meaning is the caller's business, not the file's --
+/// another series may use 1 as an ordinary reading -- so this arrives per request
+/// and nothing about it is stored. Naming none leaves condensing exactly as it
+/// was.
+///
+/// Reserved points never join an average or a minimum; they are counted per
+/// bucket instead, and that count is returned so the loss can be charted beside
+/// the latency rather than hidden inside it.
+
+typedef struct {
+    std::vector<double> values;   // empty when the caller named none
+    bool dominate;                // let them win a maximum, rather than be skipped
+    double threshold;             // share of a bucket needed before they do
+} CONDENSE_RESERVED;
+
+
 /// HTTP interface to a set of tables.
 ///
 /// Every data path is rooted at a table: /v1/<table>/series, /v1/<table>/data and
@@ -156,8 +179,11 @@ private:
 
     int streamSeriesData(BSeries *db, uint32_t key, long long start_time, long long end_time, HttpStream *stream);
     int streamCondensedSeries(BSeries *db, uint32_t key, long long start_time, long long end_time,
-                              int mode, long long max_points, HttpStream *stream, long long *scanned_out);
-    bool readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE &response, int *mode, long long *max_points);
+                              int mode, long long max_points, const CONDENSE_RESERVED &reserved,
+                              HttpStream *stream, long long *scanned_out);
+    bool readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE &response, int *mode,
+                             long long *max_points, CONDENSE_RESERVED *reserved);
+    bool readReservedOptions(const HTTP_REQUEST &request, HTTP_RESPONSE &response, CONDENSE_RESERVED *reserved);
     bool readTimeRange(const HTTP_REQUEST &request, HTTP_RESPONSE &response, long long *start_time, long long *end_time);
     int64_t pointsInRange(BSeries *db, uint32_t key, long long start_time, long long end_time);
     void handleWriteData(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
