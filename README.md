@@ -349,9 +349,9 @@ Measured on a 500 series, one point per series ingest over HTTP:
 100000 points:  read syscalls 0   write syscalls 0   disk bytes 0
 ```
 
-The buffer flushes once every `write_ahead_size` points per series, and on a clean
-shutdown. Straight against the library, 100000 points into one series is 24 write
-syscalls — one per 4096 points.
+A block flushes once it fills, and on a clean shutdown. Straight against the
+library with the flush timer off, 100000 points into one series is 121 write
+syscalls — one per 1024 point block.
 
 Getting there needs `seriesShape()` rather than `seriesInfo()` on any write path.
 `seriesInfo()` reads the header off disk deliberately, so probing unknown keys
