@@ -1,6 +1,8 @@
 #include "bseries.h"
 #include "debug.h"
 
+#include <new>
+
 
 
 
@@ -46,41 +48,62 @@ int BSeries::createSeries(FILE *file, SERIES *series, uint32_t datasize){
 
 
 //closes series that havent been written to in max_age (seconds)
+//
+// Entries currently in use are skipped: series_list hands out raw ENTRY pointers,
+// so an entry whose access mutex is held may still be in the middle of a write and
+// erasing it would leave that thread with a dangling pointer.
 
 void BSeries::closeSeries(uint32_t max_age){
 
-    int64_t age;
-    int64_t age_counts;
-
     uint32_t current_timestamp = time(NULL);
+
+    index_access.lock();
 
     auto it = series_list.begin();
     while(it != series_list.end()){
 
+        // Never evict an entry another thread is working on. This also has to come
+        // before the age test: last_write is published under the entry lock, so
+        // reading it here without that lock is a data race.
+        if(!it->second.access.try_lock()){
+            it++;
+            continue;
+        }
 
+        int64_t age = (int64_t)current_timestamp - (int64_t)it->second.last_write;
 
+        if(age <= (int64_t)max_age && it->second.last_write){
+            it->second.access.unlock();
+            it++;
+            continue;
+        }
 
+        // Flush whatever is still sitting in the write ahead cache before dropping
+        // it, otherwise closing a series silently discards up to write_ahead_size
+        // points. last_write is only non-zero once a write has actually landed, so
+        // entries that were only ever read have nothing to flush.
+        if(it->second.write_ahead_cache != NULL){
 
-            age = current_timestamp - it->second.last_write;
-            if(age > max_age ||  !it->second.last_write){
-
-
-                it = series_list.erase(it);
-            } else {
-                it++;
+            if(it->second.last_write){
+                FILE *file = openFile(it->first,true);
+                if(file != NULL){
+                    flushBuffer(&it->second,file);
+                    fclose(file);
+                } else {
+                    _ERROR("\t Failed to open %u to flush before closing\n",it->first);
+                }
             }
 
+            free(it->second.write_ahead_cache);
+            it->second.write_ahead_cache = NULL;
+        }
 
-            it++;
+        it->second.access.unlock();
 
-
-
-
-
-
-
-
+        it = series_list.erase(it);
     }
+
+    index_access.unlock();
 }
 
 
@@ -88,6 +111,7 @@ void BSeries::closeSeries(uint32_t max_age){
 
 bool BSeries::trim(){
     // flush and close old series;
+    return false; // not implemented yet, falling off the end here was undefined
 }
 
 
@@ -97,8 +121,12 @@ FILE* BSeries::openFile(uint64_t key, bool writeMode){
 
 
     char filename[256];
-    _DEBUG("\tOpening file %u\n",key);
-    sprintf(filename,"%s/%u",data_directory,key);
+    _DEBUG("\tOpening file %lu\n",(unsigned long)key);
+
+    if(snprintf(filename,sizeof(filename),"%s/%lu",data_directory,(unsigned long)key) >= (int)sizeof(filename)){
+        _ERROR("\t Path for key %lu does not fit in the filename buffer\n",(unsigned long)key);
+        return NULL;
+    }
 
 
     FILE *file = fopen(filename,"r+b");
@@ -146,6 +174,14 @@ bool BSeries::flushBuffer(ENTRY *series,FILE *file){
 
 
 bool BSeries::validateWriteAheadCache(ENTRY *series){
+
+    if(series->header.datasize == 0){
+        // The header has not been loaded yet. Allocating here would produce a zero
+        // sized cache that is never resized, because the NULL check below would then
+        // consider it valid forever.
+        _ERROR("Cache requested before the header was loaded\n");
+        return false;
+    }
 
     // If our write ahead cache is NULL, malloc it and set it to our null fill
     if(series->write_ahead_cache == NULL){
@@ -196,29 +232,24 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
     FILE *file = NULL;
 
 
-    index_access.lock();
-
-
-
     ENTRY *series;
 
-   // if(series_list.find(key) == series_list.end()){
-   //     ENTRY _series;
-   //     series_list[key] = _series;
-   // }
-
+    // The entry lock is taken while index_access is still held. series_list hands
+    // out raw ENTRY pointers, so closeSeries() needs the entry mutex to tell that
+    // an entry is in use; releasing index_access before locking leaves a window
+    // where it could erase the entry and hand us a dangling pointer.
+    index_access.lock();
     series = &series_list[key];
-
+    series->access.lock();
     index_access.unlock();
 
 
-    uint32_t status = NO_ERROR;
+    int status = NO_ERROR;
 
     if(!timestamp)
         timestamp = time(NULL);
 
     do {
-        series->access.lock();
 
         int size;
 
@@ -242,6 +273,7 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
 
             if(file == NULL){
                 _ERROR("\t Failed to open or create file");
+                status = FILE_OPEN_FAILURE;
                 break;
             }
 
@@ -254,6 +286,7 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
                 /// Create header and continue write
                 if(!createSeries(file,&series->header,datasize)){ // attempt to create header, if failure, return error
                     fclose(file);
+                    file = NULL; // the exit path below closes file, don't close it twice
                     _ERROR("\t Failed to create new File/header\n");
                     status = CREATE_NEW_HEADER_FAIL;
                     break;
@@ -266,6 +299,7 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
             // check the checksum once more, if incorrect, close the file
             if(series->header.checksum != getChecksum(&series->header)){
                 fclose(file);
+                file = NULL; // the exit path below closes file, don't close it twice
                 _ERROR("\t HEADER_INVALID_CHECKSUM\n");
                 status = HEADER_INVALID_CHECKSUM;
                 break;
@@ -291,9 +325,24 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
 
         /// If we reach this point, we have a valid header and our pointer is on the first data point in the series
 
+        if(series->header.interval == 0){ // the point calculation below divides by this
+            _ERROR("\t INVALID_SERIES_INTERVAL\n");
+            status = INVALID_SERIES_INTERVAL;
+            break;
+        }
+
+        if(timestamp < series->header.timestamp){
+            // Both fields are uint32_t. An unsigned subtraction here wraps to about
+            // four billion, and the null fill below would then try to grow the file
+            // by gigabytes to reach that point.
+            _ERROR("\t WRITE_BEFORE_SERIES_START\n");
+            status = WRITE_BEFORE_SERIES_START;
+            break;
+        }
+
 retry:
 
-        int64_t point = (timestamp - series->header.timestamp)/series->header.interval;
+        int64_t point = ((int64_t)timestamp - (int64_t)series->header.timestamp)/(int64_t)series->header.interval;
         // Point since start of file
 
         int64_t file_pos = point * series->header.datasize + sizeof(SERIES);
@@ -324,8 +373,15 @@ retry:
                     if(file == NULL)
                         file = openFile(key,true);
 
+                    if(file == NULL){
+                        _ERROR("\t Failed to open or create file\n");
+                        status = FILE_OPEN_FAILURE;
+                        break;
+                    }
+
                     if(!flushBuffer(series,file)){
-                        _DEBUG("\t Failed to flush buffer");
+                        _ERROR("\t WAL_WRITE_FAILURE, failed to flush buffer\n");
+                        status = WAL_WRITE_FAILURE;
                         break;
                     }
                 }
@@ -340,7 +396,8 @@ retry:
 
                 // Check if the file opened correctily
                 if(file == NULL){
-                    _ERROR("\t Failed to open or create file");
+                    _ERROR("\t Failed to open or create file\n");
+                    status = FILE_OPEN_FAILURE;
                     break;
                 }
 
@@ -348,7 +405,8 @@ retry:
 
                 // First flush our current buffer to disk because it could contain some valid points
                 if(!flushBuffer(series,file)){
-                    _DEBUG("\t Failed to flush buffer");
+                    _ERROR("\t WAL_WRITE_FAILURE, failed to flush buffer\n");
+                    status = WAL_WRITE_FAILURE;
                     break;
                 }
 
@@ -363,6 +421,7 @@ retry:
                 char *nullFill = (char*)malloc(grow_by * series->header.datasize); // Allocate a temporary memory buffer to contain the null data points that we will write
                 if(nullFill == NULL){ // Could not allocate memory
                     _ERROR("\t WAL_MEMORY_ALLOCATION_FAILURE\n");
+                    status = WAL_MEMORY_ALLOCATION_FAILURE;
                     break;
                 }
 
@@ -371,9 +430,10 @@ retry:
 
                 _DEBUG("\Writing null fill to end of file\n");
                 // Write it to disk
-                if(fwrite(nullFill,series->header.datasize,grow_by,file) != grow_by){ // Write the null points
+                if(fwrite(nullFill,series->header.datasize,grow_by,file) != (size_t)grow_by){ // Write the null points
                     free(nullFill);
                     _ERROR("\t WAL_WRITE_FAILURE\n");
+                    status = WAL_WRITE_FAILURE;
                     break;
                 }
                 _DEBUG("\t freeing null buffer\n");
@@ -400,6 +460,7 @@ retry:
                 file = openFile(key,true);
                 if(file == NULL){
                     _ERROR("\tFailed to open file for direct writing\n");
+                    status = FILE_OPEN_FAILURE;
                     break;
                 }
             }
@@ -412,14 +473,19 @@ retry:
 
             if(size != 1){ // Check that write completed with the correct number of bytes written
                 fclose(file);
+                file = NULL; // the exit path below closes file, don't close it twice
                 _ERROR("\t Failed to direct write data point\n");
                 status = DATA_POINT_WRITE_FAILURE;
                 break;
             }
             _DEBUG("\t Success\n");
-            series->last_write = time(NULL);
         }
 
+
+        // Stamped for every successful write, cached or direct. closeSeries() evicts
+        // on last_write, so leaving it unset on the cached path (the common one) made
+        // it evict exactly the series that were busiest.
+        series->last_write = time(NULL);
 
         status = NO_ERROR; // Return successful, don't close file
         break;
@@ -470,7 +536,16 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
     _DEBUG("Reading from series %u where time > %lu and time < %lu\n",key,start_time,end_time);
 
 
-    uint32_t status = NO_ERROR;
+    // Every out parameter is filled in or accumulated into below; callers cannot be
+    // expected to pre-zero them, and on a failed read they must not be left holding
+    // a stale result pointer.
+    *n_points = 0;
+    *real_points = 0;
+    *seconds_per_point = 0;
+    *first_point_timestamp = 0;
+    *result = NULL;
+
+    int status = NO_ERROR;
     FILE *file = NULL;
     ENTRY *series = NULL;
 
@@ -483,30 +558,13 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
 
         _DEBUG("Looking Up Key: %d\n",key);
 
+        // Same ordering as write(): take the entry lock while index_access is still
+        // held, both so closeSeries() cannot erase the entry underneath us and so
+        // that the exit path below always has a lock to release.
         index_access.lock();
-
-
-       // if(series_list.find(key) == series_list.end()){
-       //     ENTRY _series;
-      //      series_list[key] = _series;
-      //  }
-
         series = &series_list[key];
-
-
-        // Allocate write ahead cache if needed
-        if(!validateWriteAheadCache(series)){
-           _ERROR("\t WAL_MEMORY_ALLOCATION_FAILURE\n");
-           index_access.unlock();
-            status = WAL_MEMORY_ALLOCATION_FAILURE;
-            break;
-        }
-
-
-        index_access.unlock();
-
-
         series->access.lock();
+        index_access.unlock();
 
 
         if(end_time <= 0)
@@ -579,12 +637,30 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
         /// Calculate the position in the file (Byte) where we are going to write the data point,
         /// this is based on the start timestampfor the series and the number of seconds between points,
         /// the position is also offseted to account for the header size
-        int64_t points = ( end_time - start_time) / series->header.interval;
-        int64_t points_in_file = (series->file_size - sizeof(SERIES))/series->header.datasize;
-        *seconds_per_point = series->header.interval;
-        // *first_point_timestamp = series->header.timestamp + (series->header.interval * (start_pos + offset));
+        if(series->header.interval == 0 || series->header.datasize == 0){ // both divide below
+            _ERROR("\t INVALID_SERIES_INTERVAL\n");
+            status = INVALID_SERIES_INTERVAL;
+            break;
+        }
 
-        char *output = new char[points*series->header.datasize];
+        // Only now that the header is loaded is datasize known. Allocating the cache
+        // any earlier sizes it as write_ahead_size * 0, and malloc(0) hands back a
+        // non NULL pointer that this function then never grows.
+        if(!validateWriteAheadCache(series)){
+            _ERROR("\t WAL_MEMORY_ALLOCATION_FAILURE\n");
+            status = WAL_MEMORY_ALLOCATION_FAILURE;
+            break;
+        }
+
+        int64_t points = ( end_time - start_time) / series->header.interval;
+        int64_t points_in_file = (series->file_size - (int64_t)sizeof(SERIES))/series->header.datasize;
+        *seconds_per_point = series->header.interval;
+
+        // output[0] corresponds to start_time: the mapping below places every file
+        // and cache point at (its timestamp - start_time) / interval.
+        *first_point_timestamp = start_time;
+
+        char *output = new (std::nothrow) char[points*series->header.datasize];
         if(output == NULL){
             _ERROR("\t MEMORY_ALLOCATION_FAILED\n");
             status = MEMORY_ALLOCATION_FAILED;
@@ -645,6 +721,13 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
             _DEBUG("\tbuffer_output_pos: %d\n",buffer_output_pos);
             _DEBUG("\tbuffer_output_points: %d\n",buffer_output_points);
             _DEBUG("\tbuffer_output_timestamp: %d\n",buffer_output_timestamp);
+
+            // Clamp to the output buffer. Without this a wide enough time range
+            // freads past the end of output.
+            if(buffer_output_pos < 0)
+                buffer_output_pos = 0;
+            if(buffer_output_pos + buffer_output_points > points)
+                buffer_output_points = points - buffer_output_pos;
 
             if(buffer_output_points > 0 && file_start_point >= 0 && file_end_point >= 0){
 
@@ -740,8 +823,9 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
             _DEBUG("\tbuffer_output_points: %d\n",buffer_output_points);
             _DEBUG("\tcache_start_time: %d\n",cache_start_time);
 
-            if(buffer_output_points > 0 && series->write_ahead_cache != NULL && cache_start_point >= 0 && cache_end_point >= 0){
-                memcpy(output+(buffer_output_start_pos*series->header.datasize),series->write_ahead_cache + cache_start_point,buffer_output_points*series->header.datasize);
+            if(buffer_output_points > 0 && series->write_ahead_cache != NULL && cache_start_point >= 0 && cache_end_point >= 0 && buffer_output_start_pos >= 0){
+                // cache_start_point counts points, the cache is addressed in bytes.
+                memcpy(output+(buffer_output_start_pos*series->header.datasize),series->write_ahead_cache + (cache_start_point*series->header.datasize),buffer_output_points*series->header.datasize);
                 *real_points += buffer_output_points;
             }
 
@@ -763,7 +847,8 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
         fclose(file);
 
 
-    series->access.unlock();
+    if(series)
+        series->access.unlock();
 
     return status;
 }
@@ -821,7 +906,9 @@ void BSeries::close()
             it->second.access.lock(); // Ensure nobody is accessing our resource
             if(it->second.write_ahead_cache != NULL){
                 free(it->second.write_ahead_cache);
+                it->second.write_ahead_cache = NULL; // don't leave a freed pointer behind
             }
+            it->second.access.unlock(); // destroying a locked std::mutex is undefined
 
         it++;
     }
