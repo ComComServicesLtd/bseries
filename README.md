@@ -371,24 +371,46 @@ Default 60 seconds; `0` disables it. `SIGTERM` and `SIGINT` still flush everythi
 so a normal restart loses nothing either way.
 
 ```
-wrote 3000 points          file: 20 bytes      (buffer holds 4096, nothing due yet)
-after the timer            file: 3020 bytes
+wrote 3000 points          file: 20 bytes      (nothing due yet)
+after the timer            file: padded out to whole blocks
 kill -9, restart           3000 of 3000 points survived
 ```
 
-A flush writes **only the points actually buffered**, not the whole buffer. That is
-not a detail: flushing the whole buffer would advance the file past slots nothing
-has been written to yet, and every later write into that window would take the
-direct path with an open and a seek of its own. Measured over 1000 points spanning
-a mid-stream flush:
+### Blocks, and what a flush costs
 
-```
-flushing what was written    1 write syscall
-flushing the whole buffer  901 write syscalls
-```
+Points are buffered a block at a time, `write_ahead_size` points to a block,
+default 1024. **A block is always written whole**: where fewer points than that
+have been recorded, the rest go down as null fill, so the file only ever grows by
+whole blocks and a partly filled one is padded ahead rather than left short.
 
-The same change means a clean buffer costs nothing to flush, where an idle series
-used to gain a whole buffer of null fill every time.
+That has a consequence worth understanding before choosing a flush interval. Once a
+block has been padded the file covers all of it, so later points inside that block
+are written **straight to the file** rather than buffered. They are durable as they
+arrive — and they cost a write each. Measured on one series over 4096 points with
+1024 point blocks:
+
+| flush timer fires | write syscalls per point |
+|---|---|
+| never, the block fills first | 0.001 |
+| every 300 points | 0.817 |
+| every 60 points | 0.948 |
+
+So the interval to choose is really a question about its ratio to how long a block
+takes to fill:
+
+* **Longer than a block takes to fill** — the block fills first, the timer rarely
+  fires, and writes cost almost nothing. A 1s series with 1024 point blocks fills
+  in about 17 minutes.
+* **Shorter than that** — most points are written through to the file individually.
+  Durability is close to per point, at about one file write per point.
+
+Neither is wrong; they are two points on the same trade. At the default 60 second
+timer a 1s series sits in the second regime, which for a write primary database is
+usually the intent. Raise `write_ahead_size` or `flush_interval` to move the other
+way.
+
+A clean buffer still costs nothing to flush, so an idle series does not gain a
+block of null fill every time anything flushes it.
 
 ### Changing settings while it runs
 
