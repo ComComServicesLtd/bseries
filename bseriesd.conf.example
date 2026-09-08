@@ -1,0 +1,66 @@
+# bseriesd configuration
+#
+# One "setting value" per line. Everything after a # is a comment. An unknown
+# setting is an error rather than a silent no-op, so a typo cannot leave the
+# server running with something other than what was intended.
+#
+#     bseriesd -c /etc/bseriesd.conf
+
+
+# --- where to listen ------------------------------------------------------
+
+listen                127.0.0.1     # use :: or 0.0.0.0 to accept remote connections
+port                  8086
+
+
+# --- the database ---------------------------------------------------------
+
+data_directory        /var/lib/bseries
+definitions           /etc/bseries.conf   # series interval and type declarations
+
+write_ahead_size      4096          # points buffered per series before a disk write
+default_interval      10            # seconds per point for keys with no definition
+
+
+# --- authentication -------------------------------------------------------
+#
+# Keys are presented as  X-API-Key: <key>  (Authorization: Bearer <key> also
+# works). read_key may call the GET endpoints; write_key may call everything.
+# Leave one empty to disable that level of access. They must differ.
+#
+# Generate with:  head -c 32 /dev/urandom | base64
+#
+# This file holds secrets. chmod 600 it; bseriesd warns on startup if other
+# users can read it.
+
+read_key              CHANGE_ME_read_only_key
+write_key             CHANGE_ME_read_write_key
+
+
+# --- CORS -----------------------------------------------------------------
+#
+# Origins allowed to call the API from a browser. Repeat the setting for more
+# than one. A single entry of * allows any origin. With no cors_origin line no
+# CORS headers are sent at all, which blocks browser callers; that is the right
+# default when the only clients are server side.
+
+# cors_origin         https://dashboard.example.com
+# cors_origin         http://localhost:3000
+
+
+# --- limits ---------------------------------------------------------------
+
+max_points_per_read   1000000       # a wider range is refused with 413
+max_body_bytes        1048576       # a larger request body is refused with 413
+max_connections       64            # further connections get 503
+
+
+# --- maintenance ----------------------------------------------------------
+#
+# A series untouched for series_max_idle seconds is flushed to disk and dropped
+# from memory. Without this the server keeps an entry and a write ahead buffer
+# for every key it has ever touched, and buffered points sit in memory
+# indefinitely. Set series_max_idle to 0 to disable.
+
+series_max_idle       900
+maintenance_interval  60

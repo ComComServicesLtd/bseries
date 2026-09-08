@@ -29,6 +29,8 @@
 #define SERIES_TYPE_MISMATCH -10
 #define INVALID_SERIES_DEFINITION -11
 #define DEFINITIONS_FILE_UNREADABLE -12
+#define SERIES_ALREADY_EXISTS -13
+#define SERIES_NOT_FOUND -14
 
 
 #define INVALID_TIME_RANGE -1
@@ -187,6 +189,23 @@ public:
     int write_ahead_size;
     int default_seconds_per_point;
     char default_null_fill_byte;
+
+    /// Series lifecycle, beyond the implicit "created by the first write" path.
+    ///
+    /// createSeriesFile() lays down a header for a series that does not exist yet
+    /// with an explicit shape, so a caller can declare a series without having a
+    /// point to write. deleteSeries() drops the series from memory without
+    /// flushing it and unlinks its file. seriesInfo() reads a header straight from
+    /// disk without touching series_list, so probing a key that does not exist
+    /// cannot grow the in memory index.
+
+    /// start_timestamp is the moment the series' first point sits at; pass 0 for
+    /// now. Setting it in the past is how a series is prepared for a backfill,
+    /// since a write before the series start is refused.
+    int createSeriesFile(uint32_t key, uint32_t interval, uint8_t datatype, uint8_t datasize, uint32_t start_timestamp = 0);
+    int deleteSeries(uint32_t key);
+    int seriesInfo(uint32_t key, SERIES *header, int64_t *file_size);
+    int listSeriesKeys(vector<uint32_t> *keys, uint32_t after, int limit);
 
     void flush();
     void close();

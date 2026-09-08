@@ -2,6 +2,9 @@
 #include "debug.h"
 
 #include <new>
+#include <dirent.h>
+#include <algorithm>
+#include <stdlib.h>
 
 
 
@@ -171,6 +174,21 @@ bool BSeries::bindHeader(ENTRY *entry, uint32_t key){
 /// ===========================================================================
 
 
+/// Copies a diagnostic label, truncating rather than failing. The name only ever
+/// appears in log messages, so a long one being cut short costs nothing.
+
+static void copyDefinitionName(char *destination, size_t size, const char *source){
+
+    size_t length = strlen(source);
+
+    if(length > size - 1)
+        length = size - 1;
+
+    memcpy(destination,source,length);
+    destination[length] = 0;
+}
+
+
 /// Parses "1234", "1000-1999" or "*" into an inclusive key range.
 
 static bool parseKeyRange(const char *text, uint32_t *first, uint32_t *last){
@@ -276,10 +294,8 @@ int BSeries::defineSeries(uint32_t key_first, uint32_t key_last, uint32_t interv
     def.datasize = datasize;
     def.null_fill_byte = (null_fill_byte < 0) ? bsTypeNullFill(datatype,datasize) : (unsigned char)null_fill_byte;
 
-    if(name != NULL){
-        strncpy(def.name,name,sizeof(def.name)-1);
-        def.name[sizeof(def.name)-1] = 0;
-    }
+    if(name != NULL)
+        copyDefinitionName(def.name,sizeof(def.name),name);
 
     definitions_access.lock();
     definitions.push_back(def);
@@ -407,8 +423,7 @@ int BSeries::loadDefinitions(const char *path){
         def.datasize = datasize;
         def.null_fill_byte = (null_fill < 0) ? bsTypeNullFill(datatype,datasize) : (unsigned char)null_fill;
 
-        strncpy(def.name,name,sizeof(def.name)-1);
-        def.name[sizeof(def.name)-1] = 0;
+        copyDefinitionName(def.name,sizeof(def.name),name);
 
         parsed.push_back(def);
     }
@@ -539,7 +554,7 @@ bool BSeries::flushBuffer(ENTRY *series,FILE *file){
     // Write are buffer to the file
     size_t size = fwrite(series->write_ahead_cache,series->datasize,write_ahead_size,file); // Write the data point
 
-    if(size != write_ahead_size){
+    if(size != (size_t)write_ahead_size){
         _ERROR("\t Failed to flush write ahead buffer to file");
         return false;
     }
@@ -1263,6 +1278,235 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
 }
 
 
+
+
+
+
+/// ===========================================================================
+/// Series lifecycle
+/// ===========================================================================
+
+
+/// Lays down a header for a series that does not exist yet, with an explicit shape
+/// rather than one inferred from a write. Fails with SERIES_ALREADY_EXISTS rather
+/// than touching a series that is already on disk, because rewriting a header
+/// would misaddress every point already stored under the old one.
+
+int BSeries::createSeriesFile(uint32_t key, uint32_t interval, uint8_t datatype, uint8_t datasize, uint32_t start_timestamp){
+
+    if(shuttingDown)
+        return INTERNAL_ERROR;
+
+    if(interval == 0 || !bsTypeValid(datatype,datasize))
+        return INVALID_SERIES_DEFINITION;
+
+    ENTRY *series;
+
+    index_access.lock();
+    series = &series_list[key];
+    series->access.lock();
+    index_access.unlock();
+
+    int status = NO_ERROR;
+    FILE *file = NULL;
+
+    do {
+
+        file = openFile(key,false); // probe without creating
+
+        if(file != NULL){
+            status = SERIES_ALREADY_EXISTS;
+            break;
+        }
+
+        file = openFile(key,true);
+
+        if(file == NULL){
+            _ERROR("\t Could not create series %u\n",key);
+            status = FILE_OPEN_FAILURE;
+            break;
+        }
+
+        SERIES header;
+        memset(&header,0,sizeof(header));
+
+        header.version = SERIES_VERSION_TYPED;
+        header.timestamp = start_timestamp ? start_timestamp : (uint32_t)time(NULL);
+        header.interval = interval;
+        header.typecode = bsPackTypeCode(datatype,datasize);
+        header.checksum = getChecksum(&header);
+
+        fseek(file,0,SEEK_SET);
+
+        if(fwrite((char*)&header,sizeof(header),1,file) != 1){
+            _ERROR("\t Could not write the header for series %u\n",key);
+            status = CREATE_NEW_HEADER_FAIL;
+            break;
+        }
+
+        series->header = header;
+
+        if(!bindHeader(series,key)){
+            status = SERIES_TYPE_MISMATCH;
+            break;
+        }
+
+        fseek(file,0,SEEK_END);
+        series->file_size = ftell(file);
+
+    } while(false);
+
+    if(file != NULL)
+        fclose(file);
+
+    series->access.unlock();
+
+    return status;
+}
+
+
+/// Drops a series from memory and unlinks its file.
+///
+/// The write ahead cache is freed without being flushed: the points in it are being
+/// deleted along with everything else. A write racing this call can recreate the
+/// series immediately afterwards, which is inherent to deleting something another
+/// thread is still writing to.
+
+int BSeries::deleteSeries(uint32_t key){
+
+    if(shuttingDown)
+        return INTERNAL_ERROR;
+
+    char filename[256];
+
+    if(snprintf(filename,sizeof(filename),"%s/%lu",data_directory,(unsigned long)key) >= (int)sizeof(filename)){
+        _ERROR("\t Path for key %lu does not fit in the filename buffer\n",(unsigned long)key);
+        return INTERNAL_ERROR;
+    }
+
+    index_access.lock();
+
+    map<uint32_t,ENTRY>::iterator it = series_list.find(key);
+
+    if(it != series_list.end()){
+
+        // Everyone takes the entry lock while holding index_access, so blocking
+        // here cannot deadlock and nobody can be waiting on this entry once we
+        // hold it. That makes the erase below safe.
+        it->second.access.lock();
+
+        if(it->second.write_ahead_cache != NULL){
+            free(it->second.write_ahead_cache);
+            it->second.write_ahead_cache = NULL;
+        }
+
+        it->second.access.unlock();
+
+        series_list.erase(it);
+    }
+
+    index_access.unlock();
+
+    if(remove(filename) != 0)
+        return SERIES_NOT_FOUND;
+
+    return NO_ERROR;
+}
+
+
+/// Reads a header straight from disk without touching series_list, so probing keys
+/// that do not exist cannot grow the in memory index. Callers exposing this over a
+/// network want exactly that.
+
+int BSeries::seriesInfo(uint32_t key, SERIES *header, int64_t *file_size){
+
+    FILE *file = openFile(key,false);
+
+    if(file == NULL)
+        return SERIES_NOT_FOUND;
+
+    int status = NO_ERROR;
+
+    do {
+
+        if(fread((char*)header,sizeof(SERIES),1,file) != 1){
+            status = FAILED_TO_READ_HEADER;
+            break;
+        }
+
+        if(header->checksum != getChecksum(header)){
+            status = INVALID_HEADER_CHECKSUM;
+            break;
+        }
+
+        if(file_size != NULL){
+            fseek(file,0,SEEK_END);
+            *file_size = ftell(file);
+        }
+
+    } while(false);
+
+    fclose(file);
+
+    return status;
+}
+
+
+/// Lists the series present in data_directory, in ascending key order, starting
+/// after the given key. Returns the number of keys appended to the vector.
+///
+/// This walks the directory on every call. It is meant for administration, not for
+/// a hot path.
+
+int BSeries::listSeriesKeys(vector<uint32_t> *keys, uint32_t after, int limit){
+
+    if(keys == NULL || limit <= 0)
+        return 0;
+
+    DIR *dir = opendir(data_directory);
+
+    if(dir == NULL){
+        _ERROR("Could not open the data directory %s\n",data_directory);
+        return FAILED_TO_OPEN_FILE;
+    }
+
+    vector<uint32_t> found;
+    struct dirent *entry;
+
+    while((entry = readdir(dir)) != NULL){
+
+        // Series files are named for their key and nothing else, so anything that
+        // is not a plain unsigned number is somebody else's file.
+        const char *name = entry->d_name;
+
+        if(name[0] == 0)
+            continue;
+
+        char *end = NULL;
+        unsigned long value = strtoul(name,&end,10);
+
+        if(end == name || *end != 0 || value > 0xFFFFFFFFuL)
+            continue;
+
+        if(after != 0 && value <= after)
+            continue;
+
+        found.push_back((uint32_t)value);
+    }
+
+    closedir(dir);
+
+    sort(found.begin(),found.end());
+
+    int count = 0;
+
+    for(size_t i = 0; i < found.size() && count < limit; i++){
+        keys->push_back(found[i]);
+        count++;
+    }
+
+    return count;
+}
 
 
 

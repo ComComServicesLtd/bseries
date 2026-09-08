@@ -57,6 +57,78 @@ width is passed to `write()`, which is what the database did before definitions
 existed.
 
 
+## HTTP API
+
+`bseriesd` serves CRUD over HTTP. It depends on nothing but libc, pthreads and the
+POSIX socket API, so it cross compiles for arm, arm64 and x86 with no libraries to
+chase:
+
+```
+make            # builds bseriesd
+make test       # builds and runs the test suite
+bseriesd -c /etc/bseriesd.conf
+```
+
+See `bseriesd.conf.example` for the settings. Point data crosses the wire as hex,
+because a series holds raw binary of whatever width it was defined with.
+
+| Method | Path | Key | |
+|---|---|---|---|
+| GET | `/v1/health` | none | liveness |
+| GET | `/v1/series?limit=&after=` | read | list series |
+| GET | `/v1/series/{key}` | read | header and size |
+| POST | `/v1/series/{key}?type=&interval=&start=` | write | create |
+| DELETE | `/v1/series/{key}` | write | delete |
+| GET | `/v1/series/{key}/data?start=&end=` | read | read a range |
+| POST | `/v1/series/{key}/data?timestamp=` | write | write points |
+
+`start` and `end` are unix timestamps; `end` defaults to now. A write body is the
+hex of one or more consecutive points, placed at `timestamp`, `timestamp+interval`,
+and so on. `start` on create sets where the series' first point sits, which is how
+a series is prepared for a backfill — a write before the series start is refused
+rather than silently relocated.
+
+```
+$ curl -XPOST -H 'X-API-Key: $WRITE_KEY' \
+    'localhost:8086/v1/series/10500?type=float32&interval=60&start=1700000000'
+{"key":10500,"version":2,"type":"float32","datasize":4,"interval":60,...}
+
+$ curl -XPOST -H 'X-API-Key: $WRITE_KEY' --data-binary '0000a4410000aa4100000c42' \
+    'localhost:8086/v1/series/10500/data?timestamp=1700000000'
+{"key":10500,"points_written":3,"first_timestamp":1700000000,...}
+
+$ curl -H 'X-API-Key: $READ_KEY' \
+    'localhost:8086/v1/series/10500/data?start=1700000000&end=1700000300'
+{"key":10500,"type":"float32","interval":60,"n_points":5,"real_points":3,
+ "null_fill":"ffffffff","data":"0000a4410000aa4100000c42ffffffffffffffff"}
+```
+
+### Gaps in a response
+
+`data` is the raw series content, so the points where nothing was recorded hold the
+series' null fill. Every response carries `null_fill` as a hex pattern one point
+wide — compare each point against it to find the gaps. In the example above the
+last two points are gaps.
+
+The consequence is worth being explicit about: **a real reading equal to the fill
+is indistinguishable from a gap.** For float series the fill is a NaN and nothing
+is lost. For integer series pick a fill your data cannot produce, in the series
+definitions file. `real_points` counts the points that differ from the fill.
+
+### Authentication and CORS
+
+Keys go in `X-API-Key` (`Authorization: Bearer` also works). `read_key` may call
+the GET endpoints, `write_key` may call everything; they must differ, and an unset
+key disables that level of access. Keys are compared in constant time.
+
+`cors_origin` in the config allows a browser origin, and may be repeated; a single
+`*` allows any. With no `cors_origin` line no CORS headers are sent, which blocks
+browser callers and is the right default when the clients are server side.
+
+There is no TLS. Bind to localhost or a trusted interface, and put a reverse proxy
+in front for anything else.
+
+
 ## Gaps
 
 Series are dense: every interval between the first and last point occupies space in
