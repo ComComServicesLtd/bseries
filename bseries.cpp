@@ -347,11 +347,18 @@ bool BSeries::definitionForKey(uint32_t key, SERIES_DEFINITION *out){
 /// (uint8, int32, float32, ...). null_fill optionally overrides the default fill
 /// byte for the type. Everything after a # is a comment.
 ///
+/// A "table <name>" line switches which table the definitions after it belong to.
+/// Definitions before any such line belong to the table named "default". When table
+/// is given only that table's definitions are installed; pass NULL to install every
+/// definition in the file, which is what a single table database wants.
+///
 /// Returns the number of definitions loaded, or a negative error code. A malformed
 /// line fails the whole load rather than being skipped: a typo in a database's type
-/// configuration must not quietly change how points are stored.
+/// configuration must not quietly change how points are stored. That check runs on
+/// every line, not only the ones being installed, so a typo under one table is
+/// still reported when a different table is loaded.
 
-int BSeries::loadDefinitions(const char *path){
+int BSeries::loadDefinitions(const char *path, const char *table){
 
     FILE *file = fopen(path,"r");
 
@@ -364,6 +371,7 @@ int BSeries::loadDefinitions(const char *path){
     char line[512];
     int line_number = 0;
     int status = NO_ERROR;
+    string current_table = "default";
 
     while(fgets(line,sizeof(line),file) != NULL){
 
@@ -379,6 +387,20 @@ int BSeries::loadDefinitions(const char *path){
 
         if(fields <= 0) // blank line, or a line that was nothing but a comment
             continue;
+
+        if(strcmp(name,"table") == 0){
+
+            if(fields != 2){
+                _ERROR("%s line %d: expected 'table <name>'\n",path,line_number);
+                status = INVALID_SERIES_DEFINITION;
+                break;
+            }
+
+            current_table = keys; // the second token holds the table name
+            continue;
+        }
+
+        bool wanted = (table == NULL) || (current_table == table);
 
         if(fields < 4){
             _ERROR("%s line %d: expected <name> <keys> <interval> <type> [null_fill]\n",path,line_number);
@@ -432,7 +454,8 @@ int BSeries::loadDefinitions(const char *path){
 
         copyDefinitionName(def.name,sizeof(def.name),name);
 
-        parsed.push_back(def);
+        if(wanted)
+            parsed.push_back(def);
     }
 
     fclose(file);

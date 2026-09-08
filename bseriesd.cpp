@@ -11,10 +11,13 @@
 #include <time.h>
 #include <thread>
 #include <atomic>
+#include <vector>
+#include <string>
 
 #include "bseries.h"
 #include "bseries_api.h"
 #include "http_server.h"
+#include "table_set.h"
 
 
 static HttpServer *g_server = NULL;
@@ -33,7 +36,7 @@ static void handleSignal(int number){
 /// server holds an entry, and a write ahead buffer, for every key it has ever
 /// touched, and buffered points sit in memory indefinitely.
 
-static void maintenanceThread(BSeries *db, int idle_seconds, int interval_seconds){
+static void maintenanceThread(TableSet *tables, int idle_seconds, int interval_seconds){
 
     if(idle_seconds <= 0 || interval_seconds <= 0)
         return;
@@ -48,7 +51,7 @@ static void maintenanceThread(BSeries *db, int idle_seconds, int interval_second
         if(g_stopping.load())
             break;
 
-        db->closeSeries((uint32_t)idle_seconds);
+        tables->maintain((uint32_t)idle_seconds);
     }
 }
 
@@ -113,26 +116,31 @@ int main(int argc, char **argv){
     if(config.write_key.empty())
         fprintf(stderr,"bseriesd: no write_key set, the API is read only\n");
 
-    BSeries db;
-    db.data_directory = config.data_directory.c_str();
-    db.write_ahead_size = config.write_ahead_size;
-    db.default_seconds_per_point = config.default_interval;
-    db.max_grow_points = config.max_grow_points;
+    TableSet tables;
+    tables.configure(config.data_directory,config.write_ahead_size,config.default_interval,config.max_grow_points);
+    tables.auto_create = config.auto_create_tables;
 
     if(!config.definitions_path.empty()){
 
-        int loaded = db.loadDefinitions(config.definitions_path.c_str());
+        std::string error;
+        int loaded = tables.loadDefinitions(config.definitions_path.c_str(),&error);
 
         if(loaded < 0){
-            fprintf(stderr,"bseriesd: could not load series definitions from %s\n",config.definitions_path.c_str());
-            db.close();
+            fprintf(stderr,"bseriesd: %s\n",error.c_str());
+            tables.closeAll();
             return 1;
         }
 
         fprintf(stderr,"bseriesd: loaded %d series definitions\n",loaded);
     }
 
-    BSeriesApi api(&db,&config);
+    {
+        std::vector<std::string> names;
+        tables.list(&names);
+        fprintf(stderr,"bseriesd: %lu table%s\n",(unsigned long)names.size(),names.size() == 1 ? "" : "s");
+    }
+
+    BSeriesApi api(&tables,&config);
 
     HttpServer server;
     server.max_connections = config.max_connections;
@@ -144,14 +152,14 @@ int main(int argc, char **argv){
     signal(SIGTERM,handleSignal);
 
     if(!server.start(config.bind_address.c_str(),config.port)){
-        db.close();
+        tables.closeAll();
         return 1;
     }
 
     fprintf(stderr,"bseriesd: listening on %s port %d, data in %s\n",
             config.bind_address.c_str(),config.port,config.data_directory.c_str());
 
-    std::thread maintenance(maintenanceThread,&db,config.series_max_idle_seconds,config.maintenance_interval_seconds);
+    std::thread maintenance(maintenanceThread,&tables,config.series_max_idle_seconds,config.maintenance_interval_seconds);
 
     server.run(BSeriesApi::handle,&api);
 
@@ -160,7 +168,7 @@ int main(int argc, char **argv){
 
     fprintf(stderr,"bseriesd: shutting down\n");
 
-    db.close(); // flushes every write ahead buffer to disk
+    tables.closeAll(); // flushes every table's write ahead buffers to disk
 
     return 0;
 }

@@ -3,6 +3,7 @@
 
 #include "bseries.h"
 #include "bseries_api.h"
+#include "table_set.h"
 #include "http_server.h"
 #include "test_util.h"
 #include <time.h>
@@ -157,11 +158,10 @@ int main(int argc, char **argv){
     config.default_interval = 10;
     config.condense_window_points = 64;   // small, so condensing crosses many windows
 
-    BSeries db;
-    db.data_directory = dir;
-    db.default_seconds_per_point = config.default_interval;
+    TableSet tables;
+    tables.configure(dir,4096,config.default_interval,1000000);
 
-    BSeriesApi api(&db,&config);
+    BSeriesApi api(&tables,&config);
 
     HttpServer server;
     server.max_body_bytes = config.max_body_bytes;
@@ -652,7 +652,84 @@ int main(int argc, char **argv){
         CHECK(r.status==413 && bodyHas(r,"max_points"), "a huge raw range is refused and suggests condensing");
     }
 
-    printf("[14] method handling\n");
+    printf("[14] tables\n");
+    {
+        REPLY r = request("GET","/v1/tables","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"default\""), "the data directory itself is the default table");
+
+        r = request("POST","/v1/tables/network","read-write-key");
+        CHECK(r.status==201 && bodyHas(r,"\"created\":true"), "create a table");
+        r = request("POST","/v1/tables/network","read-write-key");
+        CHECK(r.status==409 && bodyHas(r,"table_exists"), "creating it twice is 409");
+        r = request("GET","/v1/tables","read-only-key");
+        CHECK(bodyHas(r,"\"network\"") && bodyHas(r,"\"count\":2"), "it is listed");
+
+        // the same key in two tables is two different series
+        r = request("POST","/v1/network/series/1?type=float32&interval=60&start=1700000000","read-write-key");
+        CHECK(r.status==201, "create series 1 in network");
+        r = request("POST","/v1/network/data","read-write-key","1 1700000000 0000a441\n");
+        CHECK(r.status==200, "write to network series 1");
+        r = request("GET","/v1/network/series/1/data?start=1700000000&end=1700000120","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"data\":\"0000a441ffffffff\""), "read it back from network");
+
+        r = request("POST","/v1/tables/power","read-write-key");
+        CHECK(r.status==201, "create a second table");
+        r = request("GET","/v1/power/series/1","read-only-key");
+        CHECK(r.status==404 && bodyHas(r,"series_not_found"), "series 1 in power is a different series");
+
+        // the unqualified paths still address the default table
+        r = request("GET","/v1/series/10500","read-only-key");
+        CHECK(r.status==200, "the legacy path still works");
+        r = request("GET","/v1/default/series/10500","read-only-key");
+        CHECK(r.status==200, "and names the same series through the default table");
+        r = request("GET","/v1/network/series/10500","read-only-key");
+        CHECK(r.status==404, "which is not the same series as in another table");
+
+        // unknown tables
+        r = request("GET","/v1/nosuchtable/series","read-only-key");
+        CHECK(r.status==404 && bodyHas(r,"table_not_found"), "an unknown table is 404");
+        r = request("POST","/v1/nosuchtable/data","read-write-key","1 1700000000 0a\n");
+        CHECK(r.status==404 && bodyHas(r,"table_not_found"), "and a write to one does not create it");
+
+        // a table name is a directory name, so it must not be able to escape
+        const char *escapes[] = {
+            "/v1/../series", "/v1/..%2f..%2fetc/series", "/v1/.%2e/series",
+            "/v1/a%2fb/series", "/v1/%2e%2e/series", "/v1/foo.bar/series",
+            "/v1/-lead/series", "/v1/9numeric/series"
+        };
+        for(unsigned i=0;i<sizeof(escapes)/sizeof(escapes[0]);i++){
+            r = request("GET",escapes[i],"read-only-key");
+            char msg[160];
+            snprintf(msg,sizeof(msg),"refused: %s",escapes[i]);
+            CHECK(r.status==400 || r.status==404, msg);
+        }
+
+        r = request("POST","/v1/tables/data","read-write-key");
+        CHECK(r.status==400 && bodyHas(r,"reserved"), "an endpoint name cannot be a table");
+        r = request("POST","/v1/tables/health","read-write-key");
+        CHECK(r.status==400, "nor can health");
+
+        // dropping
+        r = request("DELETE","/v1/tables/power","read-write-key");
+        CHECK(r.status==200 && bodyHas(r,"\"dropped\":true"), "an empty table drops");
+        r = request("DELETE","/v1/tables/network","read-write-key");
+        CHECK(r.status==409 && bodyHas(r,"table_not_empty"), "one holding series does not");
+        r = request("GET","/v1/network/series/1","read-only-key");
+        CHECK(r.status==200, "and its series survived the refusal");
+        r = request("DELETE","/v1/tables/network?force=1","read-write-key");
+        CHECK(r.status==200, "force drops it with its series");
+        r = request("GET","/v1/network/series","read-only-key");
+        CHECK(r.status==404, "and it is gone");
+        r = request("DELETE","/v1/tables/default?force=1","read-write-key");
+        CHECK(r.status==400, "the default table cannot be dropped, it is the data directory");
+
+        r = request("GET","/v1/tables/network","read-only-key");
+        CHECK(r.status==404, "info on a dropped table is 404");
+        r = request("POST","/v1/tables/network","read-only-key");
+        CHECK(r.status==403, "creating a table needs the write key");
+    }
+
+    printf("[15] method handling\n");
     {
         REPLY r = request("DELETE","/v1/series","read-write-key");
         CHECK(r.status==405, "DELETE on the collection is 405");
@@ -662,7 +739,7 @@ int main(int argc, char **argv){
 
     server.stop();
     serving.join();
-    db.close();
+    tables.closeAll();
 
     return testReport();
 }

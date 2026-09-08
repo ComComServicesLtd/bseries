@@ -18,6 +18,17 @@ port                  8086
 data_directory        /var/lib/bseries
 definitions           /etc/bseries.conf   # series interval and type declarations
 
+# A table is a directory of series files under data_directory, giving each set of
+# series its own key namespace. The table named "default" is data_directory
+# itself, which is what keeps a database written before tables existed working
+# without moving a file.
+#
+# Tables must be created through the API before they can be written to. Turn this
+# on to have a write to an unknown table create it instead; off by default so a
+# typo in a table name cannot quietly fork the data.
+
+auto_create_tables    0
+
 write_ahead_size      4096          # points buffered per series before a disk write
 default_interval      10            # seconds per point for keys with no definition
 

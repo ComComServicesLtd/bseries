@@ -180,7 +180,11 @@ public:
     /// but a reload cannot retype series that already exist on disk.
 
     int defineSeries(uint32_t key_first, uint32_t key_last, uint32_t interval, uint8_t datatype, uint8_t datasize, const char *name = NULL, int null_fill_byte = -1);
-    int loadDefinitions(const char *path);
+    /// table selects which of the file's tables to install. A "table <name>"
+    /// line switches which table the definitions after it belong to; those before
+    /// any such line belong to "default". Pass NULL to install every definition
+    /// in the file regardless, which is what a single table database wants.
+    int loadDefinitions(const char *path, const char *table = NULL);
     bool definitionForKey(uint32_t key, SERIES_DEFINITION *out);
     void clearDefinitions();
 

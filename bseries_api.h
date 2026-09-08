@@ -6,6 +6,7 @@
 
 #include "bseries.h"
 #include "http_server.h"
+#include "table_set.h"
 
 
 /// HTTP CRUD interface to a BSeries database.
@@ -31,6 +32,11 @@ typedef struct {
 
     std::string data_directory;
     std::string definitions_path;
+
+    /// When false, a write to a table that does not exist is a 404 rather than a
+    /// new table. Off by default: a typo in a table name should not quietly fork
+    /// a database's data into a second copy nobody is reading.
+    bool auto_create_tables;
 
     /// read_key may call the GET endpoints. write_key may call everything.
     /// An empty key disables that level of access entirely.
@@ -69,44 +75,60 @@ void apiConfigDefaults(API_CONFIG *config);
 int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out);
 
 
+/// HTTP interface to a set of tables.
+///
+/// Every data path is rooted at a table: /v1/<table>/series, /v1/<table>/data and
+/// so on. The unqualified paths that predate tables still work and address the
+/// table named "default", which is the data directory itself.
+
 class BSeriesApi
 {
 public:
-    BSeriesApi(BSeries *database, const API_CONFIG *config);
+    BSeriesApi(TableSet *table_set, const API_CONFIG *config);
 
     /// The HTTP_HANDLER entry point. Pass the BSeriesApi instance as context.
     static void handle(const HTTP_REQUEST &request, HTTP_RESPONSE &response, void *context);
 
-    BSeries *db;
+    TableSet *tables;
     API_CONFIG config;
 
 private:
     void route(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void routeTable(BSeries *db, const std::vector<std::string> &rest, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+
+    /// Resolves a table name to its database, answering the request with the right
+    /// error and returning NULL when it cannot.
+    BSeries *resolveTable(const std::string &name, bool for_write, HTTP_RESPONSE &response);
+
+    void handleListTables(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void handleTableInfo(const std::string &name, HTTP_RESPONSE &response);
+    void handleCreateTable(const std::string &name, HTTP_RESPONSE &response);
+    void handleDropTable(const std::string &name, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
     bool authorise(const HTTP_REQUEST &request, bool needs_write, HTTP_RESPONSE &response);
     void applyCors(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
     void handleHealth(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
-    void handleListSeries(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
-    void handleSeriesInfo(uint32_t key, HTTP_RESPONSE &response);
-    void handleCreateSeries(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
-    void handleDeleteSeries(uint32_t key, HTTP_RESPONSE &response);
-    void handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
-    void handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void handleListSeries(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void handleSeriesInfo(BSeries *db, uint32_t key, HTTP_RESPONSE &response);
+    void handleCreateSeries(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void handleDeleteSeries(BSeries *db, uint32_t key, HTTP_RESPONSE &response);
+    void handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
-    int streamSeriesData(uint32_t key, long long start_time, long long end_time, HttpStream *stream);
-    int streamCondensedSeries(uint32_t key, long long start_time, long long end_time,
+    int streamSeriesData(BSeries *db, uint32_t key, long long start_time, long long end_time, HttpStream *stream);
+    int streamCondensedSeries(BSeries *db, uint32_t key, long long start_time, long long end_time,
                               int mode, long long max_points, HttpStream *stream, long long *scanned_out);
     bool readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE &response, int *mode, long long *max_points);
     bool readTimeRange(const HTTP_REQUEST &request, HTTP_RESPONSE &response, long long *start_time, long long *end_time);
-    int64_t pointsInRange(uint32_t key, long long start_time, long long end_time);
-    void handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
-    void handleBatchWrite(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
-    void handleWriteNow(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    int64_t pointsInRange(BSeries *db, uint32_t key, long long start_time, long long end_time);
+    void handleWriteData(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void handleBatchWrite(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void handleWriteNow(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
-    bool resolveWriteShape(uint32_t key, size_t body_bytes, uint32_t *datasize, int64_t *interval, std::string *error);
-    int writePoints(uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written, int64_t *overwritten = NULL);
-    bool nearestSlotTime(uint32_t key, long long when, long long *slot_time);
+    bool resolveWriteShape(BSeries *db, uint32_t key, size_t body_bytes, uint32_t *datasize, int64_t *interval, std::string *error);
+    int writePoints(BSeries *db, uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written, int64_t *overwritten = NULL);
+    bool nearestSlotTime(BSeries *db, uint32_t key, long long when, long long *slot_time);
 };
 
 

@@ -72,17 +72,24 @@ bseriesd -c /etc/bseriesd.conf
 See `bseriesd.conf.example` for the settings. Point data crosses the wire as hex,
 because a series holds raw binary of whatever width it was defined with.
 
+Every data path is rooted at a table (see **Tables** below); `{t}` stands for the
+table name.
+
 | Method | Path | Key | |
 |---|---|---|---|
 | GET | `/v1/health` | none | liveness |
-| GET | `/v1/series?keys=` or `?limit=&after=` | read | list series |
-| GET | `/v1/series/{key}` | read | header and size |
-| POST | `/v1/series/{key}?type=&interval=&start=` | write | create |
-| DELETE | `/v1/series/{key}` | write | delete |
-| GET | `/v1/series/{key}/data?start=&end=` | read | read a range |
-| GET | `/v1/data?keys=&start=&end=` | read | read a range across several series |
-| POST | `/v1/data` | write | write points to several series |
-| POST | `/v1/now` | write | push one reading into every series, at the nearest slot |
+| GET | `/v1/tables` | read | list tables |
+| GET | `/v1/tables/{t}` | read | table info |
+| POST | `/v1/tables/{t}` | write | create a table |
+| DELETE | `/v1/tables/{t}?force=` | write | drop a table |
+| GET | `/v1/{t}/series?keys=` or `?limit=&after=` | read | list series |
+| GET | `/v1/{t}/series/{key}` | read | header and size |
+| POST | `/v1/{t}/series/{key}?type=&interval=&start=` | write | create |
+| DELETE | `/v1/{t}/series/{key}` | write | delete |
+| GET | `/v1/{t}/series/{key}/data?start=&end=` | read | read a range |
+| GET | `/v1/{t}/data?keys=&start=&end=` | read | read a range across several series |
+| POST | `/v1/{t}/data` | write | write points to several series |
+| POST | `/v1/{t}/now` | write | push one reading into every series, at the nearest slot |
 | POST | `/v1/series/{key}/data?timestamp=` | write | write points |
 
 `start` and `end` are unix timestamps; `end` defaults to now. A write body is the
@@ -105,6 +112,74 @@ $ curl -H 'X-API-Key: $READ_KEY' \
 {"key":10500,"type":"float32","interval":60,"n_points":5,"real_points":3,
  "null_fill":"ffffffff","data":"0000a4410000aa4100000c42ffffffffffffffff"}
 ```
+
+### Tables
+
+A table is an independent namespace of series, so one database can hold several
+unrelated collections without their keys colliding: device 1 in `network` and
+device 1 in `power` are different series with different intervals and types.
+
+On disk a table is exactly a directory of series files. Nothing about the storage
+format changes — a table is a place, not a new kind of thing.
+
+```
+$ curl -XPOST -H 'X-API-Key: $WRITE_KEY' localhost:8086/v1/tables/network
+{"table":"network","created":true}
+
+$ curl -H 'X-API-Key: $READ_KEY' localhost:8086/v1/tables
+{"tables":["default","network","power"],"count":3}
+```
+
+**The table named `default` is the data directory itself**, not a subdirectory of
+it. That is what lets a database written before tables existed keep working
+untouched: its files stay where they are, and the unqualified paths
+(`/v1/series/...`, `/v1/data`, `/v1/now`) still work and address that table.
+`/v1/default/series/5` and `/v1/series/5` are the same series.
+
+```
+data/5                  the default table, which is the root
+data/network/1          table "network"
+data/power/1            table "power"
+```
+
+Tables must be created before they can be written to; a write to an unknown table
+is a 404 rather than a new table, so a typo in a table name cannot quietly fork a
+database's data into a second copy nobody is reading. Set `auto_create_tables 1`
+in the config if you would rather have the convenience.
+
+Dropping a table refuses while it still holds series. `force=1` deletes them with
+it, and is the only way to destroy data through that endpoint. The default table
+cannot be dropped, since it is the data directory.
+
+A table name must start with a letter and continue with letters, digits,
+underscore or hyphen, at most 64 characters. The leading letter is not cosmetic:
+the default table is the root directory, so an all digit name would create a
+directory that the default table's own series listing would mistake for a series
+file. The character set also makes the name safe as a path component, which matters
+because it arrives from a URL — `..`, `/` and their percent encoded forms are all
+refused. `health`, `tables`, `series`, `data` and `now` are reserved.
+
+### Definitions per table
+
+A `table` line in the definitions file switches which table the definitions after
+it belong to. Those before any such line belong to `default`:
+
+```
+legacy      1-99        10s  uint8      # the default table
+
+table network
+ping        1-9999      1s   uint8
+latency     10000-19999 60s  float32
+
+table power
+draw        1-999       10s  uint32
+```
+
+Key ranges may overlap between tables, since the tables are independent: key 1 is a
+1 second `uint8` in `network` and a 10 second `uint32` in `power`.
+
+A malformed line fails the whole load whichever table is being read, so a typo
+under one table is reported rather than waiting until that table is first used.
 
 ### Selecting series
 

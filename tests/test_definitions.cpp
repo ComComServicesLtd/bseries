@@ -159,5 +159,60 @@ int main(int argc,char**argv){
         db.close();
     }
 
+    printf("[H] per table definitions\n");
+    {
+        char path[512];
+        snprintf(path,sizeof(path),"%s/tables.conf",dir);
+        FILE *f = fopen(path,"w");
+        fputs("legacy  1-99        10s  uint8\n",f);       // before any table line
+        fputs("table network\n",f);
+        fputs("ping    1-9999      1s   uint8\n",f);
+        fputs("table power\n",f);
+        fputs("draw    1-999       10s  uint32\n",f);
+        fclose(f);
+
+        SERIES_DEFINITION d;
+
+        BSeries a; a.data_directory = dir;
+        CHECK(a.loadDefinitions(path,"default")==1, "the default table gets the leading definitions only");
+        CHECK(a.definitionForKey(50,&d) && d.interval==10 && d.datasize==1, "and they are the right ones");
+        CHECK(!a.definitionForKey(5000,NULL), "network's definitions are not installed in default");
+        a.close();
+
+        BSeries b; b.data_directory = dir;
+        CHECK(b.loadDefinitions(path,"network")==1, "network gets its own");
+        CHECK(b.definitionForKey(5000,&d) && d.interval==1 && d.datatype==BS_UNSIGNED && d.datasize==1, "1s uint8 there");
+        b.close();
+
+        BSeries c; c.data_directory = dir;
+        CHECK(c.loadDefinitions(path,"power")==1, "power gets its own");
+        CHECK(c.definitionForKey(500,&d) && d.interval==10 && d.datasize==4, "10s uint32 for an overlapping key range");
+        c.close();
+
+        BSeries e; e.data_directory = dir;
+        CHECK(e.loadDefinitions(path)==3, "no table filter installs every definition");
+        e.close();
+
+        // a typo under one table is reported even when another is being loaded
+        snprintf(path,sizeof(path),"%s/bad_table.conf",dir);
+        f = fopen(path,"w");
+        fputs("table network\n",f);
+        fputs("ping 1-9999 1s uint8\n",f);
+        fputs("table power\n",f);
+        fputs("draw 1-999 10s notatype\n",f);
+        fclose(f);
+        BSeries g; g.data_directory = dir;
+        CHECK(g.loadDefinitions(path,"network")<0, "a bad line under another table still fails the load");
+        g.close();
+
+        snprintf(path,sizeof(path),"%s/bad_directive.conf",dir);
+        f = fopen(path,"w");
+        fputs("table\n",f);
+        fclose(f);
+        BSeries h; h.data_directory = dir;
+        CHECK(h.loadDefinitions(path,"default")<0, "a table line with no name is refused");
+        h.close();
+    }
+
     return testReport();
 }

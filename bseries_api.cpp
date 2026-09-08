@@ -516,6 +516,7 @@ void apiConfigDefaults(API_CONFIG *config){
     config->max_grow_points = 1000000;
     config->max_condense_scan = 50000000;
     config->condense_window_points = 262144;
+    config->auto_create_tables = false;
     config->max_body_bytes = 1024 * 1024;
     config->max_connections = 64;
     config->write_ahead_size = 4096;
@@ -582,6 +583,7 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out){
         else if(key == "max_grow_points"          && parseUnsigned(text,&number)) config->max_grow_points = (int)number;
         else if(key == "max_condense_scan"        && parseUnsigned(text,&number)) config->max_condense_scan = (int)number;
         else if(key == "condense_window"          && parseUnsigned(text,&number)) config->condense_window_points = (int)number;
+        else if(key == "auto_create_tables"       && parseUnsigned(text,&number)) config->auto_create_tables = (number != 0);
         else if(key == "max_body_bytes"           && parseUnsigned(text,&number)) config->max_body_bytes = (int)number;
         else if(key == "max_connections"          && parseUnsigned(text,&number)) config->max_connections = (int)number;
         else if(key == "write_ahead_size"         && parseUnsigned(text,&number)) config->write_ahead_size = (int)number;
@@ -607,9 +609,9 @@ int apiLoadConfig(const char *path, API_CONFIG *config, std::string *error_out){
 // API
 // ===========================================================================
 
-BSeriesApi::BSeriesApi(BSeries *database, const API_CONFIG *configuration)
+BSeriesApi::BSeriesApi(TableSet *table_set, const API_CONFIG *configuration)
 {
-    db = database;
+    tables = table_set;
     config = *configuration;
 }
 
@@ -717,6 +719,297 @@ bool BSeriesApi::authorise(const HTTP_REQUEST &request, bool needs_write, HTTP_R
 }
 
 
+/// Resolves a table name to its database.
+///
+/// A write to a table that does not exist is a 404 unless auto_create_tables is
+/// on, so a typo in a table name cannot quietly start a second copy of a
+/// database that nobody is reading from.
+
+BSeries *BSeriesApi::resolveTable(const std::string &name, bool for_write, HTTP_RESPONSE &response){
+
+    std::string error;
+
+    if(!TableSet::validName(name,&error)){
+        jsonError(response,400,"bad_table",error);
+        return NULL;
+    }
+
+    BSeries *db = tables->open(name);
+
+    if(db != NULL)
+        return db;
+
+    if(for_write && config.auto_create_tables){
+
+        int rc = tables->create(name);
+
+        if(rc == NO_ERROR || rc == SERIES_ALREADY_EXISTS)
+            db = tables->open(name);
+
+        if(db != NULL)
+            return db;
+    }
+
+    jsonError(response,404,"table_not_found",
+              "no table '" + name + "'; create it with POST /v1/tables/" + name);
+    return NULL;
+}
+
+
+void BSeriesApi::handleListTables(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+
+    (void)request;
+
+    std::vector<std::string> names;
+
+    if(tables->list(&names) < 0){
+        jsonError(response,500,"database_error","could not list tables");
+        return;
+    }
+
+    response.status = 200;
+    response.body = "{\"tables\":[";
+
+    for(size_t i = 0; i < names.size(); i++){
+
+        if(i > 0)
+            response.body += ",";
+
+        response.body += "\"" + jsonEscape(names[i]) + "\"";
+    }
+
+    char tail[64];
+    snprintf(tail,sizeof(tail),"],\"count\":%lu}",(unsigned long)names.size());
+    response.body += tail;
+}
+
+
+void BSeriesApi::handleTableInfo(const std::string &name, HTTP_RESPONSE &response){
+
+    std::string error;
+
+    if(!TableSet::validName(name,&error)){
+        jsonError(response,400,"bad_table",error);
+        return;
+    }
+
+    if(!tables->exists(name)){
+        jsonError(response,404,"table_not_found","no table '" + name + "'");
+        return;
+    }
+
+    BSeries *db = tables->open(name);
+    std::vector<uint32_t> keys;
+    int count = (db != NULL) ? db->listSeriesKeys(&keys,0,1000000) : 0;
+
+    char buffer[256];
+    snprintf(buffer,sizeof(buffer),"{\"table\":\"%s\",\"series\":%d}",
+             jsonEscape(name).c_str(), count < 0 ? 0 : count);
+
+    response.status = 200;
+    response.body = buffer;
+}
+
+
+void BSeriesApi::handleCreateTable(const std::string &name, HTTP_RESPONSE &response){
+
+    std::string error;
+
+    if(!TableSet::validName(name,&error)){
+        jsonError(response,400,"bad_table",error);
+        return;
+    }
+
+    int rc = tables->create(name);
+
+    if(rc == SERIES_ALREADY_EXISTS){
+        jsonError(response,409,"table_exists","table '" + name + "' already exists");
+        return;
+    }
+
+    if(rc != NO_ERROR){
+        jsonDatabaseError(response,rc,"creating the table");
+        return;
+    }
+
+    char buffer[192];
+    snprintf(buffer,sizeof(buffer),"{\"table\":\"%s\",\"created\":true}",jsonEscape(name).c_str());
+
+    response.status = 201;
+    response.body = buffer;
+}
+
+
+/// Dropping a table removes every series in it, so it refuses unless the table is
+/// already empty. force=1 says to remove the series too, and is the only way to
+/// destroy data through this endpoint.
+
+void BSeriesApi::handleDropTable(const std::string &name, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+
+    std::string error;
+
+    if(!TableSet::validName(name,&error)){
+        jsonError(response,400,"bad_table",error);
+        return;
+    }
+
+    if(name == DEFAULT_TABLE_NAME){
+        jsonError(response,400,"bad_table","the default table is the data directory itself and cannot be dropped");
+        return;
+    }
+
+    bool force = false;
+    std::string force_text = httpQueryParam(request,"force");
+
+    if(!force_text.empty() && force_text != "0" && force_text != "false")
+        force = true;
+
+    int rc = tables->drop(name,force);
+
+    if(rc == SERIES_NOT_FOUND){
+        jsonError(response,404,"table_not_found","no table '" + name + "'");
+        return;
+    }
+
+    if(rc == SERIES_ALREADY_EXISTS){
+        jsonError(response,409,"table_not_empty",
+                  "table '" + name + "' still holds series; pass force=1 to delete them with it");
+        return;
+    }
+
+    if(rc != NO_ERROR){
+        jsonDatabaseError(response,rc,"dropping the table");
+        return;
+    }
+
+    char buffer[192];
+    snprintf(buffer,sizeof(buffer),"{\"table\":\"%s\",\"dropped\":true}",jsonEscape(name).c_str());
+
+    response.status = 200;
+    response.body = buffer;
+}
+
+
+/// The endpoints inside one table. rest is the path after the table name.
+
+void BSeriesApi::routeTable(BSeries *db, const std::vector<std::string> &rest, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+
+    if(rest.empty()){
+        jsonError(response,404,"not_found","expected /series, /data or /now under a table");
+        return;
+    }
+
+    // <table>/now - one value per series, into the slot nearest the server clock
+    if(rest[0] == "now" && rest.size() == 1){
+
+        if(request.method != "POST" && request.method != "PUT"){
+            jsonError(response,405,"method_not_allowed","use POST to push a reading into every series");
+            return;
+        }
+
+        if(!authorise(request,true,response))
+            return;
+
+        handleWriteNow(db,request,response);
+        return;
+    }
+
+    // <table>/data - several series in one request, read or write
+    if(rest[0] == "data" && rest.size() == 1){
+
+        if(request.method == "GET"){
+            if(!authorise(request,false,response)) return;
+            handleMultiRead(db,request,response);
+            return;
+        }
+
+        if(request.method == "POST" || request.method == "PUT"){
+            if(!authorise(request,true,response)) return;
+            handleBatchWrite(db,request,response);
+            return;
+        }
+
+        jsonError(response,405,"method_not_allowed","GET to read, POST to write");
+        return;
+    }
+
+    if(rest[0] != "series"){
+        jsonError(response,404,"not_found","unknown endpoint");
+        return;
+    }
+
+    // <table>/series
+    if(rest.size() == 1){
+
+        if(request.method != "GET"){
+            jsonError(response,405,"method_not_allowed","use GET to list series");
+            return;
+        }
+
+        if(!authorise(request,false,response))
+            return;
+
+        handleListSeries(db,request,response);
+        return;
+    }
+
+    unsigned long key_value = 0;
+
+    if(!parseUnsigned(rest[1],&key_value) || key_value > 0xFFFFFFFFuL){
+        jsonError(response,400,"bad_key","a series key is an unsigned 32 bit number");
+        return;
+    }
+
+    uint32_t key = (uint32_t)key_value;
+
+    // <table>/series/{key}
+    if(rest.size() == 2){
+
+        if(request.method == "GET"){
+            if(!authorise(request,false,response)) return;
+            handleSeriesInfo(db,key,response);
+            return;
+        }
+
+        if(request.method == "POST" || request.method == "PUT"){
+            if(!authorise(request,true,response)) return;
+            handleCreateSeries(db,key,request,response);
+            return;
+        }
+
+        if(request.method == "DELETE"){
+            if(!authorise(request,true,response)) return;
+            handleDeleteSeries(db,key,response);
+            return;
+        }
+
+        jsonError(response,405,"method_not_allowed","GET, POST, PUT or DELETE");
+        return;
+    }
+
+    // <table>/series/{key}/data
+    if(rest.size() == 3 && rest[2] == "data"){
+
+        if(request.method == "GET"){
+            if(!authorise(request,false,response)) return;
+            handleReadData(db,key,request,response);
+            return;
+        }
+
+        if(request.method == "POST" || request.method == "PUT"){
+            if(!authorise(request,true,response)) return;
+            handleWriteData(db,key,request,response);
+            return;
+        }
+
+        jsonError(response,405,"method_not_allowed","GET, POST or PUT");
+        return;
+    }
+
+    jsonError(response,404,"not_found","unknown endpoint");
+}
+
+
 void BSeriesApi::route(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     applyCors(request,response);
@@ -739,115 +1032,80 @@ void BSeriesApi::route(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
         return;
     }
 
-    // /v1/now - one value per series, into the slot nearest the server clock
-    if(segments[1] == "now" && segments.size() == 2){
+    // /v1/tables - the tables themselves
+    if(segments[1] == "tables"){
 
-        if(request.method != "POST" && request.method != "PUT"){
-            jsonError(response,405,"method_not_allowed","use POST to push a reading into every series");
+        if(segments.size() == 2){
+
+            if(request.method != "GET"){
+                jsonError(response,405,"method_not_allowed","use GET to list tables");
+                return;
+            }
+
+            if(!authorise(request,false,response))
+                return;
+
+            handleListTables(request,response);
             return;
         }
 
-        if(!authorise(request,true,response))
-            return;
+        if(segments.size() == 3){
 
-        handleWriteNow(request,response);
-        return;
-    }
+            if(request.method == "GET"){
+                if(!authorise(request,false,response)) return;
+                handleTableInfo(segments[2],response);
+                return;
+            }
 
-    // /v1/data - several series in one request, read or write
-    if(segments[1] == "data" && segments.size() == 2){
+            if(request.method == "POST" || request.method == "PUT"){
+                if(!authorise(request,true,response)) return;
+                handleCreateTable(segments[2],response);
+                return;
+            }
 
-        if(request.method == "GET"){
-            if(!authorise(request,false,response)) return;
-            handleMultiRead(request,response);
+            if(request.method == "DELETE"){
+                if(!authorise(request,true,response)) return;
+                handleDropTable(segments[2],request,response);
+                return;
+            }
+
+            jsonError(response,405,"method_not_allowed","GET, POST, PUT or DELETE");
             return;
         }
 
-        if(request.method == "POST" || request.method == "PUT"){
-            if(!authorise(request,true,response)) return;
-            handleBatchWrite(request,response);
-            return;
-        }
-
-        jsonError(response,405,"method_not_allowed","GET to read, POST to write");
-        return;
-    }
-
-    if(segments[1] != "series"){
         jsonError(response,404,"not_found","unknown endpoint");
         return;
     }
 
-    // /v1/series
-    if(segments.size() == 2){
+    std::vector<std::string> rest;
+    std::string table;
 
-        if(request.method != "GET"){
-            jsonError(response,405,"method_not_allowed","use GET to list series");
-            return;
-        }
+    if(segments[1] == "series" || segments[1] == "data" || segments[1] == "now"){
 
-        if(!authorise(request,false,response))
-            return;
+        // The unqualified paths that predate tables, which address the default
+        // table. Kept so existing clients keep working against existing data.
+        table = DEFAULT_TABLE_NAME;
+        rest.assign(segments.begin() + 1,segments.end());
 
-        handleListSeries(request,response);
-        return;
+    } else {
+
+        table = segments[1];
+        rest.assign(segments.begin() + 2,segments.end());
     }
 
-    unsigned long key_value = 0;
+    // Whether this request writes decides whether an unknown table may be created
+    bool writes = (request.method == "POST" || request.method == "PUT" || request.method == "DELETE");
 
-    if(!parseUnsigned(segments[2],&key_value) || key_value > 0xFFFFFFFFuL){
-        jsonError(response,400,"bad_key","a series key is an unsigned 32 bit number");
+    BSeries *db = resolveTable(table,writes,response);
+
+    if(db == NULL)
         return;
-    }
 
-    uint32_t key = (uint32_t)key_value;
-
-    // /v1/series/{key}
-    if(segments.size() == 3){
-
-        if(request.method == "GET"){
-            if(!authorise(request,false,response)) return;
-            handleSeriesInfo(key,response);
-            return;
-        }
-
-        if(request.method == "POST" || request.method == "PUT"){
-            if(!authorise(request,true,response)) return;
-            handleCreateSeries(key,request,response);
-            return;
-        }
-
-        if(request.method == "DELETE"){
-            if(!authorise(request,true,response)) return;
-            handleDeleteSeries(key,response);
-            return;
-        }
-
-        jsonError(response,405,"method_not_allowed","GET, POST, PUT or DELETE");
-        return;
-    }
-
-    // /v1/series/{key}/data
-    if(segments.size() == 4 && segments[3] == "data"){
-
-        if(request.method == "GET"){
-            if(!authorise(request,false,response)) return;
-            handleReadData(key,request,response);
-            return;
-        }
-
-        if(request.method == "POST" || request.method == "PUT"){
-            if(!authorise(request,true,response)) return;
-            handleWriteData(key,request,response);
-            return;
-        }
-
-        jsonError(response,405,"method_not_allowed","GET, POST or PUT");
-        return;
-    }
-
-    jsonError(response,404,"not_found","unknown endpoint");
+    routeTable(db,rest,request,response);
 }
+
+
+
 
 
 void BSeriesApi::handleHealth(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
@@ -903,7 +1161,7 @@ static void appendSeriesJson(std::string &out, uint32_t key, const SERIES &heade
 }
 
 
-void BSeriesApi::handleSeriesInfo(uint32_t key, HTTP_RESPONSE &response){
+void BSeriesApi::handleSeriesInfo(BSeries *db, uint32_t key, HTTP_RESPONSE &response){
 
     SERIES header;
     int64_t file_size = 0;
@@ -920,7 +1178,7 @@ void BSeriesApi::handleSeriesInfo(uint32_t key, HTTP_RESPONSE &response){
 }
 
 
-void BSeriesApi::handleListSeries(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+void BSeriesApi::handleListSeries(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     std::vector<uint32_t> keys;
     bool selected = false;
@@ -1029,7 +1287,7 @@ void BSeriesApi::handleListSeries(const HTTP_REQUEST &request, HTTP_RESPONSE &re
 
 
 
-void BSeriesApi::handleCreateSeries(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+void BSeriesApi::handleCreateSeries(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     std::string type_text = httpQueryParam(request,"type");
     std::string interval_text = httpQueryParam(request,"interval");
@@ -1085,7 +1343,7 @@ void BSeriesApi::handleCreateSeries(uint32_t key, const HTTP_REQUEST &request, H
 }
 
 
-void BSeriesApi::handleDeleteSeries(uint32_t key, HTTP_RESPONSE &response){
+void BSeriesApi::handleDeleteSeries(BSeries *db, uint32_t key, HTTP_RESPONSE &response){
 
     int rc = db->deleteSeries(key);
 
@@ -1115,7 +1373,7 @@ void BSeriesApi::handleDeleteSeries(uint32_t key, HTTP_RESPONSE &response){
 /// Returns a database status. Nothing is written to the stream unless it is
 /// NO_ERROR, so a caller can still turn a failure into an error entry.
 
-int BSeriesApi::streamSeriesData(uint32_t key, long long start_time, long long end_time, HttpStream *stream){
+int BSeriesApi::streamSeriesData(BSeries *db, uint32_t key, long long start_time, long long end_time, HttpStream *stream){
 
     SERIES header;
     int64_t file_size = 0;
@@ -1243,7 +1501,7 @@ static void emitCondensedBucket(std::string &out, int mode, long long samples, d
 ///
 /// Returns a database status. Nothing is written unless it is NO_ERROR.
 
-int BSeriesApi::streamCondensedSeries(uint32_t key, long long start_time, long long end_time,
+int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start_time, long long end_time,
                                       int mode, long long max_points, HttpStream *stream,
                                       long long *scanned_out){
 
@@ -1577,7 +1835,7 @@ bool BSeriesApi::readTimeRange(const HTTP_REQUEST &request, HTTP_RESPONSE &respo
 
 /// How many points the range covers for one series, or 0 if it cannot be read.
 
-int64_t BSeriesApi::pointsInRange(uint32_t key, long long start_time, long long end_time){
+int64_t BSeriesApi::pointsInRange(BSeries *db, uint32_t key, long long start_time, long long end_time){
 
     SERIES header;
     int64_t file_size = 0;
@@ -1592,7 +1850,7 @@ int64_t BSeriesApi::pointsInRange(uint32_t key, long long start_time, long long 
 }
 
 
-void BSeriesApi::handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+void BSeriesApi::handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     long long start_time = 0, end_time = 0;
 
@@ -1605,7 +1863,7 @@ void BSeriesApi::handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_
     if(!readCondenseOptions(request,response,&condense_mode,&max_points))
         return;
 
-    int64_t points = pointsInRange(key,start_time,end_time);
+    int64_t points = pointsInRange(db,key,start_time,end_time);
 
     if(condense_mode == CONDENSE_NONE){
 
@@ -1655,8 +1913,8 @@ void BSeriesApi::handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_
     stream->write(head,strlen(head));
 
     int rc = (condense_mode == CONDENSE_NONE)
-           ? streamSeriesData(key,start_time,end_time,stream)
-           : streamCondensedSeries(key,start_time,end_time,condense_mode,max_points,stream,NULL);
+           ? streamSeriesData(db,key,start_time,end_time,stream)
+           : streamCondensedSeries(db,key,start_time,end_time,condense_mode,max_points,stream,NULL);
 
     if(rc != NO_ERROR){
         // The head is already on the wire, so a failure this late can only be
@@ -1677,7 +1935,7 @@ void BSeriesApi::handleReadData(uint32_t key, const HTTP_REQUEST &request, HTTP_
 /// failing the whole request, because one missing key out of two hundred should
 /// not cost the caller the other hundred and ninety nine.
 
-void BSeriesApi::handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     long long start_time = 0, end_time = 0;
 
@@ -1716,7 +1974,7 @@ void BSeriesApi::handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &res
     int64_t total_points = 0;
 
     for(size_t i = 0; i < keys.size(); i++)
-        total_points += pointsInRange(keys[i],start_time,end_time);
+        total_points += pointsInRange(db,keys[i],start_time,end_time);
 
     if(condense_mode == CONDENSE_NONE && total_points > (int64_t)config.max_points_per_read){
         char message[256];
@@ -1768,8 +2026,8 @@ void BSeriesApi::handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &res
 
         if(info == NO_ERROR)
             rc = (condense_mode == CONDENSE_NONE)
-               ? streamSeriesData(keys[i],start_time,end_time,stream)
-               : streamCondensedSeries(keys[i],start_time,end_time,condense_mode,max_points,stream,NULL);
+               ? streamSeriesData(db,keys[i],start_time,end_time,stream)
+               : streamCondensedSeries(db,keys[i],start_time,end_time,condense_mode,max_points,stream,NULL);
 
         if(rc != NO_ERROR){
             char entry[256];
@@ -1796,7 +2054,7 @@ void BSeriesApi::handleMultiRead(const HTTP_REQUEST &request, HTTP_RESPONSE &res
 /// the definitions file decides, and failing that the caller's payload is taken to
 /// be a single point, which is the only unambiguous reading available.
 
-bool BSeriesApi::resolveWriteShape(uint32_t key, size_t body_bytes, uint32_t *datasize, int64_t *interval, std::string *error){
+bool BSeriesApi::resolveWriteShape(BSeries *db, uint32_t key, size_t body_bytes, uint32_t *datasize, int64_t *interval, std::string *error){
 
     SERIES header;
     int64_t file_size = 0;
@@ -1848,7 +2106,7 @@ bool BSeriesApi::resolveWriteShape(uint32_t key, size_t body_bytes, uint32_t *da
 /// Writes consecutive points starting at timestamp. Returns a database status and
 /// sets written to how many points landed before any failure.
 
-int BSeriesApi::writePoints(uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written, int64_t *overwritten){
+int BSeriesApi::writePoints(BSeries *db, uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written, int64_t *overwritten){
 
     int64_t count = (int64_t)(points.size() / datasize);
     *written = 0;
@@ -1886,7 +2144,7 @@ int BSeriesApi::writePoints(uint32_t key, const std::string &points, uint32_t da
 /// timestamp is what places a reading in it. A series that does not exist yet has
 /// no grid to snap to, so the time is returned unchanged and becomes its start.
 
-bool BSeriesApi::nearestSlotTime(uint32_t key, long long when, long long *slot_time){
+bool BSeriesApi::nearestSlotTime(BSeries *db, uint32_t key, long long when, long long *slot_time){
 
     SERIES header;
     int64_t file_size = 0;
@@ -1912,7 +2170,7 @@ bool BSeriesApi::nearestSlotTime(uint32_t key, long long when, long long *slot_t
 }
 
 
-void BSeriesApi::handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+void BSeriesApi::handleWriteData(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     std::string timestamp_text = httpQueryParam(request,"timestamp");
     long long timestamp = 0;
@@ -1940,7 +2198,7 @@ void BSeriesApi::handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP
     int64_t interval = 0;
     std::string shape_error;
 
-    if(!resolveWriteShape(key,points.size(),&datasize,&interval,&shape_error)){
+    if(!resolveWriteShape(db,key,points.size(),&datasize,&interval,&shape_error)){
         jsonError(response,422,"bad_point_width",shape_error);
         return;
     }
@@ -1956,7 +2214,7 @@ void BSeriesApi::handleWriteData(uint32_t key, const HTTP_REQUEST &request, HTTP
     }
 
     int64_t written = 0, overwritten = 0;
-    int rc = writePoints(key,points,datasize,interval,timestamp,&written,&overwritten);
+    int rc = writePoints(db,key,points,datasize,interval,timestamp,&written,&overwritten);
 
     if(rc != NO_ERROR){
 
@@ -2059,7 +2317,7 @@ static int splitTokens(const std::string &line, std::string *tokens, int max){
 /// series already held a reading in that slot, since rounding to nearest makes two
 /// samples sharing a slot more likely, and a series can only hold one.
 
-void BSeriesApi::handleWriteNow(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+void BSeriesApi::handleWriteNow(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     long long now = (long long)time(NULL);
 
@@ -2131,7 +2389,7 @@ void BSeriesApi::handleWriteNow(const HTTP_REQUEST &request, HTTP_RESPONSE &resp
 
         std::string shape_error;
 
-        if(!resolveWriteShape(record.key,record.points.size(),&record.datasize,&record.interval,&shape_error)){
+        if(!resolveWriteShape(db,record.key,record.points.size(),&record.datasize,&record.interval,&shape_error)){
             char message[256];
             snprintf(message,sizeof(message),"line %d: %s",line_number,shape_error.c_str());
             jsonError(response,422,"bad_point_width",shape_error);
@@ -2175,11 +2433,11 @@ void BSeriesApi::handleWriteNow(const HTTP_REQUEST &request, HTTP_RESPONSE &resp
         // Each series has its own grid, so the nearest slot is worked out per
         // series rather than once for the batch.
         long long slot_time = now;
-        nearestSlotTime(records[i].key,now,&slot_time);
+        nearestSlotTime(db,records[i].key,now,&slot_time);
         records[i].timestamp = slot_time;
 
         records[i].attempted = true;
-        records[i].status = writePoints(records[i].key,records[i].points,records[i].datasize,
+        records[i].status = writePoints(db,records[i].key,records[i].points,records[i].datasize,
                                         records[i].interval,slot_time,
                                         &records[i].written,&records[i].overwritten);
 
@@ -2272,7 +2530,7 @@ void BSeriesApi::handleWriteNow(const HTTP_REQUEST &request, HTTP_RESPONSE &resp
 /// The database has no transactions, so a failure during the write pass still
 /// leaves a partial batch; that is reported per record rather than glossed over.
 
-void BSeriesApi::handleBatchWrite(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+void BSeriesApi::handleBatchWrite(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     std::vector<BATCH_RECORD> records;
     int64_t total_points = 0;
@@ -2349,7 +2607,7 @@ void BSeriesApi::handleBatchWrite(const HTTP_REQUEST &request, HTTP_RESPONSE &re
 
         std::string shape_error;
 
-        if(!resolveWriteShape(record.key,record.points.size(),&record.datasize,&record.interval,&shape_error)){
+        if(!resolveWriteShape(db,record.key,record.points.size(),&record.datasize,&record.interval,&shape_error)){
             char message[256];
             snprintf(message,sizeof(message),"line %d: %s",line_number,shape_error.c_str());
             jsonError(response,422,"bad_point_width",message);
@@ -2389,7 +2647,7 @@ void BSeriesApi::handleBatchWrite(const HTTP_REQUEST &request, HTTP_RESPONSE &re
     for(size_t i = 0; i < records.size(); i++){
 
         records[i].attempted = true;
-        records[i].status = writePoints(records[i].key,records[i].points,records[i].datasize,
+        records[i].status = writePoints(db,records[i].key,records[i].points,records[i].datasize,
                                         records[i].interval,records[i].timestamp,
                                         &records[i].written,&records[i].overwritten);
 
