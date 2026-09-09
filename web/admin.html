@@ -100,7 +100,7 @@
     <!-- ---------------------------------------------------------- series -->
     <section v-if="tab === 'series'">
       <form class="row" @submit.prevent="loadSeries">
-        <select v-model="table" @change="loadSeries">
+        <select v-model="table" @change="chooseTable">
           <option v-for="t in tables" :key="t.name" :value="t.name">{{ t.name }}</option>
         </select>
         <input v-model="after" placeholder="after key" size="10">
@@ -239,7 +239,7 @@ createApp({
     keyInput: '', busy: false, error: '', note: '',
     tab: 'tables', tabs: ['tables','series','keys','config'],
     health: null, tables: [], newTable: '',
-    table: '', series: [], after: '',
+    table: '', series: [], after: '', tableChosen: false,
     ns: { key:'', type:'float32', interval:'60', start:'' },
     types: ['uint8','uint16','uint32','uint64','int8','int16','int32','int64','float32','float64'],
     reading: null, points: [], lastRead: null,
@@ -296,7 +296,7 @@ createApp({
     go(tab) {
       this.tab = tab; this.error = ''; this.note = '';
       if (tab === 'tables') this.loadTables();
-      if (tab === 'series') { this.loadTables().then(() => this.table && this.loadSeries()); }
+      if (tab === 'series') { this.loadTables().then(() => this.openSeriesTab()); }
       if (tab === 'keys')   this.loadKeys();
       if (tab === 'config') this.loadConfig();
       this.api('/v1/health').then(h => this.health = h).catch(() => {});
@@ -322,6 +322,27 @@ createApp({
         if (this.table === name) { this.table = ''; this.series = []; }
         await this.loadTables();
       }, 'table dropped');
+    },
+
+    // The first table is "default", the data directory itself, and on a database
+    // whose series all live in named tables it is empty. Landing there shows "no
+    // series" and looks like the database is empty, so move on to one that has
+    // something -- but only until the user picks a table themselves.
+    // Once a table has been picked deliberately, stop second guessing it: an
+    // empty table the user asked for should stay on screen.
+    chooseTable() { this.tableChosen = true; return this.loadSeries(); },
+
+    async openSeriesTab() {
+      if (!this.tables.length) return;
+      if (this.tableChosen) return this.loadSeries();
+
+      for (const t of this.tables) {
+        try {
+          const r = await this.api(`/v1/${encodeURIComponent(t.name)}/series?limit=1`);
+          if ((r.series || []).length) { this.table = t.name; break; }
+        } catch (e) { /* an unreadable table is not a reason to stop looking */ }
+      }
+      return this.loadSeries();
     },
 
     loadSeries() {

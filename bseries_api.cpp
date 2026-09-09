@@ -1352,8 +1352,45 @@ bool BSeriesApi::handleWebAsset(const HTTP_REQUEST &request, HTTP_RESPONSE &resp
     if(asset == NULL)
         return false;
 
-    response.status = 200;
+    // The page lives in the binary, so upgrading the binary is what changes it.
+    // Without a validator a browser applies heuristic caching, and a server that
+    // has just been upgraded serves a page the browser then refuses to refetch --
+    // the new version is on disk, on the wire, and invisible.
+    //
+    // The tag is derived from the bytes, so it changes exactly when they do, and
+    // no-cache asks for a revalidation rather than forbidding the cache: an
+    // unchanged page still costs one 304 rather than 167KB of Vue.
+    uint64_t hash = 1469598103934665603ULL;         // FNV-1a
+
+    for(size_t i = 0; i < asset->length; i++){
+        hash ^= (uint64_t)asset->data[i];
+        hash *= 1099511628211ULL;
+    }
+
+    char tag[32];
+    snprintf(tag,sizeof(tag),"\"%llx\"",(unsigned long long)hash);
+
+    HTTP_HEADER header;
+
+    header.name = "Cache-Control";
+    header.value = "no-cache";
+    response.headers.push_back(header);
+
+    header.name = "ETag";
+    header.value = tag;
+    response.headers.push_back(header);
+
+    // A 304 carries no body, but the headers it does carry should be the ones the
+    // 200 would have had, not the JSON default every other response here uses.
     response.content_type = asset->content_type;
+
+    if(httpHeader(request,"if-none-match") == tag){
+        response.status = 304;
+        response.body.clear();
+        return true;
+    }
+
+    response.status = 200;
     response.body.assign((const char *)asset->data,asset->length);
     return true;
 }

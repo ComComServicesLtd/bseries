@@ -49,6 +49,7 @@ const char *httpStatusText(int status){
         case 200: return "OK";
         case 201: return "Created";
         case 204: return "No Content";
+        case 304: return "Not Modified";
         case 400: return "Bad Request";
         case 401: return "Unauthorized";
         case 403: return "Forbidden";

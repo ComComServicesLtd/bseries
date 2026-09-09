@@ -62,7 +62,8 @@ static bool decodeChunked(const std::string &raw, std::string *out){
 
 
 static REPLY request(const char *method, const std::string &path, const char *api_key,
-                     const std::string &body = "", const char *origin = NULL){
+                     const std::string &body = "", const char *origin = NULL,
+                     const char *extra_header = NULL){
 
     REPLY reply;
     reply.status = -1;
@@ -87,6 +88,7 @@ static REPLY request(const char *method, const std::string &path, const char *ap
     std::string out(head,(size_t)length);
     if(api_key) out += std::string("X-API-Key: ") + api_key + "\r\n";
     if(origin)  out += std::string("Origin: ") + origin + "\r\n";
+    if(extra_header) out += std::string(extra_header) + "\r\n";
     out += "\r\n";
     out += body;
 
@@ -660,6 +662,38 @@ int main(int argc, char **argv){
         r = request("GET","/v1/data?keys=70001,70002&start=1700000000&end=1700000600&max_points=6&condense=max","read-only-key");
         CHECK(r.status==200 && bodyHas(r,"\"count\":2"), "batch read condenses too");
         CHECK(bodyHas(r,"\"condense\":\"max\""), "and reports the operation per series");
+
+        // The page is in the binary, so upgrading the binary is what changes it.
+        // Without a validator a browser caches it heuristically and an upgraded
+        // server serves a page the browser will not refetch.
+        {
+            REPLY r = request("GET","/admin",NULL);
+            CHECK(r.status==200, "the admin page needs no key, it is where one is typed");
+            CHECK(headHas(r,"Cache-Control: no-cache"), "it asks to be revalidated, not reused blind");
+            CHECK(headHas(r,"ETag: \""), "and carries a tag derived from its bytes");
+
+            // Pull the tag back out of the head to revalidate with it.
+            std::string tag;
+            {
+                size_t at = r.head.find("ETag: ");
+                if(at != std::string::npos){
+                    size_t end = r.head.find("\r\n",at);
+                    tag = r.head.substr(at + 6, end - (at + 6));
+                }
+            }
+            CHECK(!tag.empty(), "the tag is readable");
+
+            r = request("GET","/admin",NULL,"",NULL,("If-None-Match: " + tag).c_str());
+            CHECK(r.status==304 && r.body.empty(), "an unchanged page revalidates to 304 with no body");
+
+            r = request("GET","/admin",NULL,"",NULL,"If-None-Match: \"stale\"");
+            CHECK(r.status==200 && !r.body.empty(), "a tag that no longer matches gets the page");
+
+            // Different bytes, different tag, so upgrading always invalidates.
+            REPLY js = request("GET","/admin/vue.global.prod.js",NULL);
+            CHECK(js.status==200 && headHas(js,"ETag: \""), "the script is tagged too");
+            CHECK(js.head.find(tag) == std::string::npos, "and its tag is not the page's");
+        }
 
         // Migrating a legacy series.
         //
