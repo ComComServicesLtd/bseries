@@ -1008,6 +1008,21 @@ of seconds. `interval` and `created` are still reported in seconds, with
 `interval_ms` and `created_ms` alongside them rather than the existing fields
 changing units under clients that compute point times from them.
 
+**The label and address are set through one endpoint**, because each write
+rewrites the header and setting both means one change rather than two:
+
+```
+$ curl -XPOST -H 'X-API-Key: $WRITE_KEY' \
+    'localhost:8086/v1/lab/series/4/meta?name=gateway%20latency&address=172.20.0.1'
+{"key":4,"name":"gateway latency","address":"172.20.0.1","address_family":"ipv4"}
+```
+
+Only what is named changes, and an empty value clears a field. The address is
+given as an IPv4 or IPv6 literal and parsed here rather than as sixteen hex bytes,
+so the family follows from the text and the stored bytes cannot disagree with the
+flag describing them. A name is at most 47 bytes and a longer one is refused
+rather than truncated, since cutting UTF-8 to a byte count lands mid sequence.
+
 **A series names its own profile**, so a read resolves it without being told —
 including a multi series read, where each series answers with its own. An explicit
 `profile=` still wins, which is how you look at a series through a different

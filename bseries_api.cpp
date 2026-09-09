@@ -2,6 +2,7 @@
 #include "web_assets.h"
 
 #include <algorithm>
+#include <arpa/inet.h>   // inet_pton/inet_ntop, so an address is given as text
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1415,6 +1416,21 @@ void BSeriesApi::routeTable(BSeries *db, const std::vector<std::string> &rest, c
         return;
     }
 
+    // <table>/series/{key}/meta - the descriptive fields in the header
+    if(rest.size() == 3 && rest[2] == "meta"){
+
+        if(request.method != "POST" && request.method != "PUT"){
+            jsonError(response,405,"method_not_allowed","use POST to set the name or address");
+            return;
+        }
+
+        if(!authorise(request,true,response))
+            return;
+
+        handleSetSeriesMeta(db,key,request,response);
+        return;
+    }
+
     // <table>/series/{key}/profile - which profile this series is read with
     if(rest.size() == 3 && rest[2] == "profile"){
 
@@ -1756,16 +1772,34 @@ static void appendSeriesJson(std::string &out, uint32_t key, const SERIES &heade
     // replacing them: every existing client computes point times as
     // first_point_timestamp + i * interval, and redefining those units would give
     // each of them wrong answers with no error to notice.
-    char extra[256];
+    char extra[448];
     extra[0] = 0;
 
     if(header.version == SERIES_VERSION_PROFILED){
+
+        // Reported so a field that can be set can also be seen; an address set
+        // through /meta was otherwise write only.
+        char address[64];
+        const char *family = "none";
+        address[0] = 0;
+
+        switch(header.flags & SERIES_ADDRESS_MASK){
+            case SERIES_ADDRESS_IPV4: family = "ipv4";
+                inet_ntop(AF_INET,header.address,address,sizeof(address)); break;
+            case SERIES_ADDRESS_IPV6: family = "ipv6";
+                inet_ntop(AF_INET6,header.address,address,sizeof(address)); break;
+            default: break;
+        }
+
         snprintf(extra,sizeof(extra),
-                 ",\"interval_ms\":%llu,\"created_ms\":%llu,\"profile\":\"%s\",\"name\":\"%s\"",
+                 ",\"interval_ms\":%llu,\"created_ms\":%llu,\"profile\":\"%s\",\"name\":\"%s\","
+                 "\"address\":\"%s\",\"address_family\":\"%s\"",
                  (unsigned long long)header.interval_ms,
                  (unsigned long long)header.timestamp_ms,
-                 header.profile,
-                 header.name);
+                 jsonEscape(header.profile).c_str(),
+                 jsonEscape(header.name).c_str(),
+                 address,
+                 family);
     }
 
     snprintf(buffer,sizeof(buffer),
@@ -2217,6 +2251,120 @@ void BSeriesApi::handleMigrateSeries(BSeries *db, uint32_t key, const HTTP_REQUE
 /// This is what makes a profile a property of the data rather than of a request:
 /// once it is here, a read resolves it without being told, and a multi series
 /// read can answer with several because each series names its own.
+
+/// Sets the descriptive fields a version 4 header carries.
+///
+/// Both are optional and only what is named changes, in one header rewrite: a
+/// caller setting a name and an address means one change, not two. An empty value
+/// clears a field, which is the only way back from having set one.
+///
+/// The address is given as text and parsed here, rather than as sixteen hex
+/// bytes: the family follows from the text, which is one fewer thing to get wrong
+/// and one fewer way for the stored bytes to disagree with the flag describing
+/// them.
+
+void BSeriesApi::handleSetSeriesMeta(BSeries *db, uint32_t key, const HTTP_REQUEST &request,
+                                     HTTP_RESPONSE &response){
+
+    bool has_name = false, has_address = false;
+
+    std::string name = httpQueryParam(request,"name",&has_name);
+    std::string address_text = httpQueryParam(request,"address",&has_address);
+
+    if(!has_name && !has_address){
+        jsonError(response,400,"bad_parameter","name, address, or both");
+        return;
+    }
+
+    // 48 bytes with a guaranteed terminator. Refused rather than truncated: a cut
+    // at a byte count lands mid sequence in UTF-8 and stores an invalid string.
+    if(has_name && name.size() >= SERIES_NAME_BYTES){
+        char message[128];
+        snprintf(message,sizeof(message),"a name is at most %d bytes; this one is %u",
+                 SERIES_NAME_BYTES - 1,(unsigned)name.size());
+        jsonError(response,400,"bad_parameter",message);
+        return;
+    }
+
+    unsigned char address[SERIES_ADDRESS_BYTES];
+    int family = -1;
+
+    memset(address,0,sizeof(address));
+
+    if(has_address){
+
+        if(address_text.empty()){
+
+            family = SERIES_ADDRESS_NONE;
+
+        } else if(inet_pton(AF_INET,address_text.c_str(),address) == 1){
+
+            family = SERIES_ADDRESS_IPV4;
+
+        } else if(inet_pton(AF_INET6,address_text.c_str(),address) == 1){
+
+            family = SERIES_ADDRESS_IPV6;
+
+        } else {
+
+            jsonError(response,400,"bad_parameter",
+                      "an address is an IPv4 or IPv6 literal, or empty to clear it");
+            return;
+        }
+    }
+
+    BSeries::META meta;
+    meta.profile = NULL;
+    meta.name = has_name ? name.c_str() : NULL;
+    meta.address = has_address ? address : NULL;
+    meta.address_family = family;
+
+    int rc = db->setSeriesMeta(key,meta);
+
+    if(rc == SERIES_TYPE_MISMATCH){
+        jsonError(response,409,"not_applicable",
+                  "only a version 4 header has room for these; upgrade the series first");
+        return;
+    }
+
+    if(rc != NO_ERROR){
+        jsonDatabaseError(response,rc,"setting the series metadata");
+        return;
+    }
+
+    // Read back rather than echoed, so the answer is what the file now says.
+    SERIES header;
+    int64_t file_size = 0;
+
+    if(db->seriesInfo(key,&header,&file_size) != NO_ERROR){
+        jsonError(response,500,"database_error","the header was written but could not be read back");
+        return;
+    }
+
+    char text[64];
+    const char *family_name = "none";
+    text[0] = 0;
+
+    switch(header.flags & SERIES_ADDRESS_MASK){
+        case SERIES_ADDRESS_IPV4: family_name = "ipv4";
+            inet_ntop(AF_INET,header.address,text,sizeof(text)); break;
+        case SERIES_ADDRESS_IPV6: family_name = "ipv6";
+            inet_ntop(AF_INET6,header.address,text,sizeof(text)); break;
+        default: break;
+    }
+
+    char body[320];
+    snprintf(body,sizeof(body),
+             "{\"key\":%lu,\"name\":\"%s\",\"address\":\"%s\",\"address_family\":\"%s\"}",
+             (unsigned long)key,
+             jsonEscape(header.name).c_str(),
+             text,
+             family_name);
+
+    response.status = 200;
+    response.body = body;
+}
+
 
 void BSeriesApi::handleSetSeriesProfile(BSeries *db, uint32_t key, const HTTP_REQUEST &request,
                                         HTTP_RESPONSE &response){

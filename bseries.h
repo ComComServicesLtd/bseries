@@ -436,11 +436,27 @@ public:
     int remapUint8(uint32_t key, const unsigned char *map256, const char *profile,
                    MIGRATION_REPORT *report, bool dry_run);
 
-    /// Names the profile a series is read with, in its own header.
+    /// Changes to a version 4 header's descriptive fields. A NULL, or a family of
+    /// -1, leaves that field alone; an empty string clears it.
     ///
-    /// Only a version 4 header has anywhere to put it. Rewrites the header in
-    /// place -- 128 bytes, no data moved -- and refuses a name that would not
-    /// survive being turned back into a path.
+    /// Grouped rather than one call per field because each one rewrites the
+    /// header, and a caller setting a name and an address means one change, not
+    /// two.
+    typedef struct {
+        const char *profile;
+        const char *name;
+        const unsigned char *address;   // 16 bytes when set
+        int address_family;             // -1 unchanged, 0 none, 1 IPv4, 2 IPv6
+    } META;
+
+    /// Rewrites those fields in the header, in place: 128 bytes, no data moved.
+    ///
+    /// Only a version 4 header has anywhere to put them. The series is flushed
+    /// and dropped from memory first, because its cached header is about to stop
+    /// describing the file.
+    int setSeriesMeta(uint32_t key, const META &meta);
+
+    /// Names the profile a series is read with. A META with only that set.
     int setSeriesProfile(uint32_t key, const char *profile);
     int listSeriesKeys(vector<uint32_t> *keys, uint32_t after, int limit);
 

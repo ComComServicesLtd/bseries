@@ -920,6 +920,41 @@ int main(int argc, char **argv){
             // the values mean, and it works for a width no translation covers.
             // This path shipped once with a null map dereference behind it,
             // because nothing here executed it.
+            // The descriptive fields a version 4 header carries. Exercised through
+            // the endpoint rather than the struct, because the last field added
+            // here shipped with nothing calling it.
+            r = request("POST","/v1/series/70005/meta?name=gateway%20latency&address=172.20.0.1","read-write-key");
+            CHECK(r.status==200 && bodyHas(r,"\"name\":\"gateway latency\""), "a name and address are set together");
+            CHECK(bodyHas(r,"\"address\":\"172.20.0.1\"") && bodyHas(r,"\"address_family\":\"ipv4\""),
+                  "the family follows from the text");
+
+            r = request("GET","/v1/series/70005","read-only-key");
+            CHECK(bodyHas(r,"\"name\":\"gateway latency\"") && bodyHas(r,"\"address\":\"172.20.0.1\""),
+                  "and both are reported by the series, not only echoed");
+
+            r = request("POST","/v1/series/70005/meta?name=renamed","read-write-key");
+            CHECK(bodyHas(r,"\"name\":\"renamed\"") && bodyHas(r,"\"address\":\"172.20.0.1\""),
+                  "naming one field leaves the other alone");
+
+            r = request("POST","/v1/series/70005/meta?address=2001:4860:4860::8888","read-write-key");
+            CHECK(bodyHas(r,"\"address_family\":\"ipv6\""), "an IPv6 literal is stored as one");
+
+            r = request("POST","/v1/series/70005/meta?address=","read-write-key");
+            CHECK(bodyHas(r,"\"address_family\":\"none\""), "an empty value clears it");
+
+            r = request("POST","/v1/series/70005/meta?address=not.an.ip","read-write-key");
+            CHECK(r.status==400, "anything that is not an address is refused");
+
+            r = request("POST","/v1/series/70005/meta?name=012345678901234567890123456789012345678901234567","read-write-key");
+            CHECK(r.status==400 && bodyHas(r,"47 bytes"),
+                  "a name past the field is refused rather than truncated mid character");
+
+            r = request("POST","/v1/series/70005/meta","read-write-key");
+            CHECK(r.status==400, "naming neither field is refused");
+
+            r = request("POST","/v1/series/70005/meta?name=x","read-only-key");
+            CHECK(r.status==403, "setting metadata needs a write key");
+
             // A version 3 float32 file, written by hand: this build creates version
             // 4 series, so there is no other way to have one to bring forward.
             {

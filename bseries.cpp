@@ -2080,10 +2080,28 @@ int BSeries::remapUint8(uint32_t key, const unsigned char *map256, const char *p
 
 int BSeries::setSeriesProfile(uint32_t key, const char *profile){
 
+    META meta;
+    meta.profile = profile;
+    meta.name = NULL;
+    meta.address = NULL;
+    meta.address_family = -1;
+
+    return setSeriesMeta(key,meta);
+}
+
+
+int BSeries::setSeriesMeta(uint32_t key, const META &meta){
+
     if(shuttingDown)
         return FAILED_TO_OPEN_FILE;
 
-    if(profile == NULL || strlen(profile) >= SERIES_PROFILE_BYTES)
+    if(meta.profile != NULL && strlen(meta.profile) >= SERIES_PROFILE_BYTES)
+        return INVALID_SERIES_DEFINITION;
+
+    // 48 bytes with a guaranteed terminator, so 47 usable. Refused rather than
+    // truncated: cutting UTF-8 to a byte count lands mid sequence and writes an
+    // invalid string into the file.
+    if(meta.name != NULL && strlen(meta.name) >= SERIES_NAME_BYTES)
         return INVALID_SERIES_DEFINITION;
 
     // The whole series is taken out of memory first: its cached header is about
@@ -2136,8 +2154,26 @@ int BSeries::setSeriesProfile(uint32_t key, const char *profile){
             break;
         }
 
-        memset(header.profile,0,sizeof(header.profile));
-        snprintf(header.profile,sizeof(header.profile),"%s",profile);
+        if(meta.profile != NULL){
+            memset(header.profile,0,sizeof(header.profile));
+            snprintf(header.profile,sizeof(header.profile),"%s",meta.profile);
+        }
+
+        if(meta.name != NULL){
+            memset(header.name,0,sizeof(header.name));
+            snprintf(header.name,sizeof(header.name),"%s",meta.name);
+        }
+
+        if(meta.address_family >= 0){
+
+            memset(header.address,0,sizeof(header.address));
+
+            if(meta.address != NULL && meta.address_family != SERIES_ADDRESS_NONE)
+                memcpy(header.address,meta.address,sizeof(header.address));
+
+            header.flags = (header.flags & ~(uint32_t)SERIES_ADDRESS_MASK) |
+                           ((uint32_t)meta.address_family & SERIES_ADDRESS_MASK);
+        }
 
         bsFinaliseHeader(&header);
 
