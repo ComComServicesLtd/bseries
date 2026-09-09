@@ -122,6 +122,9 @@
                 v-if="s.buffered_points"> +{{ s.buffered_points }}</span></td>
             <td>
               <button class="act" @click="readSeries(s)">read</button>
+              <!-- Only a legacy one byte unsigned series has anything to migrate;
+                   the server refuses anything else, so do not offer it. -->
+              <button class="act danger" v-if="migratable(s)" @click="migrateSeries(s)">migrate</button>
               <button class="act danger" @click="dropSeries(s.key)">delete</button>
             </td>
           </tr>
@@ -338,6 +341,30 @@ createApp({
         this.ns.key = ''; await this.loadSeries();
       }, 'series created');
     },
+    // A version 1 file records a width and no datatype, so 1 byte reads back as
+    // uint8. Anything else has no remapping defined and the server refuses it.
+    migratable(s) { return s.version === 1 && s.datasize === 1 && s.type === 'uint8'; },
+
+    migrateSeries(s) {
+      // Spelled out rather than a bare "are you sure": it cannot be undone, and
+      // the two lossy parts are not obvious from the button.
+      if (!confirm(
+        `Migrate series ${s.key} from version 1 to version 3?\n\n` +
+        `Readings of 1 become 254, the value meaning "no reply".\n` +
+        `Readings of 245 to 254 are pulled down to 244.\n` +
+        `255 stays as "nothing recorded".\n\n` +
+        `This rewrites the file and cannot be undone.`)) return;
+
+      return this.run(async () => {
+        const r = await this.api(
+          `/v1/${encodeURIComponent(this.table)}/series/${s.key}/migrate`, { method: 'POST' });
+        this.note = `series ${r.key} migrated: ${r.points} points, ` +
+                    `${r.remapped} remapped to ${r.no_reply}, ${r.clamped} clamped to ${r.reading_max}, ` +
+                    `${r.nulls} left as fill`;
+        await this.loadSeries();
+      });
+    },
+
     dropSeries(k) {
       if (!confirm(`Delete series ${k}?`)) return;
       return this.run(async () => {

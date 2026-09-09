@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <algorithm>
 #include <stdlib.h>
+#include <unistd.h>   // fsync, so a migrated file is on disk before the rename
 
 
 
@@ -1646,6 +1647,185 @@ int BSeries::seriesInfo(uint32_t key, SERIES *header, int64_t *file_size){
     } while(false);
 
     fclose(file);
+
+    return status;
+}
+
+
+int BSeries::migrateLegacyUint8(uint32_t key, MIGRATION_REPORT *report){
+
+    if(shuttingDown)
+        return FAILED_TO_OPEN_FILE;
+
+    if(report != NULL)
+        memset(report,0,sizeof(*report));
+
+    char path[256];
+    char temp_path[288];
+
+    if(snprintf(path,sizeof(path),"%s/%lu",data_directory,(unsigned long)key) >= (int)sizeof(path))
+        return FAILED_TO_OPEN_FILE;
+
+    snprintf(temp_path,sizeof(temp_path),"%s.migrating",path);
+
+    // Held for the whole rewrite. Nothing may open this series while its file is
+    // being replaced, and an admin operation that runs once is the right place to
+    // pay for that with a quiet database rather than with a second locking scheme.
+    index_access.lock();
+
+    int status = NO_ERROR;
+    FILE *in = NULL;
+    FILE *out = NULL;
+
+    do {
+
+        // Flush and drop the series first: its write ahead cache holds points the
+        // file does not, and its cached header would outlive the file it describes.
+        map<uint32_t,ENTRY>::iterator it = series_list.find(key);
+
+        if(it != series_list.end()){
+
+            it->second.access.lock();
+
+            if(it->second.write_ahead_cache != NULL){
+
+                if(it->second.last_write){
+                    FILE *file = openFile(key,true);
+                    if(file != NULL){
+                        flushBuffer(&it->second,file);
+                        fclose(file);
+                    } else {
+                        _ERROR("\t Failed to open %lu to flush before migrating\n",(unsigned long)key);
+                        it->second.access.unlock();
+                        status = FAILED_TO_OPEN_FILE;
+                        break;
+                    }
+                }
+
+                free(it->second.write_ahead_cache);
+                it->second.write_ahead_cache = NULL;
+            }
+
+            it->second.access.unlock();
+            series_list.erase(it);
+        }
+
+        in = fopen(path,"rb");
+
+        if(in == NULL){
+            status = SERIES_NOT_FOUND;
+            break;
+        }
+
+        SERIES header;
+
+        if(fread((char*)&header,sizeof(header),1,in) != 1){
+            status = FAILED_TO_READ_HEADER;
+            break;
+        }
+
+        if(header.checksum != getChecksum(&header)){
+            status = INVALID_HEADER_CHECKSUM;
+            break;
+        }
+
+        // Only a legacy file, and only a one byte one. Version is the guard that
+        // makes running this twice impossible, and the remapping is meaningless
+        // for anything but a uint8.
+        if(header.version != SERIES_VERSION_LEGACY || bsHeaderDataSize(&header) != 1 ||
+           bsHeaderDataType(&header) != BS_UNSIGNED){
+            status = SERIES_TYPE_MISMATCH;
+            break;
+        }
+
+        out = fopen(temp_path,"wb");
+
+        if(out == NULL){
+            _ERROR("\t Failed to open %s\n",temp_path);
+            status = FAILED_TO_OPEN_FILE;
+            break;
+        }
+
+        const unsigned char fill = bsTypeNullFill(BS_UNSIGNED,1);
+
+        SERIES migrated = header;
+        migrated.version = SERIES_VERSION_FILLED;
+        migrated.typecode = bsPackTypeCode(BS_UNSIGNED,1,bsTypeNullFill(BS_UNSIGNED,1));
+        migrated.checksum = getChecksum(&migrated);
+
+        if(fwrite((const char*)&migrated,sizeof(migrated),1,out) != 1){
+            status = CREATE_NEW_HEADER_FAIL;
+            break;
+        }
+
+        unsigned char buffer[65536];
+        size_t got;
+
+        while((got = fread(buffer,1,sizeof(buffer),in)) > 0){
+
+            for(size_t i = 0; i < got; i++){
+
+                unsigned char value = buffer[i];
+
+                if(value == fill){        // nothing was recorded here
+                    if(report) report->nulls++;
+                    continue;
+                }
+
+                // Clamp before remapping, so the sentinel written below lands in a
+                // range this pass has already cleared.
+                if(value >= BS_RESERVED_FIRST && value <= BS_RESERVED_LAST){
+                    buffer[i] = BS_READING_MAX;
+                    if(report) report->clamped++;
+                } else if(value == BS_LEGACY_NO_REPLY){
+                    buffer[i] = BS_NO_REPLY;
+                    if(report) report->remapped++;
+                }
+            }
+
+            if(fwrite(buffer,1,got,out) != got){
+                status = DATA_POINT_WRITE_FAILURE;
+                break;
+            }
+
+            if(report) report->points += (int64_t)got;
+        }
+
+        if(status != NO_ERROR)
+            break;
+
+        if(ferror(in)){
+            status = INTERNAL_ERROR;
+            break;
+        }
+
+        // On disk before the rename, or a power cut could leave the name pointing
+        // at a file whose contents never arrived.
+        fflush(out);
+        fsync(fileno(out));
+        fclose(out);
+        out = NULL;
+
+        fclose(in);
+        in = NULL;
+
+        if(rename(temp_path,path) != 0){
+            _ERROR("\t Failed to rename %s over %s\n",temp_path,path);
+            status = DATA_POINT_WRITE_FAILURE;
+            break;
+        }
+
+    } while(false);
+
+    if(out != NULL){
+        fclose(out);
+        remove(temp_path);        // an interrupted run leaves the original alone
+    }
+
+    if(in != NULL)
+        fclose(in);
+
+    index_access.unlock();
 
     return status;
 }

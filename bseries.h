@@ -65,6 +65,30 @@ union BType {
 #define SERIES_VERSION_FILLED 3
 
 
+/// The values migrateLegacyUint8() moves things to. Named rather than written in
+/// line because the endpoint reports them, the tests assert them, and a reader
+/// should be able to see the whole convention in one place.
+///
+/// After a migration a uint8 series means: 0 to 244 a reading, 245 to 253 spare
+/// for another sentinel, 254 no reply, 255 nothing recorded.
+
+#define BS_LEGACY_NO_REPLY   1     // what the prober wrote
+#define BS_NO_REPLY        254     // where it goes, just under the fill
+#define BS_RESERVED_FIRST  245     // top of the range cleared for sentinels
+#define BS_RESERVED_LAST   254
+#define BS_READING_MAX     244     // the highest value that is still a reading
+
+
+/// What a migration did, for the caller to report rather than have to infer.
+
+typedef struct {
+    int64_t points;      // points in the file
+    int64_t remapped;    // the prober's sentinel, moved
+    int64_t clamped;     // readings pulled down out of the reserved range
+    int64_t nulls;       // fill, left alone
+} MIGRATION_REPORT;
+
+
 /// On disk series header. Fixed at 20 bytes: every data point is addressed as
 /// sizeof(SERIES) + point * datasize, so the size of this struct is part of the
 /// file format and must not change.
@@ -303,6 +327,33 @@ public:
     /// has nothing buffered. Probing an unopened key must not grow the index, the
     /// same reason seriesInfo() reads the header straight from disk.
     int64_t bufferedPoints(uint32_t key);
+
+    /// Rewrites a legacy uint8 series as version 3, remapping the values a prober
+    /// reserved by convention into the range this database reserves by rule.
+    ///
+    /// A version 1 header records a width and no datatype, so a 1 byte series reads
+    /// back as uint8 with 255 for the fill. That leaves a prober's own sentinel --
+    /// 1 for "no reply" -- sitting in the middle of the real readings, where it is
+    /// the smallest value rather than the worst one: it drags an average down,
+    /// never shows up in a maximum, and pins a minimum to itself forever.
+    ///
+    /// This moves that sentinel to 254, immediately below the fill, so it sorts
+    /// where it belongs. 245 to 254 are pulled down to 244 first, both to clear the
+    /// target and to leave the top of the range meaning something rather than
+    /// nothing. 255 is left alone: it is the fill, and a slot that holds it is one
+    /// nothing was ever written to.
+    ///
+    /// The two steps are one pass in the order given, so running it twice would
+    /// clamp the sentinels the first run wrote. The version field is the guard:
+    /// only a version 1 file is accepted, and the header is stamped last.
+    ///
+    /// Not reversible -- readings at 245 to 254 are lost, and a genuine 1 becomes a
+    /// no reply. The series is flushed and evicted first, then written to a
+    /// temporary file and renamed over the original, so an interrupted run leaves
+    /// the original exactly as it was. It needs the file's size again in free
+    /// space, and holds the index lock throughout, so the database is quiet while
+    /// it runs.
+    int migrateLegacyUint8(uint32_t key, MIGRATION_REPORT *report);
     int listSeriesKeys(vector<uint32_t> *keys, uint32_t after, int limit);
 
     /// Flushes every series whose buffer has been holding points for at least

@@ -1300,6 +1300,21 @@ void BSeriesApi::routeTable(BSeries *db, const std::vector<std::string> &rest, c
         return;
     }
 
+    // <table>/series/{key}/migrate
+    if(rest.size() == 3 && rest[2] == "migrate"){
+
+        if(request.method != "POST"){
+            jsonError(response,405,"method_not_allowed","use POST to migrate a series");
+            return;
+        }
+
+        if(!authorise(request,true,response))
+            return;
+
+        handleMigrateSeries(db,key,response);
+        return;
+    }
+
     // <table>/series/{key}/data
     if(rest.size() == 3 && rest[2] == "data"){
 
@@ -1738,6 +1753,67 @@ void BSeriesApi::handleCreateSeries(BSeries *db, uint32_t key, const HTTP_REQUES
 
     response.status = 201;
     appendSeriesJson(response.body,key,header,file_size,db->bufferedPoints(key));
+}
+
+
+/// Rewrites a legacy uint8 series as version 3, moving a prober's "no reply" to
+/// where the database reserves values rather than where the prober happened to put
+/// it. See BSeries::migrateLegacyUint8().
+///
+/// Reports what it moved rather than only that it worked: the counts are how an
+/// operator confirms the file held what they thought it did, and the operation
+/// cannot be undone to check afterwards.
+
+void BSeriesApi::handleMigrateSeries(BSeries *db, uint32_t key, HTTP_RESPONSE &response){
+
+    SERIES header;
+    int64_t file_size = 0;
+
+    if(db->seriesInfo(key,&header,&file_size) != NO_ERROR){
+        jsonError(response,404,"not_found","no such series");
+        return;
+    }
+
+    if(header.version != SERIES_VERSION_LEGACY){
+        char message[160];
+        snprintf(message,sizeof(message),
+                 "this series is already version %lu; only a version 1 file is migrated",
+                 (unsigned long)header.version);
+        jsonError(response,409,"not_applicable",message);
+        return;
+    }
+
+    if(bsHeaderDataSize(&header) != 1 || bsHeaderDataType(&header) != BS_UNSIGNED){
+        jsonError(response,409,"not_applicable",
+                  "the remapping is defined for one byte unsigned series only");
+        return;
+    }
+
+    MIGRATION_REPORT report;
+    int rc = db->migrateLegacyUint8(key,&report);
+
+    if(rc != NO_ERROR){
+        jsonDatabaseError(response,rc,"migrating the series");
+        return;
+    }
+
+    char body[448];
+
+    snprintf(body,sizeof(body),
+        "{\"key\":%lu,\"migrated\":true,\"from_version\":1,\"to_version\":3,"
+        "\"points\":%lld,\"remapped\":%lld,\"clamped\":%lld,\"nulls\":%lld,"
+        "\"no_reply\":%d,\"reading_max\":%d,\"null_fill\":%d}",
+        (unsigned long)key,
+        (long long)report.points,
+        (long long)report.remapped,
+        (long long)report.clamped,
+        (long long)report.nulls,
+        BS_NO_REPLY,
+        BS_READING_MAX,
+        (int)bsTypeNullFill(BS_UNSIGNED,1));
+
+    response.status = 200;
+    response.body = body;
 }
 
 

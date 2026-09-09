@@ -661,6 +661,86 @@ int main(int argc, char **argv){
         CHECK(r.status==200 && bodyHas(r,"\"count\":2"), "batch read condenses too");
         CHECK(bodyHas(r,"\"condense\":\"max\""), "and reports the operation per series");
 
+        // Migrating a legacy series.
+        //
+        // Written as a version 1 file by hand, since nothing in this build produces
+        // one any more: a 20 byte header whose typecode is a plain byte width, then
+        // one of every value so each branch of the remapping is exercised.
+        {
+            char legacy_path[512];
+            snprintf(legacy_path,sizeof(legacy_path),"%s/70004",dir);
+
+            uint32_t head[5];
+            head[0] = 1;                 // version 1
+            head[1] = 1700000000;        // timestamp
+            head[2] = 1;                 // interval
+            head[3] = 1;                 // typecode: a plain width of one byte
+            head[4] = 1234567890 + ((head[0] ^ head[1]) ^ (head[2] ^ head[3]));
+
+            FILE *f = fopen(legacy_path,"wb");
+            CHECK(f != NULL, "write a version 1 file by hand");
+            if(f){
+                fwrite(head,sizeof(head),1,f);
+                for(int v = 0; v < 256; v++){       // 0..255, one of each
+                    unsigned char b = (unsigned char)v;
+                    fwrite(&b,1,1,f);
+                }
+                fclose(f);
+            }
+
+            REPLY r = request("GET","/v1/series/70004","read-only-key");
+            CHECK(r.status==200 && bodyHas(r,"\"version\":1"), "it reads back as version 1");
+            CHECK(bodyHas(r,"\"type\":\"uint8\""), "with the type inferred from the width");
+
+            r = request("POST","/v1/series/70004/migrate","read-only-key");
+            CHECK(r.status==403, "migrating needs a write key");
+
+            r = request("POST","/v1/series/70004/migrate","read-write-key");
+            CHECK(r.status==200 && bodyHas(r,"\"migrated\":true"), "the migration runs");
+            CHECK(bodyHas(r,"\"points\":256"), "every point was walked");
+            CHECK(bodyHas(r,"\"remapped\":1"), "the single 1 became the no reply value");
+            CHECK(bodyHas(r,"\"clamped\":10"), "245 to 254 inclusive were pulled down, which is ten values");
+            CHECK(bodyHas(r,"\"nulls\":1"), "the single 255 was left as fill");
+
+            r = request("GET","/v1/series/70004","read-only-key");
+            CHECK(bodyHas(r,"\"version\":3"), "the header is now version 3");
+
+            // 0 and 2..243 untouched, 244 holds itself plus the ten clamped, 254
+            // is the sentinel, 255 is still the fill.
+            r = request("GET","/v1/series/70004/data?start=1700000000&end=1700000256","read-only-key");
+            CHECK(r.status==200, "the migrated series reads");
+            {
+                size_t at = r.body.find("\"data\":\"");
+                std::string blob;
+                if(at != std::string::npos){
+                    size_t from = at + 8, to = r.body.find('"',at + 8);
+                    if(to != std::string::npos) blob = r.body.substr(from,to - from);
+                }
+                CHECK(blob.size() == 512, "256 one byte points");
+                auto at_index = [&](int i){
+                    return blob.size() == 512 ? (int)strtoul(blob.substr(i*2,2).c_str(),NULL,16) : -1;
+                };
+                CHECK(at_index(0) == 0,     "0 is still 0");
+                CHECK(at_index(1) == 254,   "1 became the no reply value");
+                CHECK(at_index(2) == 2,     "2 is untouched");
+                CHECK(at_index(243) == 243, "243 is untouched");
+                CHECK(at_index(244) == 244, "244 is untouched");
+                CHECK(at_index(245) == 244, "245 was clamped");
+                CHECK(at_index(253) == 244, "253 was clamped");
+                CHECK(at_index(254) == 244, "254 was clamped, which is what clears the sentinel");
+                CHECK(at_index(255) == 255, "255 is still the fill");
+            }
+
+            r = request("POST","/v1/series/70004/migrate","read-write-key");
+            CHECK(r.status==409 && bodyHas(r,"already version 3"), "running it twice is refused");
+
+            // A version 3 series was never a candidate.
+            r = request("POST","/v1/series/70001/migrate","read-write-key");
+            CHECK(r.status==409, "a series this build created is not migrated");
+            r = request("POST","/v1/series/99999/migrate","read-write-key");
+            CHECK(r.status==404, "a series that does not exist is a 404");
+        }
+
         // points_in_file counts slots the file holds, so a series written to since
         // the last flush reports nothing on disk while reading back perfectly.
         // buffered_points is the difference, and points is what is actually there.
