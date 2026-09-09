@@ -967,8 +967,54 @@ definition when the default collides with real data.
 
 ## File format
 
-The 20 byte header records the version, the creation timestamp, the interval, a
-typecode and a checksum. Three versions exist:
+The header is **128 bytes from version 4**, and was 20 for versions 1 to 3. That
+size **is** the data offset — point *n* lives at
+`bsHeaderBytes(version) + n * datasize` — so it is part of the format, and a file
+written by an older release keeps its own header size and reads unchanged.
+
+| offset | field | |
+|---|---|---|
+| 0 | `version` | 4 |
+| 4 | `flags` | bits 0–1 address family: 0 none, 1 IPv4, 2 IPv6 |
+| 8 | `timestamp_ms` | first point, unix epoch milliseconds |
+| 16 | `interval_ms` | milliseconds between points |
+| 20 | `typecode` | datatype, width and null fill, as version 3 |
+| 24 | `null_fill` | the fill at the point's full width |
+| 32 | `profile` | which profile reads this series, 16 bytes |
+| 48 | `address` | what it measures, 16 bytes |
+| 64 | `name` | label, 48 bytes |
+| 112 | spare | 12 bytes, zero |
+| 124 | `checksum` | CRC32 of the preceding 124 bytes |
+
+**The struct is no longer the layout.** Headers are read and written field by
+field, so the format does not depend on how a compiler pads `SERIES` — which it
+did for as long as one was `fwrite`'d whole. One consequence for anything linking
+the library: `sizeof(SERIES)` is now the *decoded* header and is much larger than
+any on-disk header. Use `bsHeaderBytes(version)`.
+
+**The address family is this database's own value, not the platform's.**
+`AF_INET6` is 10 on Linux, 30 on macOS and 23 on Windows, so storing one would
+make a file mean different things depending on what wrote it.
+
+**The checksum covers the whole header**, including the profile name — which
+decides how the points are read, so a flipped byte there has to fail rather than
+quietly change their meaning.
+
+**Milliseconds are recorded but sub-second intervals are refused.** Every slot
+calculation in the database is in seconds, and converting that is a change to
+reads, writes and condensing rather than to the format. The field is here so that
+work needs no second format change; until then an interval must be a whole number
+of seconds. `interval` and `created` are still reported in seconds, with
+`interval_ms` and `created_ms` alongside them rather than the existing fields
+changing units under clients that compute point times from them.
+
+**A series names its own profile**, so a read resolves it without being told —
+including a multi series read, where each series answers with its own. An explicit
+`profile=` still wins, which is how you look at a series through a different
+convention. A migration stamps the target profile as it goes, since the points end
+up in that encoding.
+
+The earlier versions, all 20 bytes:
 
 * **Version 1** stores a plain point width and no datatype. Written by releases
   before typed headers. On read the datatype is inferred from the width (1 byte as
@@ -983,8 +1029,11 @@ typecode and a checksum. Three versions exist:
   things depending on whether that file was present — a stored `02` was a gap with
   it and a reading without it. Written for every series created now.
 
-There is no migration step and no format flag day. Version 1 and 2 files stay
-readable at unchanged offsets, and the header is still 20 bytes.
+Nothing has to be migrated. Versions 1 to 3 stay readable at their own offsets,
+verified against a real 15.9 million point version 1 file, and only newly created
+series are written as version 4. A `migrate` brings an existing series forward
+when you want the new fields, and costs nothing extra because it rewrites every
+byte anyway.
 
 The one thing this cannot fix retroactively: a version 2 series created with a
 **custom** fill never recorded it, so it still needs its definition until it is
@@ -995,4 +1044,6 @@ what shape to give a *new* series — worth keeping, since one line provisions t
 thousand of them — but an existing series is read correctly from its own header
 alone.
 
-The format is native endian and 32 bit timestamps cap it at 2106.
+Versions 1 to 3 are native endian; version 4 is written little endian
+explicitly. A 32 bit seconds timestamp caps those earlier versions at 2106, which
+is why version 4 records a 64 bit millisecond one.
