@@ -1014,6 +1014,60 @@ int main(int argc, char **argv){
             CHECK(r.status==404, "a series that does not exist is a 404");
         }
 
+        // Forcing a flush. A read already sees buffered points, so this is about
+        // durability rather than visibility -- and about not having to set
+        // flush_interval to 1 and remember to put it back.
+        {
+            REPLY r = request("POST","/v1/series/70010?type=uint8&interval=1&start=1700000000","read-write-key");
+            CHECK(r.status==201, "a series to flush");
+            r = request("POST","/v1/data","read-write-key","70010 1700000000 0a0b0c0d\n");
+            CHECK(r.status==200, "four points, buffered");
+
+            r = request("GET","/v1/series/70010","read-only-key");
+            CHECK(bodyHas(r,"\"points_in_file\":0") && bodyHas(r,"\"buffered_points\":4"),
+                  "nothing on disk yet");
+
+            r = request("POST","/v1/series/70010/flush","read-write-key");
+            CHECK(r.status==200 && bodyHas(r,"\"points_flushed\":4"), "flushing writes them out");
+            CHECK(bodyHas(r,"\"buffered_before\":4") && bodyHas(r,"\"buffered_after\":0"),
+                  "and reports the buffer before and after");
+
+            r = request("GET","/v1/series/70010","read-only-key");
+            CHECK(!bodyHas(r,"\"points_in_file\":0"), "the points are on disk now");
+            CHECK(bodyHas(r,"\"buffered_points\":0"), "and nothing is held");
+
+            // Distinguishable from "it worked": nothing was being held.
+            r = request("POST","/v1/series/70010/flush","read-write-key");
+            CHECK(r.status==200 && bodyHas(r,"\"points_flushed\":0"),
+                  "flushing again writes nothing, and says so");
+
+            // Past the end of the file, or it is written in place rather than
+            // buffered: the write ahead buffer only holds appends, and the first
+            // flush padded this series out to a whole 1024 point block.
+            r = request("POST","/v1/data","read-write-key","70010 1700001024 1112\n");
+            CHECK(r.status==200, "two more points, appended past the block");
+
+            // Counts are not asserted exactly: this table holds every series the
+            // earlier sections made, and any of them may be holding points too.
+            // What matters is that the flush reached this one.
+            r = request("POST","/v1/flush","read-write-key");
+            CHECK(r.status==200 && bodyHas(r,"\"flushed\":true"), "a table flush runs");
+
+            r = request("GET","/v1/series/70010","read-only-key");
+            CHECK(bodyHas(r,"\"buffered_points\":0"), "and it caught the series holding points");
+
+            r = request("POST","/v1/flush","read-write-key");
+            CHECK(bodyHas(r,"\"series_flushed\":0") && bodyHas(r,"\"points_flushed\":0"),
+                  "with everything already on disk, a second flush writes nothing");
+
+            r = request("POST","/v1/series/99998/flush","read-write-key");
+            CHECK(r.status==404, "a series that does not exist is a 404");
+            r = request("POST","/v1/series/70010/flush","read-only-key");
+            CHECK(r.status==403, "flushing needs a write key");
+            r = request("GET","/v1/flush","read-write-key");
+            CHECK(r.status==405, "GET is not how you flush");
+        }
+
         // points_in_file counts slots the file holds, so a series written to since
         // the last flush reports nothing on disk while reading back perfectly.
         // buffered_points is the difference, and points is what is actually there.

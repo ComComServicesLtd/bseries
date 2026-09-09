@@ -481,6 +481,20 @@ Getting there needs `seriesShape()` rather than `seriesInfo()` on any write path
 cannot grow the in memory index; calling it per point cost an open, two reads, a
 seek and a close for something the open series already knew.
 
+**A flush can be forced.** `POST /v1/{t}/series/{key}/flush` writes one series
+out, `POST /v1/{t}/flush` does every open series in the table, and both report
+what actually went to disk so "nothing was being held" is distinguishable from "it
+worked":
+
+```
+{"key":11,"flushed":true,"points_flushed":4,"buffered_before":4,"buffered_after":0}
+```
+
+This is about durability, not visibility — see below, a read already sees buffered
+points. It exists because the alternative was setting `flush_interval` to 1 and
+remembering to put it back, which flushes the whole database and, forgotten,
+leaves a router's flash on a one second write cycle.
+
 **Buffered points are readable.** A read fills its output from the file and then
 copies the write ahead buffer over the top, so a point is queryable the moment it
 is written and no flush is needed to see it. The flush timer is about what

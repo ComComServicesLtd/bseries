@@ -468,6 +468,19 @@ public:
     int flushAged(uint32_t max_age);
 
     void flush();
+
+    /// Writes one series' buffered points to its file, now rather than when the
+    /// timer next comes round.
+    ///
+    /// points_flushed reports how many went to disk, so a caller can tell "there
+    /// was nothing to write" from "it worked". A series that is not open has
+    /// nothing buffered by definition and is not an error -- whether the key
+    /// exists at all is a question for seriesInfo().
+    int flushSeries(uint32_t key, int64_t *points_flushed);
+
+    /// The same for every open series, reporting how many series held anything
+    /// and how many points went out between them.
+    int flushOpen(int64_t *series_flushed, int64_t *points_flushed);
     void close();
 
     void closeSeries(uint32_t max_age);

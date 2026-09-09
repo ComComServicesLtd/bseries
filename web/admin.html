@@ -122,6 +122,9 @@
                 v-if="s.buffered_points"> +{{ s.buffered_points }}</span></td>
             <td>
               <button class="act" @click="readSeries(s)">read</button>
+              <!-- Only when something is being held; a flush with nothing to
+                   write is a no-op and the button would just be noise. -->
+              <button class="act" v-if="s.buffered_points" @click="flushSeries(s)">flush</button>
               <!-- Only a legacy one byte unsigned series has anything to migrate;
                    the server refuses anything else, so do not offer it. -->
               <button class="act danger" v-if="migratable(s)" @click="migrateSeries(s)">migrate</button>
@@ -131,6 +134,11 @@
           <tr v-if="!series.length"><td colspan="6" class="muted">no series</td></tr>
         </tbody>
       </table>
+
+      <form class="row" v-if="table">
+        <button class="act" type="button" @click="flushTable">flush this table</button>
+        <span class="muted">writes buffered points to disk now, rather than when the timer comes round</span>
+      </form>
 
       <form class="row" v-if="table" @submit.prevent="createSeries">
         <input v-model="ns.key" placeholder="key (uint32)" size="10" required>
@@ -478,6 +486,23 @@ createApp({
     showProfile(name) {
       return this.run(async () => {
         this.profileDetail = await this.api(`/v1/profiles/${encodeURIComponent(name)}`);
+      });
+    },
+
+    flushSeries(s) {
+      return this.run(async () => {
+        const r = await this.api(
+          `/v1/${encodeURIComponent(this.table)}/series/${s.key}/flush`, { method: 'POST' });
+        this.note = `series ${r.key}: ${r.points_flushed} points written to disk`;
+        await this.loadSeries();
+      });
+    },
+
+    flushTable() {
+      return this.run(async () => {
+        const r = await this.api(`/v1/${encodeURIComponent(this.table)}/flush`, { method: 'POST' });
+        this.note = `${this.table}: ${r.points_flushed} points across ${r.series_flushed} series written to disk`;
+        await this.loadSeries();
       });
     },
 

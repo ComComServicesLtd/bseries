@@ -1343,6 +1343,21 @@ void BSeriesApi::routeTable(BSeries *db, const std::vector<std::string> &rest, c
         return;
     }
 
+    // <table>/flush - write out what is being held, now
+    if(rest[0] == "flush" && rest.size() == 1){
+
+        if(request.method != "POST"){
+            jsonError(response,405,"method_not_allowed","use POST to flush");
+            return;
+        }
+
+        if(!authorise(request,true,response))
+            return;
+
+        handleFlushTable(db,response);
+        return;
+    }
+
     // <table>/data - several series in one request, read or write
     if(rest[0] == "data" && rest.size() == 1){
 
@@ -1413,6 +1428,21 @@ void BSeriesApi::routeTable(BSeries *db, const std::vector<std::string> &rest, c
         }
 
         jsonError(response,405,"method_not_allowed","GET, POST, PUT or DELETE");
+        return;
+    }
+
+    // <table>/series/{key}/flush - one series, now
+    if(rest.size() == 3 && rest[2] == "flush"){
+
+        if(request.method != "POST"){
+            jsonError(response,405,"method_not_allowed","use POST to flush");
+            return;
+        }
+
+        if(!authorise(request,true,response))
+            return;
+
+        handleFlushSeries(db,key,response);
         return;
     }
 
@@ -1700,7 +1730,8 @@ void BSeriesApi::route(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
     std::vector<std::string> rest;
     std::string table;
 
-    if(segments[1] == "series" || segments[1] == "data" || segments[1] == "now"){
+    if(segments[1] == "series" || segments[1] == "data" || segments[1] == "now" ||
+       segments[1] == "flush"){
 
         // The unqualified paths that predate tables, which address the default
         // table. Kept so existing clients keep working against existing data.
@@ -2262,6 +2293,76 @@ void BSeriesApi::handleMigrateSeries(BSeries *db, uint32_t key, const HTTP_REQUE
 /// bytes: the family follows from the text, which is one fewer thing to get wrong
 /// and one fewer way for the stored bytes to disagree with the flag describing
 /// them.
+
+/// Writes buffered points out now, rather than when the timer next comes round.
+///
+/// A read already sees buffered points, so this is about durability, not
+/// visibility: it is what to call after a write that has to survive losing power,
+/// and it exists because the alternative was setting flush_interval to 1 and
+/// remembering to put it back -- which flushes the whole database and, forgotten,
+/// leaves a router's flash on a one second write cycle.
+///
+/// Reports what was actually written, so "nothing was being held" is
+/// distinguishable from "it worked".
+
+void BSeriesApi::handleFlushSeries(BSeries *db, uint32_t key, HTTP_RESPONSE &response){
+
+    SERIES header;
+    int64_t file_size = 0;
+
+    // Whether the key exists is a separate question from whether anything is
+    // buffered for it: a series that is not open holds nothing, which is not an
+    // error, but a key that does not exist is.
+    if(db->seriesInfo(key,&header,&file_size) != NO_ERROR){
+        jsonError(response,404,"not_found","no such series");
+        return;
+    }
+
+    int64_t buffered_before = db->bufferedPoints(key);
+    int64_t flushed = 0;
+
+    int rc = db->flushSeries(key,&flushed);
+
+    if(rc != NO_ERROR){
+        jsonDatabaseError(response,rc,"flushing the series");
+        return;
+    }
+
+    char body[224];
+    snprintf(body,sizeof(body),
+             "{\"key\":%lu,\"flushed\":true,\"points_flushed\":%lld,\"buffered_before\":%lld,"
+             "\"buffered_after\":%lld}",
+             (unsigned long)key,
+             (long long)flushed,
+             (long long)buffered_before,
+             (long long)db->bufferedPoints(key));
+
+    response.status = 200;
+    response.body = body;
+}
+
+
+void BSeriesApi::handleFlushTable(BSeries *db, HTTP_RESPONSE &response){
+
+    int64_t series_flushed = 0, points_flushed = 0;
+
+    int rc = db->flushOpen(&series_flushed,&points_flushed);
+
+    if(rc != NO_ERROR){
+        jsonDatabaseError(response,rc,"flushing the table");
+        return;
+    }
+
+    char body[224];
+    snprintf(body,sizeof(body),
+             "{\"flushed\":true,\"series_flushed\":%lld,\"points_flushed\":%lld}",
+             (long long)series_flushed,
+             (long long)points_flushed);
+
+    response.status = 200;
+    response.body = body;
+}
+
 
 void BSeriesApi::handleSetSeriesMeta(BSeries *db, uint32_t key, const HTTP_REQUEST &request,
                                      HTTP_RESPONSE &response){

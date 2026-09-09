@@ -2311,6 +2311,99 @@ int BSeries::listSeriesKeys(vector<uint32_t> *keys, uint32_t after, int limit){
 
 
 
+int BSeries::flushSeries(uint32_t key, int64_t *points_flushed){
+
+    if(points_flushed)
+        *points_flushed = 0;
+
+    if(shuttingDown)
+        return FAILED_TO_OPEN_FILE;
+
+    index_access.lock();
+
+    map<uint32_t,ENTRY>::iterator it = series_list.find(key);
+
+    if(it == series_list.end()){
+        index_access.unlock();
+        return NO_ERROR;            // not open, so nothing is being held for it
+    }
+
+    it->second.access.lock();       // waits for a write in flight to finish
+    index_access.unlock();
+
+    int status = NO_ERROR;
+    int64_t held = it->second.buffer_points;
+
+    // last_write is only set once a write has landed, so a series that has only
+    // ever been read has nothing to write out.
+    if(held > 0 && it->second.write_ahead_cache != NULL && it->second.last_write){
+
+        FILE *file = openFile(key,true);
+
+        if(file == NULL){
+            status = FAILED_TO_OPEN_FILE;
+        } else {
+            if(!flushBuffer(&it->second,file))
+                status = WAL_WRITE_FAILURE;
+            fclose(file);
+        }
+    }
+
+    if(status == NO_ERROR && points_flushed)
+        *points_flushed = held;
+
+    it->second.access.unlock();
+
+    return status;
+}
+
+
+int BSeries::flushOpen(int64_t *series_flushed, int64_t *points_flushed){
+
+    if(series_flushed) *series_flushed = 0;
+    if(points_flushed) *points_flushed = 0;
+
+    if(shuttingDown)
+        return FAILED_TO_OPEN_FILE;
+
+    int status = NO_ERROR;
+
+    index_access.lock();
+
+    for(map<uint32_t,ENTRY>::iterator it = series_list.begin(); it != series_list.end(); it++){
+
+        it->second.access.lock();
+
+        int64_t held = it->second.buffer_points;
+
+        if(held > 0 && it->second.write_ahead_cache != NULL && it->second.last_write){
+
+            FILE *file = openFile(it->first,true);
+
+            if(file == NULL){
+                status = FAILED_TO_OPEN_FILE;
+            } else {
+
+                if(flushBuffer(&it->second,file)){
+                    if(series_flushed) (*series_flushed)++;
+                    if(points_flushed) (*points_flushed) += held;
+                } else {
+                    status = WAL_WRITE_FAILURE;
+                }
+
+                fclose(file);
+            }
+        }
+
+        it->second.access.unlock();
+    }
+
+    index_access.unlock();
+
+    return status;
+}
+
+
 void BSeries::flush()
 {
 

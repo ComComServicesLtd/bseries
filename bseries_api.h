@@ -193,6 +193,8 @@ private:
     void handleMigrateSeries(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleSetSeriesProfile(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleSetSeriesMeta(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+    void handleFlushSeries(BSeries *db, uint32_t key, HTTP_RESPONSE &response);
+    void handleFlushTable(BSeries *db, HTTP_RESPONSE &response);
     void applySeriesProfile(const SERIES &header, CONDENSE_RESERVED *reserved);
     void handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
