@@ -713,8 +713,8 @@ literal  2-254  ms
 
 # profiles/ping — where it is going
 literal  0-244  ms
-bucket   245    245-500     "over 244 ms"
-bucket   246    500-1000    "over 500 ms"
+bucket   245    245-500     "245 to 500 ms"
+bucket   246    501-1000    "501 to 1000 ms"
 state    254    no_reply    "No reply"
 ```
 
@@ -819,9 +819,9 @@ profile:
 # state   <value>  <code>        "<label>" [colour]
 
 literal  0-244  ms          #0000FF,#00FFFF,#00FF00,#FFFF00,#FF0000
-bucket   245    245-500     "over 244 ms"    #FF8C00
-bucket   246    500-1000    "over 500 ms"    #FF4500
-bucket   247    1000-30000  "over 1000 ms"   #B22222
+bucket   245    245-500     "245 to 500 ms"     #FF8C00
+bucket   246    501-1000    "501 to 1000 ms"    #FF4500
+bucket   247    1001-30000  "over 1000 ms"      #B22222
 state    254    no_reply    "No reply"       #000000
 ```
 
@@ -832,6 +832,11 @@ Three kinds of value, and the difference between them is the whole point:
 * **bucket** — a reading, but known only to lie in a range. This is how one byte
   records a 30 second timeout: the stored value is an *ordinal*, the bounds are
   the *magnitude*, and a bound may be far outside what the type can hold.
+  **Bounds are inclusive at both ends**: a reading belongs to the bucket where
+  `low <= reading <= high`, so adjacent ranges are written `245-500`, `501-1000`,
+  `1001-30000` — the way a range of milliseconds is read. A shared edge is an
+  overlap and is refused, since the shared value would belong to two buckets at
+  once and whichever was reached last would silently win.
 * **state** — not a reading at all. Excluded from every aggregate and counted
   separately.
 

@@ -2112,7 +2112,9 @@ static bool buildRemap(const PROFILE *from, const PROFILE *to, unsigned char *ma
 
             } else if(e.kind == BS_PROFILE_BUCKET){
 
-                if(magnitude >= e.low && magnitude < e.high)
+                // Inclusive at both ends, so 245-500 and 501-1000 are written the
+                // way milliseconds are read rather than needing a shared edge.
+                if(magnitude >= e.low && magnitude <= e.high)
                     bucket = &e;
             }
         }

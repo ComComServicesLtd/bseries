@@ -2,6 +2,8 @@
 #
 #   0-244    a reading, in milliseconds
 #   245-247  a reading known only to a range, so an outlier costs one byte
+#            bounds are inclusive at both ends, so ranges are written
+#            245-500, 501-1000, 1001-30000
 #   248-253  ICMP outcomes: the probe was answered, but not with a reply
 #   254      no reply at all
 #   255      nothing was polled (the header owns this)
@@ -13,9 +15,9 @@
 
 literal  0-244  ms          #0000FF,#00FFFF,#00FF00,#FFFF00,#FF0000
 
-bucket   245    245-500     "over 244 ms"    #FF8C00
-bucket   246    500-1000    "over 500 ms"    #FF4500
-bucket   247    1000-30000  "over 1000 ms"   #B22222
+bucket   245    245-500     "245 to 500 ms"     #FF8C00
+bucket   246    501-1000    "501 to 1000 ms"    #FF4500
+bucket   247    1001-30000  "over 1000 ms"      #B22222
 
 state    248    send_error    "Send error"                   #6A5ACD
 state    249    other         "Other ICMP error"             #7B68EE

@@ -182,8 +182,37 @@ static bool validate(const PROFILE &profile, std::string *error){
                 return false;
             }
 
-            // Buckets are compared by their stored value, so a maximum only lands
-            // on the right one when the stored order matches the magnitudes.
+            // Bounds are inclusive at both ends: a reading belongs to the bucket
+            // where low <= it <= high. So 245-500 and 501-1000 are the way to
+            // write two adjacent ranges, and 245-500 with 500-1000 is an overlap
+            // -- 500 belongs to both, and whichever the loop reached last would
+            // win, silently.
+            if(e.kind == BS_PROFILE_BUCKET && f.kind == BS_PROFILE_BUCKET){
+
+                if(e.low <= f.high && f.low <= e.high){
+                    snprintf(message,sizeof(message),
+                             "buckets %g and %g cover overlapping ranges, %g-%g and %g-%g",
+                             e.first,f.first,e.low,e.high,f.low,f.high);
+                    *error = message;
+                    return false;
+                }
+            }
+
+            // A literal reading and a bucket claiming the same magnitude has the
+            // same problem: the value is exact and a floor at once.
+            if(e.kind == BS_PROFILE_LITERAL && f.kind == BS_PROFILE_BUCKET){
+
+                double lo = e.first * e.scale, hi = e.last * e.scale;
+
+                if(lo <= f.high && f.low <= hi){
+                    snprintf(message,sizeof(message),
+                             "the literal range reaches %g, which bucket %g already covers",
+                             hi,f.first);
+                    *error = message;
+                    return false;
+                }
+            }
+
             if(e.kind == BS_PROFILE_BUCKET && f.kind == BS_PROFILE_BUCKET){
 
                 bool stored_ascends = e.first < f.first;

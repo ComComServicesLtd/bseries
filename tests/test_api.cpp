@@ -708,7 +708,7 @@ int main(int argc, char **argv){
             if(f){
                 fputs("literal  0-244  ms          #0000FF,#FF0000\n",f);
                 fputs("bucket   245    245-500     \"over 244 ms\"   #FF8C00\n",f);
-                fputs("bucket   246    500-1000    \"over 500 ms\"   #FF4500\n",f);
+                fputs("bucket   246    501-1000    \"over 500 ms\"   #FF4500\n",f);
                 fputs("state    254    no_reply    \"No reply\"      #000000\n",f);
                 fclose(f);
             }
@@ -762,7 +762,7 @@ int main(int argc, char **argv){
             r = request("GET","/v1/profiles/does_not_exist","read-only-key");
             CHECK(r.status==404, "a missing profile is a 404");
 
-            // 10, 20, 245 (bucket 245-500), 246 (bucket 500-1000), 254 (no reply)
+            // 10, 20, 245 (bucket 245-500), 246 (bucket 501-1000), 254 (no reply)
             r = request("POST","/v1/series/70005?type=uint8&interval=1&start=1700000000","read-write-key");
             CHECK(r.status==201, "a series to profile");
             r = request("POST","/v1/data","read-write-key","70005 1700000000 0a14f5f6fe\n");
@@ -804,7 +804,7 @@ int main(int argc, char **argv){
                 CHECK(value > 9.9 && value < 10.1, "min is the low edge, 10");
             }
 
-            // (10 + 20 + 245 + 500) / 4, the bucket low edges, no reserved point
+            // (10 + 20 + 245 + 501) / 4, the bucket low edges, no reserved point
             r = request("GET",(std::string(RANGE) + "&condense=average&profile=pingt").c_str(),"read-only-key");
             {
                 size_t at = r.body.find("\"data\":\"");
@@ -815,7 +815,7 @@ int main(int argc, char **argv){
                         bytes[j] = (unsigned char)strtoul(r.body.substr(at + 8 + j*2,2).c_str(),NULL,16);
                     memcpy(&value,bytes,8);
                 }
-                CHECK(value > 193.7 && value < 193.8, "average uses the low edges and excludes the state");
+                CHECK(value > 193.9 && value < 194.1, "average uses the low edges and excludes the state");
             }
 
             // The profile comes back with the data, so nothing needs a second call.
