@@ -211,7 +211,7 @@ table name.
 | GET | `/v1/{t}/series/{key}` | read | header and size |
 | POST | `/v1/{t}/series/{key}?type=&interval=&start=` | write | create |
 | DELETE | `/v1/{t}/series/{key}` | write | delete |
-| POST | `/v1/{t}/series/{key}/migrate` | write | rewrite a version 1 series as version 3 |
+| POST | `/v1/{t}/series/{key}/migrate?from=&to=&dry_run=` | write | re-encode a series between two profiles |
 | GET | `/v1/profiles` | read | list value profiles |
 | GET | `/v1/profiles/{name}` | read | one profile, immutable and cacheable |
 | GET | `/v1/{t}/series/{key}/data?start=&end=` | read | read a range |
@@ -683,51 +683,59 @@ many are held at once.
 ### Migrating a legacy series
 
 A version 1 header records a point width and no datatype, so a one byte series
-reads back as `uint8` with 255 for the fill. That leaves a prober's own sentinel
-— 1 for "no reply" — sitting in the middle of the readings, where it is the
-*smallest* value rather than the worst one. It drags an average down, never
-appears in a maximum, and pins a minimum to itself forever.
+reads back as `uint8` with 255 for the fill. What the values *mean* was never in
+the file at all — a prober's `1` for "no reply" sat in the middle of the readings,
+where it is the *smallest* value rather than the worst one, dragging averages down
+and never appearing in a maximum.
+
+Migration is therefore not a special case: a legacy file is one whose values
+follow a convention nobody wrote down, and writing that convention as a profile
+makes bringing it forward the same operation as re-encoding any other series.
 
 ```
-$ curl -XPOST -H 'X-API-Key: $WRITE_KEY' 'localhost:8086/v1/lab/series/531/migrate'
-{"key":531,"migrated":true,"from_version":1,"to_version":3,"points":15894380,
- "remapped":910173,"clamped":3209,"nulls":1780471,
- "no_reply":254,"reading_max":244,"null_fill":255}
+# profiles/ping_legacy — what the old prober wrote
+state    1      no_reply  "No reply"
+literal  2-254  ms
+
+# profiles/ping — where it is going
+literal  0-244  ms
+bucket   245    245-500     "over 244 ms"
+bucket   246    500-1000    "over 500 ms"
+state    254    no_reply    "No reply"
 ```
 
-Afterwards a `uint8` series means: **0 to 244** a reading, **245 to 253** spare
-for another sentinel, **254** no reply, **255** nothing recorded. The admin page
-offers the button on any series whose file is still version 1.
+```
+$ curl -XPOST -H 'X-API-Key: $WRITE_KEY' \
+    'localhost:8086/v1/lab/series/2288/migrate?from=ping_legacy&to=ping&dry_run=1'
+{"key":2288,"migrated":false,"dry_run":true,"from":"ping_legacy","to":"ping",
+ "from_version":1,"to_version":3,
+ "points":15894380,"changed":2478754,"unchanged":11766182,"nulls":1649444,
+ "mapping":[{"from":1,"to":254},{"from":246,"to":245},…]}
+```
 
-The migration does three things: it moves 1 to 254, pulls 245 to 254 down to 244,
-and stamps a version 3 header recording `uint8` and a 255 fill. Both headers are
-20 bytes, so the data does not move.
+Every stored value is classified under the source profile, turned into the
+magnitude or the state it stands for, and expressed again in the target's terms. A
+state keeps its **code** and takes whatever value the target uses for it, so the
+two profiles may put "no reply" in different places. A reading stays literal if
+the target's range reaches it, and otherwise lands in the bucket that covers it.
 
-**245 to 254, not 245 to 253.** The range has to include the value the sentinel is
-moving *into*, or a real reading of 254 becomes indistinguishable from a no reply.
-On the series above that was 2,896 readings — small, but it is the difference
-between 254 meaning one thing and meaning two.
+**That last part is the point.** A reading of 250ms becomes "over 244 ms", not a
+clamped 244 claiming to be an exact measurement it never was. On a real series,
+clamping moved 6,818 readings onto 244 and inflated it from 162 occurrences to
+6,980; the bucket mapping leaves 244 alone and puts them where they belong.
 
-**It cannot be undone**, and it is not re-runnable: the two steps are one pass in
-that order, so a second run would clamp the sentinels the first one wrote. The
-version field is the guard, and a series that is not a version 1 one byte unsigned
-file is refused with a 409 rather than migrated into something meaningless.
+**`dry_run=1` counts and shows the whole mapping without writing**, which matters
+because the rewrite cannot be undone. The admin page offers the dry run first and
+only enables *apply* once it has one.
+
+A value the source profile does not cover is left alone and counted rather than
+guessed at, and the null fill is never translated whatever the map says — a slot
+holding it was never written to.
 
 The series is flushed and evicted first, then written to `<key>.migrating` and
 renamed over the original, so an interrupted run leaves the original untouched.
-That needs the file's size again in free space — worth checking on a router before
-migrating a series of any size. The index lock is held throughout, so the database
-is quiet while it runs.
-
-What this buys, on five years of a real series at six buckets:
-
-| | min | max | avg raw | avg `reserved=254` | loss |
-|---|---|---|---|---|---|
-| bucket 0 | 7 | 254 | 23.22 | 22.87 | 0.1% |
-| bucket 5 | 8 | 254 | 90.87 | 23.10 | 27.1% |
-
-Before the migration that last bucket averaged **14ms** and looked like the
-fastest week in the series, because a quarter of its readings were a 1.
+That needs the file's size again in free space, which is worth checking on a
+router before migrating anything large.
 
 ### Values that are not measurements
 

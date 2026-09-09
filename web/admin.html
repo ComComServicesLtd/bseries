@@ -155,21 +155,90 @@
           <button class="act" type="submit">read</button>
         </form>
         <!-- Only with condense: a raw read hands back what was stored, and the
-             server refuses reserved there rather than ignoring it. -->
+             server refuses a profile there rather than ignoring it. -->
         <form class="row" v-if="range.condense" @submit.prevent="fetchPoints">
-          <input v-model="range.reserved" placeholder="reserved e.g. 1,2" size="14">
-          <select v-model="range.reserved_mode" :disabled="!range.reserved">
-            <option value="">exclude</option>
-            <option value="dominate">dominate</option>
+          <select v-model="range.profile">
+            <option value="">no profile (values at face value)</option>
+            <option v-for="p in profileNames" :key="p" :value="p">{{ p }}</option>
           </select>
-          <input v-model="range.reserved_threshold" placeholder="threshold 0–1" size="12"
-                 :disabled="range.reserved_mode !== 'dominate'">
           <span class="muted" v-if="lastRead && lastRead.reserved_points !== undefined">
-            {{ lastRead.reserved_points }} reserved of {{ lastRead.source_points }}
+            {{ lastRead.literal_points }} exact ·
+            {{ lastRead.bucketed_points }} bucketed ·
+            {{ lastRead.reserved_points }} not a reading
+            <template v-if="lastRead.lower_bound"> · <strong>lower bound</strong></template>
           </span>
         </form>
         <pre v-if="points.length">{{ points.map(p => p[0] + '  ' + p[1] + (p[2] === null ? '' : '   loss ' + p[2])).join('\n') }}</pre>
         <p v-else-if="points.checked" class="muted">no points in that range</p>
+      </template>
+
+      <!-- Re-encoding a series from one convention to another. Dry run first,
+           because it rewrites the file and cannot be undone. -->
+      <template v-if="migrating">
+        <h2>re-encode series {{ migrating.key }}</h2>
+        <p class="muted">Every stored value is read under <em>from</em> and written
+           again under <em>to</em>. Readings the target cannot hold exactly land in
+           the bucket that covers them rather than being clamped.</p>
+        <form class="row" @submit.prevent>
+          <select v-model="mig.from">
+            <option value="">from profile…</option>
+            <option v-for="p in profileNames" :key="p" :value="p">{{ p }}</option>
+          </select>
+          <select v-model="mig.to">
+            <option value="">to profile…</option>
+            <option v-for="p in profileNames" :key="p" :value="p">{{ p }}</option>
+          </select>
+          <button class="act" :disabled="!mig.from || !mig.to" @click="runMigrate(true)">dry run</button>
+          <button class="act danger" :disabled="!mig.from || !mig.to || !migReport"
+                  @click="runMigrate(false)">apply</button>
+          <button class="act" @click="migrating = null; migReport = null">cancel</button>
+        </form>
+        <template v-if="migReport">
+          <p>{{ migReport.points }} points · <strong>{{ migReport.changed }}</strong> would change ·
+             {{ migReport.unchanged }} unchanged · {{ migReport.nulls }} fill</p>
+          <pre v-if="migReport.mapping.length">{{ migReport.mapping.map(m => m.from + ' → ' + m.to).join('\n') }}</pre>
+          <p v-else class="muted">this mapping changes nothing</p>
+        </template>
+      </template>
+    </section>
+
+    <!-- -------------------------------------------------------- profiles -->
+    <section v-if="tab === 'profiles'">
+      <p class="muted">A profile says what a series' values mean. They are files in
+         <code>profiles/</code> inside the data directory and are immutable by
+         convention — changing a meaning is a new profile, not an edit.</p>
+      <table>
+        <thead><tr><th>profile</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="p in profileNames" :key="p">
+            <td><code>{{ p }}</code></td>
+            <td><button class="act" @click="showProfile(p)">show</button></td>
+          </tr>
+          <tr v-if="!profileNames.length"><td colspan="2" class="muted">no profiles</td></tr>
+        </tbody>
+      </table>
+
+      <template v-if="profileDetail">
+        <h2>{{ profileDetail.profile }}</h2>
+        <table>
+          <thead><tr><th>kind</th><th class="num">stored</th><th>means</th><th>label</th><th>colour</th></tr></thead>
+          <tbody>
+            <tr v-for="(e, i) in profileDetail.entries" :key="i">
+              <td>{{ e.kind }}</td>
+              <td class="num"><code>{{ e.kind === 'literal' ? e.first + '–' + e.last : e.value }}</code></td>
+              <td>
+                <template v-if="e.kind === 'literal'">{{ e.unit }}<span v-if="e.scale !== 1"> × {{ e.scale }}</span></template>
+                <template v-else-if="e.kind === 'bucket'">{{ e.low }}–{{ e.high }}</template>
+                <template v-else><code>{{ e.code }}</code></template>
+              </td>
+              <td class="muted">{{ e.label }}</td>
+              <td>
+                <span v-for="c in e.colours" :key="c" :style="{background:c}"
+                      style="display:inline-block;width:1rem;height:1rem;border-radius:2px;margin-right:2px"></span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </template>
     </section>
 
@@ -237,14 +306,15 @@ createApp({
   data: () => ({
     key: sessionStorage.getItem('bseries_key') || '',
     keyInput: '', busy: false, error: '', note: '',
-    tab: 'tables', tabs: ['tables','series','keys','config'],
+    tab: 'tables', tabs: ['tables','series','profiles','keys','config'],
     health: null, tables: [], newTable: '',
     table: '', series: [], after: '', tableChosen: false,
     ns: { key:'', type:'float32', interval:'60', start:'' },
     types: ['uint8','uint16','uint32','uint64','int8','int16','int32','int64','float32','float64'],
     reading: null, points: [], lastRead: null,
-    range: { start:'', end:'', max_points:'', condense:'',
-             reserved:'', reserved_mode:'', reserved_threshold:'' },
+    range: { start:'', end:'', max_points:'', condense:'', profile:'' },
+    profileNames: [], profileDetail: null,
+    migrating: null, mig: { from:'', to:'' }, migReport: null,
     keys: [], nk: { name:'', role:'read' }, minted: null,
     config: {},
     mutable: ['flush_interval','series_max_idle','maintenance_interval',
@@ -296,7 +366,8 @@ createApp({
     go(tab) {
       this.tab = tab; this.error = ''; this.note = '';
       if (tab === 'tables') this.loadTables();
-      if (tab === 'series') { this.loadTables().then(() => this.openSeriesTab()); }
+      if (tab === 'series') { this.loadTables().then(() => this.openSeriesTab()); this.loadProfiles(); }
+      if (tab === 'profiles') this.loadProfiles();
       if (tab === 'keys')   this.loadKeys();
       if (tab === 'config') this.loadConfig();
       this.api('/v1/health').then(h => this.health = h).catch(() => {});
@@ -362,27 +433,51 @@ createApp({
         this.ns.key = ''; await this.loadSeries();
       }, 'series created');
     },
-    // A version 1 file records a width and no datatype, so 1 byte reads back as
-    // uint8. Anything else has no remapping defined and the server refuses it.
-    migratable(s) { return s.version === 1 && s.datasize === 1 && s.type === 'uint8'; },
+    // A remap is one byte to one byte. It is not version gated: bringing a legacy
+    // file forward and re-encoding a current one between two conventions are the
+    // same operation, so anything storing single unsigned bytes can be offered it.
+    migratable(s) { return s.datasize === 1 && s.type === 'uint8'; },
 
     migrateSeries(s) {
-      // Spelled out rather than a bare "are you sure": it cannot be undone, and
-      // the two lossy parts are not obvious from the button.
-      if (!confirm(
-        `Migrate series ${s.key} from version 1 to version 3?\n\n` +
-        `Readings of 1 become 254, the value meaning "no reply".\n` +
-        `Readings of 245 to 254 are pulled down to 244.\n` +
-        `255 stays as "nothing recorded".\n\n` +
+      this.migrating = s;
+      this.migReport = null;
+      // A legacy file is a good guess at the source, but never at the target.
+      this.mig = { from: s.version === 1 ? (this.profileNames[0] || '') : '', to: '' };
+      if (!this.profileNames.length) this.loadProfiles();
+    },
+
+    runMigrate(dry) {
+      if (!dry && !confirm(
+        `Re-encode series ${this.migrating.key} from "${this.mig.from}" to "${this.mig.to}"?\n\n` +
+        `${this.migReport.changed} of ${this.migReport.points} points change.\n\n` +
         `This rewrites the file and cannot be undone.`)) return;
 
       return this.run(async () => {
+        const q = new URLSearchParams({ from: this.mig.from, to: this.mig.to });
+        if (dry) q.set('dry_run', '1');
         const r = await this.api(
-          `/v1/${encodeURIComponent(this.table)}/series/${s.key}/migrate`, { method: 'POST' });
-        this.note = `series ${r.key} migrated: ${r.points} points, ` +
-                    `${r.remapped} remapped to ${r.no_reply}, ${r.clamped} clamped to ${r.reading_max}, ` +
-                    `${r.nulls} left as fill`;
-        await this.loadSeries();
+          `/v1/${encodeURIComponent(this.table)}/series/${this.migrating.key}/migrate?${q}`,
+          { method: 'POST' });
+        this.migReport = r;
+        if (!dry) {
+          this.note = `series ${r.key} re-encoded ${r.from} → ${r.to}: ` +
+                      `${r.changed} of ${r.points} points changed, ${r.nulls} left as fill`;
+          this.migrating = null;
+          this.migReport = null;
+          await this.loadSeries();
+        }
+      });
+    },
+
+    loadProfiles() {
+      return this.run(async () => {
+        this.profileNames = (await this.api('/v1/profiles')).profiles || [];
+      });
+    },
+
+    showProfile(name) {
+      return this.run(async () => {
+        this.profileDetail = await this.api(`/v1/profiles/${encodeURIComponent(name)}`);
       });
     },
 
@@ -410,12 +505,7 @@ createApp({
         if (this.range.max_points && this.range.condense) {
           q.set('max_points', this.range.max_points);
           q.set('condense', this.range.condense);
-          if (this.range.reserved) {
-            q.set('reserved', this.range.reserved);
-            if (this.range.reserved_mode) q.set('reserved_mode', this.range.reserved_mode);
-            if (this.range.reserved_mode === 'dominate' && this.range.reserved_threshold)
-              q.set('reserved_threshold', this.range.reserved_threshold);
-          }
+          if (this.range.profile) q.set('profile', this.range.profile);
         }
         const r = await this.api(`/v1/${encodeURIComponent(this.table)}/series/${this.reading.key}/data?${q}`);
         this.lastRead = r;

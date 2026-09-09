@@ -1426,7 +1426,7 @@ void BSeriesApi::routeTable(BSeries *db, const std::vector<std::string> &rest, c
         if(!authorise(request,true,response))
             return;
 
-        handleMigrateSeries(db,key,response);
+        handleMigrateSeries(db,key,request,response);
         return;
     }
 
@@ -1936,15 +1936,110 @@ void BSeriesApi::handleCreateSeries(BSeries *db, uint32_t key, const HTTP_REQUES
 }
 
 
-/// Rewrites a legacy uint8 series as version 3, moving a prober's "no reply" to
-/// where the database reserves values rather than where the prober happened to put
-/// it. See BSeries::migrateLegacyUint8().
+/// Re-encodes a one byte series from one profile's conventions into another's.
 ///
-/// Reports what it moved rather than only that it worked: the counts are how an
-/// operator confirms the file held what they thought it did, and the operation
-/// cannot be undone to check afterwards.
+/// This is the migration path for legacy data, but it is not special cased to it:
+/// a version 1 file is simply one whose values follow a convention nobody wrote
+/// down, and naming that convention as a profile makes bringing it forward the
+/// same operation as re-encoding any other series.
+///
+/// The mapping is worked out here rather than in the database, because what a
+/// value means is not something the database knows. Every stored value is
+/// classified under the source profile, turned into the magnitude or the state it
+/// stands for, and then expressed again in the target profile's terms:
+///
+///   a state    keeps its code and takes whatever value the target uses for it
+///   a literal  becomes a literal if the target's range reaches, otherwise the
+///              bucket whose range contains it -- which is how a reading of 250ms
+///              becomes "over 244 ms" rather than being clamped to 244 and
+///              claiming to be an exact measurement it never was
+///   a bucket   is carried across by its low bound, the same way
+///
+/// A value the source profile does not cover is left alone and counted, rather
+/// than guessed at.
 
-void BSeriesApi::handleMigrateSeries(BSeries *db, uint32_t key, HTTP_RESPONSE &response){
+static bool buildRemap(const PROFILE *from, const PROFILE *to, unsigned char *map256,
+                       std::string *error){
+
+    // What the target uses for each of its own kinds, looked up once.
+    for(int v = 0; v < 256; v++)
+        map256[v] = (unsigned char)v;
+
+    for(int v = 0; v < 256; v++){
+
+        const PROFILE_ENTRY *source = ProfileStore::classify(from,(double)v);
+
+        if(source == NULL)
+            continue;                      // not covered; left where it is
+
+        if(source->kind == BS_PROFILE_STATE){
+
+            // Matched by code, not by value: the whole point is that the two
+            // profiles may put "no reply" in different places.
+            const PROFILE_ENTRY *target = NULL;
+
+            for(size_t i = 0; i < to->entries.size(); i++){
+                if(to->entries[i].kind == BS_PROFILE_STATE && to->entries[i].code == source->code)
+                    target = &to->entries[i];
+            }
+
+            if(target == NULL){
+                *error = "the target profile has no state \"" + source->code + "\"";
+                return false;
+            }
+
+            map256[v] = (unsigned char)target->first;
+            continue;
+        }
+
+        // A reading. Take the magnitude it stands for and express it again.
+        double magnitude = (source->kind == BS_PROFILE_BUCKET)
+                         ? source->low
+                         : (double)v * source->scale;
+
+        const PROFILE_ENTRY *literal = NULL;
+        const PROFILE_ENTRY *bucket = NULL;
+
+        for(size_t i = 0; i < to->entries.size(); i++){
+
+            const PROFILE_ENTRY &e = to->entries[i];
+
+            if(e.kind == BS_PROFILE_LITERAL){
+
+                double stored = magnitude / (e.scale ? e.scale : 1.0);
+
+                if(stored >= e.first && stored <= e.last)
+                    literal = &e;
+
+            } else if(e.kind == BS_PROFILE_BUCKET){
+
+                if(magnitude >= e.low && magnitude < e.high)
+                    bucket = &e;
+            }
+        }
+
+        // A literal wins: it is exact, and a bucket only says the reading was
+        // somewhere in a range.
+        if(literal != NULL){
+            double stored = magnitude / (literal->scale ? literal->scale : 1.0);
+            map256[v] = (unsigned char)(stored + 0.5);
+        } else if(bucket != NULL){
+            map256[v] = (unsigned char)bucket->first;
+        } else {
+            char message[160];
+            snprintf(message,sizeof(message),
+                     "the target profile has nowhere to put a reading of %g",magnitude);
+            *error = message;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+void BSeriesApi::handleMigrateSeries(BSeries *db, uint32_t key, const HTTP_REQUEST &request,
+                                     HTTP_RESPONSE &response){
 
     SERIES header;
     int64_t file_size = 0;
@@ -1954,43 +2049,92 @@ void BSeriesApi::handleMigrateSeries(BSeries *db, uint32_t key, HTTP_RESPONSE &r
         return;
     }
 
-    if(header.version != SERIES_VERSION_LEGACY){
-        char message[160];
-        snprintf(message,sizeof(message),
-                 "this series is already version %lu; only a version 1 file is migrated",
-                 (unsigned long)header.version);
-        jsonError(response,409,"not_applicable",message);
-        return;
-    }
-
     if(bsHeaderDataSize(&header) != 1 || bsHeaderDataType(&header) != BS_UNSIGNED){
         jsonError(response,409,"not_applicable",
-                  "the remapping is defined for one byte unsigned series only");
+                  "a remap is one byte to one byte; this series is not a uint8");
         return;
     }
+
+    std::string from_name = httpQueryParam(request,"from");
+    std::string to_name = httpQueryParam(request,"to");
+
+    if(from_name.empty() || to_name.empty()){
+        jsonError(response,400,"bad_parameter",
+                  "from and to name the profiles to re-encode between; a legacy series "
+                  "needs a profile describing the convention it was written with");
+        return;
+    }
+
+    std::string error;
+    const PROFILE *from = profiles.get(from_name,&error);
+
+    if(from == NULL){
+        jsonError(response,404,"not_found",error);
+        return;
+    }
+
+    const PROFILE *to = profiles.get(to_name,&error);
+
+    if(to == NULL){
+        jsonError(response,404,"not_found",error);
+        return;
+    }
+
+    unsigned char map256[256];
+
+    if(!buildRemap(from,to,map256,&error)){
+        jsonError(response,409,"not_applicable",error);
+        return;
+    }
+
+    // Counted without writing, because this cannot be undone and the counts are
+    // the only chance to notice the file did not hold what was expected.
+    std::string dry_text = httpQueryParam(request,"dry_run");
+    bool dry_run = !dry_text.empty() && dry_text != "0" && dry_text != "false";
 
     MIGRATION_REPORT report;
-    int rc = db->migrateLegacyUint8(key,&report);
+    int rc = db->remapUint8(key,map256,&report,dry_run);
 
     if(rc != NO_ERROR){
-        jsonDatabaseError(response,rc,"migrating the series");
+        jsonDatabaseError(response,rc,"re-encoding the series");
         return;
     }
 
-    char body[448];
+    std::string body = "{";
+    char buffer[448];
 
-    snprintf(body,sizeof(body),
-        "{\"key\":%lu,\"migrated\":true,\"from_version\":1,\"to_version\":3,"
-        "\"points\":%lld,\"remapped\":%lld,\"clamped\":%lld,\"nulls\":%lld,"
-        "\"no_reply\":%d,\"reading_max\":%d,\"null_fill\":%d}",
+    snprintf(buffer,sizeof(buffer),
+        "\"key\":%lu,\"migrated\":%s,\"dry_run\":%s,\"from\":\"%s\",\"to\":\"%s\","
+        "\"from_version\":%lu,\"to_version\":3,"
+        "\"points\":%lld,\"changed\":%lld,\"unchanged\":%lld,\"nulls\":%lld,\"mapping\":[",
         (unsigned long)key,
+        dry_run ? "false" : "true",
+        dry_run ? "true" : "false",
+        from_name.c_str(),
+        to_name.c_str(),
+        (unsigned long)header.version,
         (long long)report.points,
-        (long long)report.remapped,
-        (long long)report.clamped,
-        (long long)report.nulls,
-        BS_NO_REPLY,
-        BS_READING_MAX,
-        (int)bsTypeNullFill(BS_UNSIGNED,1));
+        (long long)report.changed,
+        (long long)report.unchanged,
+        (long long)report.nulls);
+
+    body += buffer;
+
+    // Every value the translation moves, so an operator can see the whole rule
+    // before running it for real rather than inferring it from four counts.
+    bool first = true;
+
+    for(int v = 0; v < 256; v++){
+
+        if(map256[v] == (unsigned char)v)
+            continue;
+
+        snprintf(buffer,sizeof(buffer),"%s{\"from\":%d,\"to\":%d}",first ? "" : ",",v,map256[v]);
+        body += buffer;
+        first = false;
+    }
+
+    body += "]}";
 
     response.status = 200;
     response.body = body;

@@ -1652,7 +1652,7 @@ int BSeries::seriesInfo(uint32_t key, SERIES *header, int64_t *file_size){
 }
 
 
-int BSeries::migrateLegacyUint8(uint32_t key, MIGRATION_REPORT *report){
+int BSeries::remapUint8(uint32_t key, const unsigned char *map256, MIGRATION_REPORT *report, bool dry_run){
 
     if(shuttingDown)
         return FAILED_TO_OPEN_FILE;
@@ -1729,21 +1729,24 @@ int BSeries::migrateLegacyUint8(uint32_t key, MIGRATION_REPORT *report){
             break;
         }
 
-        // Only a legacy file, and only a one byte one. Version is the guard that
-        // makes running this twice impossible, and the remapping is meaningless
-        // for anything but a uint8.
-        if(header.version != SERIES_VERSION_LEGACY || bsHeaderDataSize(&header) != 1 ||
-           bsHeaderDataType(&header) != BS_UNSIGNED){
+        // A translation is one byte to one byte, so anything else is refused. The
+        // version is not a guard any more: a remap moves between two conventions
+        // the caller named, so it applies to a version 3 file being re-encoded
+        // just as much as to a version 1 one being brought forward.
+        if(bsHeaderDataSize(&header) != 1 || bsHeaderDataType(&header) != BS_UNSIGNED){
             status = SERIES_TYPE_MISMATCH;
             break;
         }
 
-        out = fopen(temp_path,"wb");
+        if(!dry_run){
 
-        if(out == NULL){
-            _ERROR("\t Failed to open %s\n",temp_path);
-            status = FAILED_TO_OPEN_FILE;
-            break;
+            out = fopen(temp_path,"wb");
+
+            if(out == NULL){
+                _ERROR("\t Failed to open %s\n",temp_path);
+                status = FAILED_TO_OPEN_FILE;
+                break;
+            }
         }
 
         const unsigned char fill = bsTypeNullFill(BS_UNSIGNED,1);
@@ -1753,7 +1756,7 @@ int BSeries::migrateLegacyUint8(uint32_t key, MIGRATION_REPORT *report){
         migrated.typecode = bsPackTypeCode(BS_UNSIGNED,1,bsTypeNullFill(BS_UNSIGNED,1));
         migrated.checksum = getChecksum(&migrated);
 
-        if(fwrite((const char*)&migrated,sizeof(migrated),1,out) != 1){
+        if(!dry_run && fwrite((const char*)&migrated,sizeof(migrated),1,out) != 1){
             status = CREATE_NEW_HEADER_FAIL;
             break;
         }
@@ -1767,23 +1770,25 @@ int BSeries::migrateLegacyUint8(uint32_t key, MIGRATION_REPORT *report){
 
                 unsigned char value = buffer[i];
 
-                if(value == fill){        // nothing was recorded here
+                // The fill is not a reading and is never translated, whatever the
+                // map says about that byte: a slot holding it was never written.
+                if(value == fill){
                     if(report) report->nulls++;
                     continue;
                 }
 
-                // Clamp before remapping, so the sentinel written below lands in a
-                // range this pass has already cleared.
-                if(value >= BS_RESERVED_FIRST && value <= BS_RESERVED_LAST){
-                    buffer[i] = BS_READING_MAX;
-                    if(report) report->clamped++;
-                } else if(value == BS_LEGACY_NO_REPLY){
-                    buffer[i] = BS_NO_REPLY;
-                    if(report) report->remapped++;
+                unsigned char mapped = map256[value];
+
+                if(mapped == value){
+                    if(report) report->unchanged++;
+                    continue;
                 }
+
+                buffer[i] = mapped;
+                if(report) report->changed++;
             }
 
-            if(fwrite(buffer,1,got,out) != got){
+            if(!dry_run && fwrite(buffer,1,got,out) != got){
                 status = DATA_POINT_WRITE_FAILURE;
                 break;
             }
@@ -1798,6 +1803,9 @@ int BSeries::migrateLegacyUint8(uint32_t key, MIGRATION_REPORT *report){
             status = INTERNAL_ERROR;
             break;
         }
+
+        if(dry_run)
+            break;                    // counted, nothing written, original untouched
 
         // On disk before the rename, or a power cut could leave the name pointing
         // at a file whose contents never arrived.

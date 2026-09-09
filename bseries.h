@@ -65,27 +65,18 @@ union BType {
 #define SERIES_VERSION_FILLED 3
 
 
-/// The values migrateLegacyUint8() moves things to. Named rather than written in
-/// line because the endpoint reports them, the tests assert them, and a reader
-/// should be able to see the whole convention in one place.
+/// What a remap did, for the caller to report rather than have to infer.
 ///
-/// After a migration a uint8 series means: 0 to 244 a reading, 245 to 253 spare
-/// for another sentinel, 254 no reply, 255 nothing recorded.
-
-#define BS_LEGACY_NO_REPLY   1     // what the prober wrote
-#define BS_NO_REPLY        254     // where it goes, just under the fill
-#define BS_RESERVED_FIRST  245     // top of the range cleared for sentinels
-#define BS_RESERVED_LAST   254
-#define BS_READING_MAX     244     // the highest value that is still a reading
-
-
-/// What a migration did, for the caller to report rather than have to infer.
+/// Deliberately counts rather than describes: what the values *mean* lives in the
+/// profiles the caller built the translation from, and the database only applies
+/// it. An operator confirms the file held what they thought from these numbers,
+/// which matters because the rewrite cannot be undone.
 
 typedef struct {
     int64_t points;      // points in the file
-    int64_t remapped;    // the prober's sentinel, moved
-    int64_t clamped;     // readings pulled down out of the reserved range
-    int64_t nulls;       // fill, left alone
+    int64_t changed;     // values the translation moved
+    int64_t unchanged;   // values it left where they were
+    int64_t nulls;       // fill, never touched whatever the map says
 } MIGRATION_REPORT;
 
 
@@ -353,7 +344,24 @@ public:
     /// the original exactly as it was. It needs the file's size again in free
     /// space, and holds the index lock throughout, so the database is quiet while
     /// it runs.
-    int migrateLegacyUint8(uint32_t key, MIGRATION_REPORT *report);
+    /// Rewrites a one byte unsigned series through a 256 entry translation, and
+    /// stamps a version 3 header while it is there.
+    ///
+    /// The translation is built by the caller from a source and a target profile,
+    /// because what a value means is not something the database knows: this only
+    /// applies the mapping and reports what it did. map256[v] is the value to
+    /// store where v was stored; an entry equal to its own index is a value left
+    /// alone. The null fill is never touched, whatever the map says.
+    ///
+    /// dry_run counts without writing, which matters because this cannot be
+    /// undone and the counts are how an operator confirms the file held what they
+    /// thought it did.
+    ///
+    /// The series is flushed and evicted first, then written to a temporary file
+    /// and renamed over the original, so an interrupted run leaves the original
+    /// exactly as it was. It needs the file's size again in free space, and holds
+    /// the index lock throughout.
+    int remapUint8(uint32_t key, const unsigned char *map256, MIGRATION_REPORT *report, bool dry_run);
     int listSeriesKeys(vector<uint32_t> *keys, uint32_t after, int limit);
 
     /// Flushes every series whose buffer has been holding points for at least

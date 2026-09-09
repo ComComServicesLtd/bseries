@@ -190,7 +190,7 @@ private:
     void handleSeriesInfo(BSeries *db, uint32_t key, HTTP_RESPONSE &response);
     void handleCreateSeries(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleDeleteSeries(BSeries *db, uint32_t key, HTTP_RESPONSE &response);
-    void handleMigrateSeries(BSeries *db, uint32_t key, HTTP_RESPONSE &response);
+    void handleMigrateSeries(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 

@@ -844,23 +844,49 @@ int main(int argc, char **argv){
             CHECK(r.status==200 && bodyHas(r,"\"version\":1"), "it reads back as version 1");
             CHECK(bodyHas(r,"\"type\":\"uint8\""), "with the type inferred from the width");
 
-            r = request("POST","/v1/series/70004/migrate","read-only-key");
+            r = request("POST","/v1/series/70004/migrate?from=legacy&to=modern","read-only-key");
             CHECK(r.status==403, "migrating needs a write key");
 
             r = request("POST","/v1/series/70004/migrate","read-write-key");
-            CHECK(r.status==200 && bodyHas(r,"\"migrated\":true"), "the migration runs");
+            CHECK(r.status==400, "from and to are required; there is no implied convention");
+
+            // The two conventions, named. The legacy one is what the old prober
+            // wrote; the modern one puts the sentinel where it sorts correctly and
+            // sends outliers to a bucket rather than clamping them.
+            char legacy_profile[600], modern_profile[600];
+            snprintf(legacy_profile,sizeof(legacy_profile),"%s/profiles/legacy",dir);
+            snprintf(modern_profile,sizeof(modern_profile),"%s/profiles/modern",dir);
+
+            FILE *lp = fopen(legacy_profile,"w");
+            fputs("state    1      no_reply  \"No reply\"\n",lp);
+            fputs("literal  2-254  ms\n",lp);
+            fclose(lp);
+
+            FILE *mp = fopen(modern_profile,"w");
+            fputs("literal  0-244  ms\n",mp);
+            fputs("bucket   245    245-500   \"over 244 ms\"\n",mp);
+            fputs("state    254    no_reply  \"No reply\"\n",mp);
+            fclose(mp);
+
+            // Counted without writing, so an operator can check before committing.
+            r = request("POST","/v1/series/70004/migrate?from=legacy&to=modern&dry_run=1","read-write-key");
+            CHECK(r.status==200 && bodyHas(r,"\"dry_run\":true"), "a dry run reports without writing");
+            CHECK(bodyHas(r,"\"migrated\":false"), "and says nothing was migrated");
+            CHECK(bodyHas(r,"{\"from\":1,\"to\":254}"), "the whole mapping is shown before it is applied");
+
+            r = request("GET","/v1/series/70004","read-only-key");
+            CHECK(bodyHas(r,"\"version\":1"), "the dry run left the file alone");
+
+            r = request("POST","/v1/series/70004/migrate?from=legacy&to=modern","read-write-key");
+            CHECK(r.status==200 && bodyHas(r,"\"migrated\":true"), "the remap runs");
             CHECK(bodyHas(r,"\"points\":256"), "every point was walked");
-            CHECK(bodyHas(r,"\"remapped\":1"), "the single 1 became the no reply value");
-            CHECK(bodyHas(r,"\"clamped\":10"), "245 to 254 inclusive were pulled down, which is ten values");
             CHECK(bodyHas(r,"\"nulls\":1"), "the single 255 was left as fill");
 
             r = request("GET","/v1/series/70004","read-only-key");
             CHECK(bodyHas(r,"\"version\":3"), "the header is now version 3");
 
-            // 0 and 2..243 untouched, 244 holds itself plus the ten clamped, 254
-            // is the sentinel, 255 is still the fill.
             r = request("GET","/v1/series/70004/data?start=1700000000&end=1700000256","read-only-key");
-            CHECK(r.status==200, "the migrated series reads");
+            CHECK(r.status==200, "the remapped series reads");
             {
                 size_t at = r.body.find("\"data\":\"");
                 std::string blob;
@@ -872,24 +898,19 @@ int main(int argc, char **argv){
                 auto at_index = [&](int i){
                     return blob.size() == 512 ? (int)strtoul(blob.substr(i*2,2).c_str(),NULL,16) : -1;
                 };
-                CHECK(at_index(0) == 0,     "0 is still 0");
-                CHECK(at_index(1) == 254,   "1 became the no reply value");
-                CHECK(at_index(2) == 2,     "2 is untouched");
-                CHECK(at_index(243) == 243, "243 is untouched");
+                CHECK(at_index(1) == 254,   "1 became the value the target uses for no_reply");
+                CHECK(at_index(2) == 2,     "2 is untouched, literal to literal");
                 CHECK(at_index(244) == 244, "244 is untouched");
-                CHECK(at_index(245) == 244, "245 was clamped");
-                CHECK(at_index(253) == 244, "253 was clamped");
-                CHECK(at_index(254) == 244, "254 was clamped, which is what clears the sentinel");
+                CHECK(at_index(245) == 245, "245 lands in the bucket that covers it");
+                CHECK(at_index(250) == 245, "and so does 250, rather than being clamped to 244");
+                CHECK(at_index(253) == 245, "and 253");
                 CHECK(at_index(255) == 255, "255 is still the fill");
             }
 
-            r = request("POST","/v1/series/70004/migrate","read-write-key");
-            CHECK(r.status==409 && bodyHas(r,"already version 3"), "running it twice is refused");
+            r = request("POST","/v1/series/70004/migrate?from=legacy&to=absent","read-write-key");
+            CHECK(r.status==404, "a target profile that does not exist is a 404");
 
-            // A version 3 series was never a candidate.
-            r = request("POST","/v1/series/70001/migrate","read-write-key");
-            CHECK(r.status==409, "a series this build created is not migrated");
-            r = request("POST","/v1/series/99999/migrate","read-write-key");
+            r = request("POST","/v1/series/99999/migrate?from=legacy&to=modern","read-write-key");
             CHECK(r.status==404, "a series that does not exist is a 404");
         }
 
