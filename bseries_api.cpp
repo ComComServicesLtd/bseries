@@ -3075,26 +3075,33 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
             if(e.kind != BS_PROFILE_STATE)
                 continue;
 
-            char item[192];
-            snprintf(item,sizeof(item),"%s{\"value\":%.17g,\"code\":\"%s\"}",
-                     entries.empty() ? "" : ",",e.first,e.code.c_str());
-            entries += item;
+            char value[64];
+            snprintf(value,sizeof(value),"%s{\"value\":%.17g,\"code\":\"",
+                     entries.empty() ? "" : ",",e.first);
+            entries += value;
+            entries += jsonEscape(e.code);
+            entries += "\"}";
         }
 
-        char head[384];
-        snprintf(head,sizeof(head),
-            ",\"profile\":\"%s\",\"reserved\":[%s],\"reserved_points\":%lld,"
-            "\"literal_points\":%lld,\"bucketed_points\":%lld,\"unclassified_points\":%lld,"
-            "\"lower_bound\":%s,\"reserved_counts\":\"",
-            reserved.profile_name.c_str(),
-            entries.c_str(),
+        // Built as a string rather than into a fixed buffer: the reserved list
+        // grows with the profile, and a snprintf that runs out of room truncates
+        // silently -- which here produced a response cut off mid field name, well
+        // formed enough to look fine and impossible to parse.
+        char counts[256];
+        snprintf(counts,sizeof(counts),
+            "],\"reserved_points\":%lld,\"literal_points\":%lld,\"bucketed_points\":%lld,"
+            "\"unclassified_points\":%lld,\"lower_bound\":%s,\"reserved_counts\":\"",
             reserved_points,
             literal_points,
             bucketed_points,
             unclassified_points,
             bucketed_points > 0 ? "true" : "false");
 
-        stream->write(head,strlen(head));
+        std::string head = ",\"profile\":\"" + jsonEscape(reserved.profile_name) + "\",\"reserved\":[";
+        head += entries;
+        head += counts;
+
+        stream->write(head);
         streamHex(stream,reserved_counts.data(),reserved_counts.size());
         stream->write("\"",1);
     }

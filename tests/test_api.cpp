@@ -713,7 +713,46 @@ int main(int argc, char **argv){
                 fclose(f);
             }
 
-            REPLY r = request("GET","/v1/profiles","read-only-key");
+            // A profile with many states: the reserved list in a condensed
+            // response grows with it, and building that into a fixed buffer
+            // truncated it mid field name -- valid looking and unparseable.
+            char many_path[600];
+            snprintf(many_path,sizeof(many_path),"%s/manystates",profile_dir);
+            FILE *mf = fopen(many_path,"w");
+            fputs("literal 0-244 ms\n",mf);
+            fputs("state 248 send_error   \"Send error\"\n",mf);
+            fputs("state 249 other        \"Other ICMP error\"\n",mf);
+            fputs("state 250 prohibited   \"Administratively prohibited\"\n",mf);
+            fputs("state 251 ttl_exceeded \"TTL exceeded\"\n",mf);
+            fputs("state 252 unreach_net  \"Network unreachable\"\n",mf);
+            fputs("state 253 unreach_host \"Host unreachable\"\n",mf);
+            fputs("state 254 no_reply     \"No reply\"\n",mf);
+            fclose(mf);
+
+            REPLY r = request("POST","/v1/series/70011?type=uint8&interval=1&start=1700000000","read-write-key");
+            CHECK(r.status==201, "a series for the many state profile");
+            r = request("POST","/v1/data","read-write-key","70011 1700000000 141ef8f9fafbfcfdfe\n");
+            CHECK(r.status==200, "two readings and seven outcomes");
+
+            r = request("GET","/v1/series/70011/data?start=1700000000&end=1700000009&max_points=1&condense=average&profile=manystates","read-only-key");
+            CHECK(r.status==200, "a seven state profile condenses");
+            CHECK(bodyHas(r,"\"reserved_points\":7"), "all seven are counted as outcomes");
+            CHECK(bodyHas(r,"\"literal_points\":2"), "and only the two readings are averaged");
+            CHECK(bodyHas(r,"\"unclassified_points\":0"), "nothing is left unclassified");
+            CHECK(bodyHas(r,"\"reserved_counts\":\""), "the counts field survives a long reserved list");
+            CHECK(bodyHas(r,"\"code\":\"unreach_host\"") && bodyHas(r,"\"code\":\"no_reply\""),
+                  "and every state is named, including the last");
+            {
+                int depth = 0; bool balanced = true;
+                for(size_t i = 0; i < r.body.size(); i++){
+                    if(r.body[i] == '{') depth++;
+                    else if(r.body[i] == '}') depth--;
+                    if(depth < 0) balanced = false;
+                }
+                CHECK(balanced && depth == 0, "the JSON is balanced, not truncated mid object");
+            }
+
+            r = request("GET","/v1/profiles","read-only-key");
             CHECK(r.status==200 && bodyHas(r,"\"pingt\""), "it is listed");
 
             r = request("GET","/v1/profiles/pingt","read-only-key");
