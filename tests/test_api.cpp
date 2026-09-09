@@ -916,6 +916,62 @@ int main(int argc, char **argv){
                   "a read resolves the series' own profile without being told");
             CHECK(bodyHas(r,"\"type\":\"float64\""), "and answers in magnitudes");
 
+            // A header only upgrade: no value moves, nothing is claimed about what
+            // the values mean, and it works for a width no translation covers.
+            // This path shipped once with a null map dereference behind it,
+            // because nothing here executed it.
+            // A version 3 float32 file, written by hand: this build creates version
+            // 4 series, so there is no other way to have one to bring forward.
+            {
+                char v3path[512];
+                snprintf(v3path,sizeof(v3path),"%s/70006",dir);
+
+                uint32_t tc = bsPackTypeCode(BS_FLOAT,4,0xFF);
+                uint32_t f[5] = { SERIES_VERSION_FILLED, 1700000000u, 60u, tc, 0 };
+                f[4] = 1234567890u + ((f[0] ^ f[1]) ^ (f[2] ^ f[3]));
+
+                FILE *vf = fopen(v3path,"wb");
+                for(int i = 0; i < 5; i++){
+                    unsigned char b[4];
+                    b[0]=(unsigned char)f[i];       b[1]=(unsigned char)(f[i]>>8);
+                    b[2]=(unsigned char)(f[i]>>16); b[3]=(unsigned char)(f[i]>>24);
+                    fwrite(b,4,1,vf);
+                }
+                float sample[3] = { 1.5f, 2.5f, 3.5f };
+                fwrite(sample,sizeof(sample),1,vf);
+                fclose(vf);
+            }
+
+            r = request("GET","/v1/series/70006","read-only-key");
+            CHECK(bodyHas(r,"\"version\":3") && bodyHas(r,"\"float32\""), "a version 3 float32 series exists");
+
+            r = request("POST","/v1/series/70006/migrate?upgrade=1&dry_run=1","read-write-key");
+            CHECK(r.status==200 && bodyHas(r,"\"upgrade\":true"), "a float32 series can be upgraded");
+            CHECK(bodyHas(r,"\"values_inspected\":false"), "and says it did not classify anything");
+            CHECK(bodyHas(r,"\"dry_run\":true"), "the dry run reports without writing");
+
+            r = request("GET","/v1/series/70006","read-only-key");
+            CHECK(bodyHas(r,"\"version\":3"), "which left the header alone");
+
+            r = request("POST","/v1/series/70006/migrate?upgrade=1","read-write-key");
+            CHECK(r.status==200 && bodyHas(r,"\"to_version\":4"), "and applying it brings the header forward");
+
+            r = request("GET","/v1/series/70006","read-only-key");
+            CHECK(bodyHas(r,"\"version\":4"), "the float32 series is now version 4");
+            CHECK(bodyHas(r,"\"type\":\"float32\""), "with its type intact");
+
+            r = request("GET","/v1/series/70006/data?start=1700000000&end=1700000180","read-only-key");
+            CHECK(r.status==200 && bodyHas(r,"\"data\":\"0000c03f00002040000060 40\"")==false && bodyHas(r,"\"datasize\":4"),
+                  "and its points still read at the new offset");
+
+            r = request("POST","/v1/series/70006/migrate?upgrade=1","read-write-key");
+            CHECK(r.status==409, "upgrading a version 4 series again is refused");
+
+            // A value translation is still one byte to one byte.
+            r = request("POST","/v1/series/70006/migrate?from=legacy&to=modern","read-write-key");
+            CHECK(r.status==409 && bodyHas(r,"upgrade=1"),
+                  "a translation on a float32 series is refused, and says what to do instead");
+
             r = request("POST","/v1/series/70004/migrate?from=legacy&to=absent","read-write-key");
             CHECK(r.status==404, "a target profile that does not exist is a 404");
 

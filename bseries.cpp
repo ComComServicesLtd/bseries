@@ -1948,7 +1948,10 @@ int BSeries::remapUint8(uint32_t key, const unsigned char *map256, const char *p
         // version is not a guard any more: a remap moves between two conventions
         // the caller named, so it applies to a version 3 file being re-encoded
         // just as much as to a version 1 one being brought forward.
-        if(bsHeaderDataSize(&header) != 1 || bsHeaderDataType(&header) != BS_UNSIGNED){
+        // With no translation there is nothing width specific left -- the bytes
+        // are copied verbatim -- so a header only upgrade works for any type,
+        // which is the only way a float series reaches version 4.
+        if(map256 != NULL && (bsHeaderDataSize(&header) != 1 || bsHeaderDataType(&header) != BS_UNSIGNED)){
             status = SERIES_TYPE_MISMATCH;
             break;
         }
@@ -1964,7 +1967,9 @@ int BSeries::remapUint8(uint32_t key, const unsigned char *map256, const char *p
             }
         }
 
-        const unsigned char fill = bsTypeNullFill(BS_UNSIGNED,1);
+        uint32_t width = bsHeaderDataSize(&header);
+        uint8_t kind = bsHeaderDataType(&header);
+        const unsigned char fill = resolveNullFill(key,&header);
 
         // The rewrite already copies every byte, so bringing the header up to the
         // current version costs nothing extra here -- the data simply lands after
@@ -1972,7 +1977,7 @@ int BSeries::remapUint8(uint32_t key, const unsigned char *map256, const char *p
         // mean moving every point in the file for its own sake.
         SERIES migrated = header;
         migrated.version = SERIES_VERSION_PROFILED;
-        migrated.typecode = bsPackTypeCode(BS_UNSIGNED,1,fill);
+        migrated.typecode = bsPackTypeCode(kind,(uint8_t)width,fill);
         memset(migrated.null_fill_wide,fill,sizeof(migrated.null_fill_wide));
 
         // The points are in the target profile's encoding now, so the header says
@@ -1994,26 +1999,32 @@ int BSeries::remapUint8(uint32_t key, const unsigned char *map256, const char *p
 
         while((got = fread(buffer,1,sizeof(buffer),in)) > 0){
 
-            for(size_t i = 0; i < got; i++){
+            // No translation means the bytes are copied untouched and nothing is
+            // classified: an upgrade moves the header, and claiming to have
+            // counted values it never decoded would be worse than saying nothing.
+            if(map256 != NULL){
 
-                unsigned char value = buffer[i];
+                for(size_t i = 0; i < got; i++){
 
-                // The fill is not a reading and is never translated, whatever the
-                // map says about that byte: a slot holding it was never written.
-                if(value == fill){
-                    if(report) report->nulls++;
-                    continue;
+                    unsigned char value = buffer[i];
+
+                    // The fill is not a reading and is never translated, whatever
+                    // the map says: a slot holding it was never written.
+                    if(value == fill){
+                        if(report) report->nulls++;
+                        continue;
+                    }
+
+                    unsigned char mapped = map256[value];
+
+                    if(mapped == value){
+                        if(report) report->unchanged++;
+                        continue;
+                    }
+
+                    buffer[i] = mapped;
+                    if(report) report->changed++;
                 }
-
-                unsigned char mapped = map256[value];
-
-                if(mapped == value){
-                    if(report) report->unchanged++;
-                    continue;
-                }
-
-                buffer[i] = mapped;
-                if(report) report->changed++;
             }
 
             if(!dry_run && fwrite(buffer,1,got,out) != got){
@@ -2021,7 +2032,7 @@ int BSeries::remapUint8(uint32_t key, const unsigned char *map256, const char *p
                 break;
             }
 
-            if(report) report->points += (int64_t)got;
+            if(report) report->points += (int64_t)got / (width ? width : 1);
         }
 
         if(status != NO_ERROR)

@@ -2083,9 +2083,44 @@ void BSeriesApi::handleMigrateSeries(BSeries *db, uint32_t key, const HTTP_REQUE
         return;
     }
 
-    if(bsHeaderDataSize(&header) != 1 || bsHeaderDataType(&header) != BS_UNSIGNED){
-        jsonError(response,409,"not_applicable",
-                  "a remap is one byte to one byte; this series is not a uint8");
+
+    std::string dry_text = httpQueryParam(request,"dry_run");
+    bool dry_run = !dry_text.empty() && dry_text != "0" && dry_text != "false";
+
+    std::string upgrade_text = httpQueryParam(request,"upgrade");
+    bool upgrade_only = !upgrade_text.empty() && upgrade_text != "0" && upgrade_text != "false";
+
+    // A header only upgrade: no value moves, nothing is claimed about what the
+    // values mean, and it works for any type. This is the only route to version 4
+    // for a series whose convention nobody has written down yet, or whose points
+    // are wider than the one byte a translation covers.
+    if(upgrade_only){
+
+        if(header.version == SERIES_VERSION_PROFILED){
+            jsonError(response,409,"not_applicable","this series is already version 4");
+            return;
+        }
+
+        MIGRATION_REPORT report;
+        int rc = db->remapUint8(key,NULL,NULL,&report,dry_run);
+
+        if(rc != NO_ERROR){
+            jsonDatabaseError(response,rc,"upgrading the series header");
+            return;
+        }
+
+        char body[320];
+        snprintf(body,sizeof(body),
+            "{\"key\":%lu,\"migrated\":%s,\"dry_run\":%s,\"upgrade\":true,"
+            "\"from_version\":%lu,\"to_version\":4,\"points\":%lld,\"values_inspected\":false}",
+            (unsigned long)key,
+            dry_run ? "false" : "true",
+            dry_run ? "true" : "false",
+            (unsigned long)header.version,
+            (long long)report.points);
+
+        response.status = 200;
+        response.body = body;
         return;
     }
 
@@ -2114,17 +2149,19 @@ void BSeriesApi::handleMigrateSeries(BSeries *db, uint32_t key, const HTTP_REQUE
         return;
     }
 
+    if(bsHeaderDataSize(&header) != 1 || bsHeaderDataType(&header) != BS_UNSIGNED){
+        jsonError(response,409,"not_applicable",
+                  "a value translation is one byte to one byte; this series is not a uint8. "
+                  "Pass upgrade=1 to bring its header forward without touching the values");
+        return;
+    }
+
     unsigned char map256[256];
 
     if(!buildRemap(from,to,map256,&error)){
         jsonError(response,409,"not_applicable",error);
         return;
     }
-
-    // Counted without writing, because this cannot be undone and the counts are
-    // the only chance to notice the file did not hold what was expected.
-    std::string dry_text = httpQueryParam(request,"dry_run");
-    bool dry_run = !dry_text.empty() && dry_text != "0" && dry_text != "false";
 
     MIGRATION_REPORT report;
     int rc = db->remapUint8(key,map256,to_name.c_str(),&report,dry_run);
