@@ -1,6 +1,7 @@
 // End to end tests for the HTTP API. Starts a real server on an ephemeral port
 // and talks to it over a real socket.
 
+#include <sys/stat.h>
 #include "bseries.h"
 #include "bseries_api.h"
 #include "table_set.h"
@@ -693,6 +694,123 @@ int main(int argc, char **argv){
             REPLY js = request("GET","/admin/vue.global.prod.js",NULL);
             CHECK(js.status==200 && headHas(js,"ETag: \""), "the script is tagged too");
             CHECK(js.head.find(tag) == std::string::npos, "and its tag is not the page's");
+        }
+
+        // Profiles: what the stored values mean.
+        {
+            char profile_dir[512], profile_path[600];
+            snprintf(profile_dir,sizeof(profile_dir),"%s/profiles",dir);
+            mkdir(profile_dir,0755);
+            snprintf(profile_path,sizeof(profile_path),"%s/pingt",profile_dir);
+
+            FILE *f = fopen(profile_path,"w");
+            CHECK(f != NULL, "write a profile file");
+            if(f){
+                fputs("literal  0-244  ms          #0000FF,#FF0000\n",f);
+                fputs("bucket   245    245-500     \"over 244 ms\"   #FF8C00\n",f);
+                fputs("bucket   246    500-1000    \"over 500 ms\"   #FF4500\n",f);
+                fputs("state    254    no_reply    \"No reply\"      #000000\n",f);
+                fclose(f);
+            }
+
+            REPLY r = request("GET","/v1/profiles","read-only-key");
+            CHECK(r.status==200 && bodyHas(r,"\"pingt\""), "it is listed");
+
+            r = request("GET","/v1/profiles/pingt","read-only-key");
+            CHECK(r.status==200 && bodyHas(r,"\"kind\":\"bucket\""), "and readable");
+            CHECK(headHas(r,"immutable"), "cached forever, because a profile never changes");
+
+            r = request("GET","/v1/profiles/does_not_exist","read-only-key");
+            CHECK(r.status==404, "a missing profile is a 404");
+
+            // 10, 20, 245 (bucket 245-500), 246 (bucket 500-1000), 254 (no reply)
+            r = request("POST","/v1/series/70005?type=uint8&interval=1&start=1700000000","read-write-key");
+            CHECK(r.status==201, "a series to profile");
+            r = request("POST","/v1/data","read-write-key","70005 1700000000 0a14f5f6fe\n");
+            CHECK(r.status==200, "five points covering every kind");
+
+            const char *RANGE = "/v1/series/70005/data?start=1700000000&end=1700000005&max_points=1";
+
+            // A bucket's maximum is the top of the range it stands for, which a
+            // uint8 cannot hold -- so a profiled read answers in magnitudes.
+            r = request("GET",(std::string(RANGE) + "&condense=max&profile=pingt").c_str(),"read-only-key");
+            CHECK(r.status==200 && bodyHas(r,"\"type\":\"float64\""), "profiled output is promoted");
+            CHECK(bodyHas(r,"\"literal_points\":2"), "two exact readings");
+            CHECK(bodyHas(r,"\"bucketed_points\":2"), "two known only to a range");
+            CHECK(bodyHas(r,"\"reserved_points\":1"), "one that is not a reading at all");
+            CHECK(bodyHas(r,"\"lower_bound\":true"), "and the answer is flagged as a floor");
+
+            {
+                size_t at = r.body.find("\"data\":\"");
+                double value = 0;
+                if(at != std::string::npos){
+                    unsigned char bytes[8];
+                    for(int j = 0; j < 8; j++)
+                        bytes[j] = (unsigned char)strtoul(r.body.substr(at + 8 + j*2,2).c_str(),NULL,16);
+                    memcpy(&value,bytes,8);
+                }
+                CHECK(value > 999.9 && value < 1000.1, "max is the high edge of the top bucket, 1000");
+            }
+
+            r = request("GET",(std::string(RANGE) + "&condense=min&profile=pingt").c_str(),"read-only-key");
+            {
+                size_t at = r.body.find("\"data\":\"");
+                double value = 0;
+                if(at != std::string::npos){
+                    unsigned char bytes[8];
+                    for(int j = 0; j < 8; j++)
+                        bytes[j] = (unsigned char)strtoul(r.body.substr(at + 8 + j*2,2).c_str(),NULL,16);
+                    memcpy(&value,bytes,8);
+                }
+                CHECK(value > 9.9 && value < 10.1, "min is the low edge, 10");
+            }
+
+            // (10 + 20 + 245 + 500) / 4, the bucket low edges, no reserved point
+            r = request("GET",(std::string(RANGE) + "&condense=average&profile=pingt").c_str(),"read-only-key");
+            {
+                size_t at = r.body.find("\"data\":\"");
+                double value = 0;
+                if(at != std::string::npos){
+                    unsigned char bytes[8];
+                    for(int j = 0; j < 8; j++)
+                        bytes[j] = (unsigned char)strtoul(r.body.substr(at + 8 + j*2,2).c_str(),NULL,16);
+                    memcpy(&value,bytes,8);
+                }
+                CHECK(value > 193.7 && value < 193.8, "average uses the low edges and excludes the state");
+            }
+
+            // The profile comes back with the data, so nothing needs a second call.
+            CHECK(bodyHas(r,"\"profiles\":{\"pingt\":"), "the profile is returned with the data");
+            CHECK(bodyHas(r,"\"colours\":[\"#0000FF\",\"#FF0000\"]"), "including what a client needs to draw");
+
+            r = request("GET","/v1/data?keys=70005,70001&start=1700000000&end=1700000005&max_points=1&condense=max&profile=pingt","read-only-key");
+            CHECK(r.status==200, "a bulk read takes a profile too");
+            {
+                size_t first = r.body.find("\"entries\":[");
+                size_t second = first == std::string::npos ? std::string::npos
+                                                           : r.body.find("\"entries\":[",first + 1);
+                CHECK(first != std::string::npos && second == std::string::npos,
+                      "and sends it once for the request, not once per series");
+            }
+
+            r = request("GET",(std::string(RANGE) + "&condense=max&profile=pingt&reserved=254").c_str(),"read-only-key");
+            CHECK(r.status==400, "profile and reserved together are refused, not silently ranked");
+
+            r = request("GET","/v1/series/70005/data?start=1700000000&end=1700000005&profile=pingt","read-only-key");
+            CHECK(r.status==400, "a profile on a raw read is refused; raw data stays as stored");
+
+            r = request("GET",(std::string(RANGE) + "&condense=max&profile=absent").c_str(),"read-only-key");
+            CHECK(r.status==404, "a profile that cannot be read fails the request rather than being ignored");
+
+            r = request("GET",(std::string(RANGE) + "&condense=max&profile=../../etc/passwd").c_str(),"read-only-key");
+            CHECK(r.status==404, "and a traversal never reaches the disk");
+
+            // A table is any directory in the data directory, so the one holding
+            // profiles has to be spoken for or it turns up as a table nobody made.
+            r = request("GET","/v1/tables","read-only-key");
+            CHECK(!bodyHas(r,"\"profiles\""), "the profiles directory is not listed as a table");
+            r = request("POST","/v1/tables/profiles","read-write-key");
+            CHECK(r.status==400, "and a table cannot be created with that name");
         }
 
         // Migrating a legacy series.

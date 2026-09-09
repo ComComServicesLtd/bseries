@@ -9,6 +9,7 @@
 #include "table_set.h"
 #include "auth_store.h"
 #include "runtime_settings.h"
+#include "profile_store.h"
 
 
 /// HTTP CRUD interface to a BSeries database.
@@ -115,6 +116,17 @@ typedef struct {
     std::vector<double> values;   // empty when the caller named none
     bool dominate;                // let them win a maximum, rather than be skipped
     double threshold;             // share of a bucket needed before they do
+
+    /// A profile says the same thing and more, and supersedes the list above: it
+    /// distinguishes a value that is not a reading from one that is a reading
+    /// known only to lie in a range. NULL when the caller named no profile.
+    ///
+    /// Condensing with one answers in magnitudes rather than stored values -- a
+    /// bucket's maximum is the top of the range it stands for, which is usually a
+    /// number the series' own type cannot hold -- so the output is promoted to
+    /// float64 for every operation, not just an average.
+    const PROFILE *profile;
+    std::string profile_name;
 } CONDENSE_RESERVED;
 
 
@@ -136,6 +148,7 @@ public:
     AuthStore *auth;
     RUNTIME_SETTINGS *runtime;
     API_CONFIG config;
+    ProfileStore profiles;
 
 private:
     void route(const HTTP_REQUEST &request, HTTP_RESPONSE &response);
@@ -149,6 +162,9 @@ private:
     void handleTableInfo(const std::string &name, HTTP_RESPONSE &response);
     void handleCreateTable(const std::string &name, HTTP_RESPONSE &response);
     void handleDropTable(const std::string &name, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
+
+    void handleListProfiles(HTTP_RESPONSE &response);
+    void handleProfile(const std::string &name, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
     void handleListKeys(HTTP_RESPONSE &response);
     void handleCreateKey(const HTTP_REQUEST &request, HTTP_RESPONSE &response);

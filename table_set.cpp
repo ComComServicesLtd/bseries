@@ -58,6 +58,15 @@ bool TableSet::validName(const std::string &name, std::string *error){
         return false;
     }
 
+    // The database keeps its own state in the data directory, and a table is any
+    // directory in there -- so anything it puts alongside the tables has to be
+    // spoken for here, or it turns up as a table nobody created. auth.keys avoids
+    // this only by being a file.
+    if(name == "profiles"){
+        if(error) *error = "\"profiles\" is where value profiles live and cannot be a table";
+        return false;
+    }
+
     // Digits are not allowed at all, so a table name can never look like a series
     // file: the default table is the data directory itself, and series files are
     // named for their key and nothing else. Requiring a letter first also keeps a

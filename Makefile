@@ -23,12 +23,12 @@ LDLIBS   ?= -pthread
 PREFIX   ?= /usr/local
 
 LIB_SOURCES    = bseries.cpp
-SERVER_SOURCES = bseries.cpp table_set.cpp auth_store.cpp runtime_settings.cpp http_server.cpp bseries_api.cpp web_assets.cpp bseriesd.cpp
+SERVER_SOURCES = bseries.cpp table_set.cpp auth_store.cpp runtime_settings.cpp profile_store.cpp http_server.cpp bseries_api.cpp web_assets.cpp bseriesd.cpp
 
 LIB_OBJECTS    = $(LIB_SOURCES:.cpp=.o)
 SERVER_OBJECTS = $(SERVER_SOURCES:.cpp=.o)
 
-TESTS = tests/test_bseries tests/test_definitions tests/test_auth tests/test_api tests/test_concurrency
+TESTS = tests/test_bseries tests/test_definitions tests/test_auth tests/test_profiles tests/test_api tests/test_concurrency
 
 .PHONY: all clean test install static lib install-lib web
 
@@ -75,7 +75,7 @@ install-lib: libbseries.a
 -include $(SERVER_OBJECTS:.o=.d)
 
 tests/%: tests/%.cpp $(SERVER_SOURCES)
-	$(CXX) $(CXXFLAGS) -I. -o $@ $< bseries.cpp table_set.cpp auth_store.cpp runtime_settings.cpp http_server.cpp bseries_api.cpp web_assets.cpp $(LDLIBS)
+	$(CXX) $(CXXFLAGS) -I. -o $@ $< bseries.cpp table_set.cpp auth_store.cpp runtime_settings.cpp profile_store.cpp http_server.cpp bseries_api.cpp web_assets.cpp $(LDLIBS)
 
 test: $(TESTS)
 	@failed=0; \

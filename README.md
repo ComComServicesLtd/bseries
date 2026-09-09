@@ -212,6 +212,8 @@ table name.
 | POST | `/v1/{t}/series/{key}?type=&interval=&start=` | write | create |
 | DELETE | `/v1/{t}/series/{key}` | write | delete |
 | POST | `/v1/{t}/series/{key}/migrate` | write | rewrite a version 1 series as version 3 |
+| GET | `/v1/profiles` | read | list value profiles |
+| GET | `/v1/profiles/{name}` | read | one profile, immutable and cacheable |
 | GET | `/v1/{t}/series/{key}/data?start=&end=` | read | read a range |
 | GET | `/v1/{t}/data?keys=&start=&end=` | read | read a range across several series |
 | POST | `/v1/{t}/data` | write | write points to several series |
@@ -777,6 +779,78 @@ the default because it is the least surprising reading of "let it dominate".
 Reserved values are matched as doubles, which is exact for every type the database
 stores except a 64 bit integer past 2^53. Sentinels are small by nature, so that
 has not been worth a second comparison path.
+
+### Profiles: what the values mean
+
+`reserved` above says which values are not measurements. A **profile** says what
+every value means, lives beside the data, and comes back with the read — so a
+client needs no convention compiled into it and no second request.
+
+A profile is a text file in `profiles/` inside the data directory, named for the
+profile:
+
+```
+# <data>/profiles/ping
+#
+# literal <range>  <unit> [scale] [colours]
+# bucket  <value>  <low>-<high>  "<label>" [colour]
+# state   <value>  <code>        "<label>" [colour]
+
+literal  0-244  ms          #0000FF,#00FFFF,#00FF00,#FFFF00,#FF0000
+bucket   245    245-500     "over 244 ms"    #FF8C00
+bucket   246    500-1000    "over 500 ms"    #FF4500
+bucket   247    1000-30000  "over 1000 ms"   #B22222
+state    254    no_reply    "No reply"       #000000
+```
+
+Three kinds of value, and the difference between them is the whole point:
+
+* **literal** — a reading, at face value. `scale` multiplies it, so `0-244 ms 10`
+  gives a `uint8` series a 2440ms range at 10ms resolution.
+* **bucket** — a reading, but known only to lie in a range. This is how one byte
+  records a 30 second timeout: the stored value is an *ordinal*, the bounds are
+  the *magnitude*, and a bound may be far outside what the type can hold.
+* **state** — not a reading at all. Excluded from every aggregate and counted
+  separately.
+
+The fill stays in the header. "Nothing was polled" and "polled, no answer" are
+different facts and a chart draws them differently.
+
+**Condensing with a profile answers in magnitudes**, so `min` takes a bucket's low
+edge and `max` its high edge, which makes the pair a true enclosing interval. An
+average uses the low edges and the response says `lower_bound` — an average that
+claims "at least 312ms" is honest, one that claims "312ms" is not. Because those
+answers are magnitudes rather than stored values, output is `float64` for every
+operation, not just an average. Raw reads and writes are untouched and stay in the
+series' own type.
+
+```
+$ curl -H 'X-API-Key: $READ_KEY' \
+    'localhost:8086/v1/lab/series/2287/data?start=…&end=…&max_points=42&condense=average&profile=ping'
+{"start":…,"profiles":{"ping":{"entries":[…]}},
+ "…":"…","literal_points":10,"bucketed_points":0,"reserved_points":32,
+ "lower_bound":false,"reserved_counts":"…"}
+```
+
+**The profile comes back with the data**, as a map keyed by name, and each series
+names the profile it used. On a multi series read it is sent once for the request
+rather than once per series. It is a map even with one profile in play so that the
+shape does not change when a series carries its own profile name.
+
+**A profile that cannot be read fails the request**, rather than being ignored.
+Quietly reading everything literally would answer with exactly the wrong numbers
+and no sign of it, which is the failure profiles exist to prevent.
+
+`GET /v1/profiles` lists them and `GET /v1/profiles/{name}` returns one. Profiles
+are immutable by convention — changing what a value means is a new profile, not an
+edit, so a chart drawn last year still means what it said. That is what lets the
+single profile response be cached forever, and why a new profile is picked up
+without a restart while an edit to one already in use is not.
+
+Two consequences worth knowing. `profiles` cannot be a table name, because a table
+is any directory in the data directory. And profile names are whitelisted to
+letters, digits, underscore and dash rather than sanitised, because the name
+reaches the filesystem from a query string.
 
 ### How missing data is kept out of the aggregate
 

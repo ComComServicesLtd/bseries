@@ -1,6 +1,7 @@
 #include "bseries_api.h"
 #include "web_assets.h"
 
+#include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -733,6 +734,11 @@ BSeriesApi::BSeriesApi(TableSet *table_set, AuthStore *auth_store, RUNTIME_SETTI
     auth = auth_store;
     runtime = settings;
     config = *configuration;
+
+    // Beside the data rather than beside the binary: a profile is what the stored
+    // values mean, so it has to travel with them. Backing up the data directory
+    // has to be enough to read the series back correctly.
+    profiles.configure(config.data_directory + "/profiles");
 }
 
 
@@ -930,6 +936,115 @@ bool BSeriesApi::authorise(const HTTP_REQUEST &request, bool needs_write, HTTP_R
 
     jsonError(response,401,"unauthorized","unrecognised API key");
     return false;
+}
+
+
+static void appendProfileJson(std::string &out, const PROFILE &profile){
+
+    char buffer[512];
+
+    snprintf(buffer,sizeof(buffer),"{\"profile\":\"%s\",\"entries\":[",profile.name.c_str());
+    out += buffer;
+
+    for(size_t i = 0; i < profile.entries.size(); i++){
+
+        const PROFILE_ENTRY &e = profile.entries[i];
+
+        if(i) out += ",";
+
+        if(e.kind == BS_PROFILE_LITERAL){
+            snprintf(buffer,sizeof(buffer),
+                     "{\"kind\":\"literal\",\"first\":%.17g,\"last\":%.17g,\"unit\":\"%s\",\"scale\":%.17g",
+                     e.first,e.last,e.unit.c_str(),e.scale);
+        } else if(e.kind == BS_PROFILE_BUCKET){
+            snprintf(buffer,sizeof(buffer),
+                     "{\"kind\":\"bucket\",\"value\":%.17g,\"low\":%.17g,\"high\":%.17g,\"label\":\"%s\"",
+                     e.first,e.low,e.high,e.label.c_str());
+        } else {
+            snprintf(buffer,sizeof(buffer),
+                     "{\"kind\":\"state\",\"value\":%.17g,\"code\":\"%s\",\"label\":\"%s\"",
+                     e.first,e.code.c_str(),e.label.c_str());
+        }
+
+        out += buffer;
+        out += ",\"colours\":[";
+
+        for(size_t c = 0; c < e.colours.size(); c++){
+            if(c) out += ",";
+            out += "\"" + e.colours[c] + "\"";
+        }
+
+        out += "]}";
+    }
+
+    out += "]}";
+}
+
+
+/// Emits the profiles a read used, keyed by name, so a client has everything it
+/// needs to draw without a second request.
+///
+/// A map rather than a single object even when only one profile is in play: a
+/// series will carry its own profile name once the header has room for one, and
+/// then a multi series read legitimately answers with several. Emitting the map
+/// now means that arrives without the response shape changing under anyone.
+
+static void appendProfilesUsed(std::string &out, const CONDENSE_RESERVED &reserved){
+
+    out += "\"profiles\":{";
+
+    if(reserved.profile != NULL){
+        out += "\"" + reserved.profile_name + "\":";
+        appendProfileJson(out,*reserved.profile);
+    }
+
+    out += "},";
+}
+
+
+void BSeriesApi::handleListProfiles(HTTP_RESPONSE &response){
+
+    std::vector<std::string> names;
+    profiles.list(&names);
+
+    std::sort(names.begin(),names.end());
+
+    response.status = 200;
+    response.body = "{\"profiles\":[";
+
+    for(size_t i = 0; i < names.size(); i++){
+        if(i) response.body += ",";
+        response.body += "\"" + names[i] + "\"";
+    }
+
+    char tail[64];
+    snprintf(tail,sizeof(tail),"],\"count\":%u}",(unsigned)names.size());
+    response.body += tail;
+}
+
+
+void BSeriesApi::handleProfile(const std::string &name, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
+
+    std::string error;
+    const PROFILE *profile = profiles.get(name,&error);
+
+    if(profile == NULL){
+        jsonError(response,404,"not_found",error);
+        return;
+    }
+
+    // Immutable, so a client that has fetched one never needs to again. The
+    // caching is worth more here than anywhere else in the API: this is the one
+    // resource a chart needs before it can draw anything.
+    HTTP_HEADER header;
+    header.name = "Cache-Control";
+    header.value = "public, max-age=31536000, immutable";
+    response.headers.push_back(header);
+
+    (void)request;
+
+    response.status = 200;
+    appendProfileJson(response.body,*profile);
 }
 
 
@@ -1438,6 +1553,34 @@ void BSeriesApi::route(const HTTP_REQUEST &request, HTTP_RESPONSE &response){
         }
 
         jsonError(response,405,"method_not_allowed","GET to read, POST to change");
+        return;
+    }
+
+    // /v1/profiles - what the values in a series mean
+    if(segments[1] == "profiles"){
+
+        if(request.method != "GET"){
+            // Immutable by design: changing what a value means is a new profile,
+            // so a chart drawn last year still means what it said.
+            jsonError(response,405,"method_not_allowed",
+                      "profiles are read here and written as files; a change is a new profile");
+            return;
+        }
+
+        if(!authorise(request,false,response))
+            return;
+
+        if(segments.size() == 2){
+            handleListProfiles(response);
+            return;
+        }
+
+        if(segments.size() == 3){
+            handleProfile(segments[2],request,response);
+            return;
+        }
+
+        jsonError(response,404,"not_found","unknown endpoint");
         return;
     }
 
@@ -1969,6 +2112,32 @@ int BSeriesApi::streamSeriesData(BSeries *db, uint32_t key, long long start_time
 /// A bucket with no real samples in it produces the null fill, which is what tells
 /// a chart to draw a gap rather than a line through some invented value.
 
+/// The profiled form of the above. Every operation answers in magnitudes, so the
+/// bucket is closed from the doubles the loop accumulated rather than from stored
+/// bytes: a minimum is the lowest magnitude any point could have been, a maximum
+/// the highest, and the two together enclose the truth.
+
+static void emitProfiledBucket(std::string &out, int mode, long long samples, double sum,
+                               double low, double high){
+
+    double value;
+
+    if(samples == 0){
+        value = 0.0 / 0.0;                  // NaN, the float fill
+    } else if(mode == CONDENSE_MIN){
+        value = low;
+    } else if(mode == CONDENSE_MAX){
+        value = high;
+    } else {
+        value = sum / (double)samples;
+    }
+
+    char bytes[8];
+    memcpy(bytes,&value,8);
+    out.append(bytes,8);
+}
+
+
 static void emitCondensedBucket(std::string &out, int mode, long long samples, double sum,
                                 const unsigned char *best, uint32_t out_datasize, unsigned char out_fill,
                                 long long reserved_count, const unsigned char *reserved_best,
@@ -2108,9 +2277,15 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
     uint32_t src_datasize = bsHeaderDataSize(&header);
     unsigned char src_fill = db->resolveNullFill(key,&header);
 
-    uint8_t out_datatype = (mode == CONDENSE_AVG) ? BS_FLOAT : src_datatype;
-    uint32_t out_datasize = (mode == CONDENSE_AVG) ? 8 : src_datasize;
-    unsigned char out_fill = (mode == CONDENSE_AVG) ? 0xFF : src_fill;
+    // A profile answers in magnitudes rather than stored values: a bucket's
+    // maximum is the top of the range it stands for, which for a one byte series
+    // recording a 30 second timeout is a number the type cannot hold. So every
+    // operation is promoted, not just an average.
+    bool profiled = (reserved.profile != NULL);
+
+    uint8_t out_datatype = (mode == CONDENSE_AVG || profiled) ? BS_FLOAT : src_datatype;
+    uint32_t out_datasize = (mode == CONDENSE_AVG || profiled) ? 8 : src_datasize;
+    unsigned char out_fill = (mode == CONDENSE_AVG || profiled) ? 0xFF : src_fill;
 
 
     // Everything below only appends, so build the head first.
@@ -2153,12 +2328,20 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
     unsigned char bucket_reserved_best[8];
     bool bucket_has_reserved = false;
 
+    // Profiled accumulation works in magnitudes, so it carries doubles rather than
+    // the stored bytes the untyped path compares.
+    double bucket_low = 0;        // smallest magnitude seen, for a minimum
+    double bucket_high = 0;       // largest, for a maximum
+    long long literal_points = 0;
+    long long bucketed_points = 0;
+    long long unclassified_points = 0;
+
     // One count per bucket, held until the data blob has finished streaming
     // because JSON cannot have the field before the array it describes. Four
     // bytes a bucket, and max_points is already capped by max_points_per_read.
     std::string reserved_counts;
 
-    if(!reserved.values.empty())
+    if(!reserved.values.empty() || reserved.profile != NULL)
         reserved_counts.reserve((size_t)bucket_count * 4);
 
     std::string out_bytes;
@@ -2203,14 +2386,17 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
             if(belongs_to != bucket_index){
 
                 // Emit the bucket that just closed
-                emitCondensedBucket(out_bytes,mode,bucket_samples,bucket_sum,
-                                    bucket_has_best ? bucket_best : NULL,
-                                    out_datasize,out_fill,
-                                    bucket_reserved,
-                                    bucket_has_reserved ? bucket_reserved_best : NULL,
-                                    reserved.dominate,reserved.threshold);
+                if(profiled)
+                    emitProfiledBucket(out_bytes,mode,bucket_samples,bucket_sum,bucket_low,bucket_high);
+                else
+                    emitCondensedBucket(out_bytes,mode,bucket_samples,bucket_sum,
+                                        bucket_has_best ? bucket_best : NULL,
+                                        out_datasize,out_fill,
+                                        bucket_reserved,
+                                        bucket_has_reserved ? bucket_reserved_best : NULL,
+                                        reserved.dominate,reserved.threshold);
 
-                if(!reserved.values.empty())
+                if(!reserved.values.empty() || profiled)
                     appendCount32(reserved_counts,bucket_reserved);
 
                 if(bucket_samples > 0)
@@ -2222,6 +2408,8 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
                 bucket_has_best = false;
                 bucket_reserved = 0;
                 bucket_has_reserved = false;
+                bucket_low = 0;
+                bucket_high = 0;
 
                 if(out_bytes.size() >= 4096){
                     streamHex(stream,out_bytes.data(),out_bytes.size());
@@ -2236,6 +2424,51 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
                 continue;   // an empty slot takes no part in the aggregate
 
             real_points++;
+
+            if(profiled){
+
+                double stored = pointToDouble(point,src_datatype,ds);
+                const PROFILE_ENTRY *entry = ProfileStore::classify(reserved.profile,stored);
+
+                // Not a reading at all. Counted, never aggregated.
+                if(entry != NULL && entry->kind == BS_PROFILE_STATE){
+                    reserved_points++;
+                    bucket_reserved++;
+                    continue;
+                }
+
+                double low, high;
+
+                if(entry != NULL && entry->kind == BS_PROFILE_BUCKET){
+
+                    // A reading, but known only to lie in a range. Taking the low
+                    // end for a minimum and the high end for a maximum makes the
+                    // pair a true enclosing interval; an average uses the low end,
+                    // and the response says the answer is a floor.
+                    low = entry->low;
+                    high = entry->high;
+                    bucketed_points++;
+
+                } else {
+
+                    low = high = (entry != NULL) ? stored * entry->scale : stored;
+
+                    if(entry != NULL) literal_points++;
+                    else              unclassified_points++;   // the profile does not cover it
+                }
+
+                if(bucket_samples == 0){
+                    bucket_low = low;
+                    bucket_high = high;
+                } else {
+                    if(low < bucket_low)   bucket_low = low;
+                    if(high > bucket_high) bucket_high = high;
+                }
+
+                bucket_sum += low;
+                bucket_samples++;
+                continue;
+            }
 
             // Recorded, but not a measurement. Counted, and then kept out of the
             // aggregate so it cannot drag an average toward a latency nobody
@@ -2282,14 +2515,17 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
         return status;   // the head is already out, the caller reports it in the body
 
     // The final bucket never sees a boundary, so it is closed here.
-    emitCondensedBucket(out_bytes,mode,bucket_samples,bucket_sum,
-                        bucket_has_best ? bucket_best : NULL,
-                        out_datasize,out_fill,
-                        bucket_reserved,
-                        bucket_has_reserved ? bucket_reserved_best : NULL,
-                        reserved.dominate,reserved.threshold);
+    if(profiled)
+        emitProfiledBucket(out_bytes,mode,bucket_samples,bucket_sum,bucket_low,bucket_high);
+    else
+        emitCondensedBucket(out_bytes,mode,bucket_samples,bucket_sum,
+                            bucket_has_best ? bucket_best : NULL,
+                            out_datasize,out_fill,
+                            bucket_reserved,
+                            bucket_has_reserved ? bucket_reserved_best : NULL,
+                            reserved.dominate,reserved.threshold);
 
-    if(!reserved.values.empty())
+    if(!reserved.values.empty() || profiled)
         appendCount32(reserved_counts,bucket_reserved);
 
     if(bucket_samples > 0)
@@ -2308,6 +2544,45 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
         nullFillPattern(out_fill,out_datasize).c_str());
 
     stream->write(tail,strlen(tail));
+
+    // A profiled response reports the three populations separately -- exact
+    // readings, readings known only to a range, and values that are not readings
+    // at all -- because a chart needs to draw them differently and an average over
+    // any bucketed point is a floor rather than a value.
+    if(profiled){
+
+        std::string entries;
+
+        for(size_t i = 0; i < reserved.profile->entries.size(); i++){
+
+            const PROFILE_ENTRY &e = reserved.profile->entries[i];
+
+            if(e.kind != BS_PROFILE_STATE)
+                continue;
+
+            char item[192];
+            snprintf(item,sizeof(item),"%s{\"value\":%.17g,\"code\":\"%s\"}",
+                     entries.empty() ? "" : ",",e.first,e.code.c_str());
+            entries += item;
+        }
+
+        char head[384];
+        snprintf(head,sizeof(head),
+            ",\"profile\":\"%s\",\"reserved\":[%s],\"reserved_points\":%lld,"
+            "\"literal_points\":%lld,\"bucketed_points\":%lld,\"unclassified_points\":%lld,"
+            "\"lower_bound\":%s,\"reserved_counts\":\"",
+            reserved.profile_name.c_str(),
+            entries.c_str(),
+            reserved_points,
+            literal_points,
+            bucketed_points,
+            unclassified_points,
+            bucketed_points > 0 ? "true" : "false");
+
+        stream->write(head,strlen(head));
+        streamHex(stream,reserved_counts.data(),reserved_counts.size());
+        stream->write("\"",1);
+    }
 
     // Only when the caller named a reserved value, so a response that did not ask
     // for any is byte for byte what it was before.
@@ -2359,6 +2634,8 @@ bool BSeriesApi::readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE 
     reserved->values.clear();
     reserved->dominate = false;
     reserved->threshold = 0.0;
+    reserved->profile = NULL;
+    reserved->profile_name.clear();
 
     std::string max_text = httpQueryParam(request,"max_points");
     std::string condense_text = httpQueryParam(request,"condense");
@@ -2366,11 +2643,11 @@ bool BSeriesApi::readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE 
     if(max_text.empty() && condense_text.empty()){
 
         // Raw reads hand back what was stored, so there is nothing for a reserved
-        // value to change. Refused rather than ignored: a caller who thought it
-        // applied would otherwise read the answer as though it had.
-        if(!httpQueryParam(request,"reserved").empty()){
+        // value or a profile to change. Refused rather than ignored: a caller who
+        // thought it applied would otherwise read the answer as though it had.
+        if(!httpQueryParam(request,"reserved").empty() || !httpQueryParam(request,"profile").empty()){
             jsonError(response,400,"bad_parameter",
-                      "reserved applies to a condensed read; supply max_points and condense too");
+                      "reserved and profile apply to a condensed read; supply max_points and condense too");
             return false;
         }
 
@@ -2421,8 +2698,38 @@ bool BSeriesApi::readReservedOptions(const HTTP_REQUEST &request, HTTP_RESPONSE 
     reserved->values.clear();
     reserved->dominate = false;
     reserved->threshold = 0.0;
+    reserved->profile = NULL;
+    reserved->profile_name.clear();
 
+    std::string profile_name = httpQueryParam(request,"profile");
     std::string list = httpQueryParam(request,"reserved");
+
+    if(!profile_name.empty()){
+
+        // They answer the same question differently; taking both would mean
+        // deciding which wins, and every answer to that is a surprise to someone.
+        if(!list.empty()){
+            jsonError(response,400,"bad_parameter",
+                      "profile and reserved are alternatives; supply one or the other");
+            return false;
+        }
+
+        std::string error;
+        const PROFILE *profile = profiles.get(profile_name,&error);
+
+        // A named profile that cannot be read is refused rather than ignored. The
+        // whole point is that the caller does not have to know the convention, so
+        // quietly reading everything literally would answer with exactly the wrong
+        // numbers and no indication of it.
+        if(profile == NULL){
+            jsonError(response,404,"not_found",error);
+            return false;
+        }
+
+        reserved->profile = profile;
+        reserved->profile_name = profile_name;
+        return true;
+    }
 
     if(list.empty())
         return true;                        // condensing behaves exactly as before
@@ -2609,6 +2916,12 @@ void BSeriesApi::handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &r
     stream->begin(200,"application/json",response.headers);
     stream->write(head,strlen(head));
 
+    if(reserved.profile != NULL){
+        std::string used;
+        appendProfilesUsed(used,reserved);
+        stream->write(used);
+    }
+
     int rc = (condense_mode == CONDENSE_NONE)
            ? streamSeriesData(db,key,start_time,end_time,stream)
            : streamCondensedSeries(db,key,start_time,end_time,condense_mode,max_points,reserved,stream,NULL);
@@ -2697,10 +3010,18 @@ void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_
     HttpStream *stream = response.stream;
 
     char head[256];
-    snprintf(head,sizeof(head),"{\"start\":%lld,\"end\":%lld,\"series\":[",start_time,end_time);
+    snprintf(head,sizeof(head),"{\"start\":%lld,\"end\":%lld,",start_time,end_time);
 
     stream->begin(200,"application/json",response.headers);
     stream->write(head,strlen(head));
+
+    if(reserved.profile != NULL){
+        std::string used;
+        appendProfilesUsed(used,reserved);
+        stream->write(used);
+    }
+
+    stream->write("\"series\":[",10);
 
     size_t returned = 0;
 
