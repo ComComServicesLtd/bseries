@@ -291,6 +291,18 @@ public:
     /// which on a one point per series ingest is several syscalls per point for
     /// information the entry is already holding.
     bool seriesShape(uint32_t key, SERIES *header_out);
+
+    /// Points a series is holding that its file does not have yet.
+    ///
+    /// A read already merges these over the file, so they are not "pending" in any
+    /// sense a caller can observe by reading. What they are is missing from
+    /// file_size, and so from the points_in_file derived from it, which is why a
+    /// series can hold hours of data and still report nothing on disk.
+    ///
+    /// Zero for a series that is not open, since a series with nothing in memory
+    /// has nothing buffered. Probing an unopened key must not grow the index, the
+    /// same reason seriesInfo() reads the header straight from disk.
+    int64_t bufferedPoints(uint32_t key);
     int listSeriesKeys(vector<uint32_t> *keys, uint32_t after, int limit);
 
     /// Flushes every series whose buffer has been holding points for at least

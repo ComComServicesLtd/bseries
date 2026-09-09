@@ -1520,7 +1520,13 @@ static std::string nullFillPattern(unsigned char fill_byte, uint32_t datasize){
 }
 
 
-static void appendSeriesJson(std::string &out, uint32_t key, const SERIES &header, int64_t file_size){
+/// buffered is what the series holds in memory that the file does not have yet.
+/// points_in_file counts slots on disk, so a series written to in the last hour
+/// reports nothing there while reading back perfectly; points is the two added,
+/// and the number that answers "how much is in this series".
+
+static void appendSeriesJson(std::string &out, uint32_t key, const SERIES &header, int64_t file_size,
+                             int64_t buffered){
 
     uint8_t datatype = bsHeaderDataType(&header);
     uint32_t datasize = bsHeaderDataSize(&header);
@@ -1529,11 +1535,15 @@ static void appendSeriesJson(std::string &out, uint32_t key, const SERIES &heade
     if(datasize > 0 && file_size >= (int64_t)sizeof(SERIES))
         points_in_file = (file_size - (int64_t)sizeof(SERIES)) / datasize;
 
-    char buffer[512];
+    if(buffered < 0)
+        buffered = 0;
+
+    char buffer[640];
 
     snprintf(buffer,sizeof(buffer),
         "{\"key\":%lu,\"version\":%lu,\"type\":\"%s\",\"datasize\":%lu,\"interval\":%lu,"
-        "\"created\":%lu,\"points_in_file\":%lld,\"file_size\":%lld}",
+        "\"created\":%lu,\"points_in_file\":%lld,\"buffered_points\":%lld,\"points\":%lld,"
+        "\"file_size\":%lld}",
         (unsigned long)key,
         (unsigned long)header.version,
         bsTypeName(datatype,(uint8_t)datasize),
@@ -1541,6 +1551,8 @@ static void appendSeriesJson(std::string &out, uint32_t key, const SERIES &heade
         (unsigned long)header.interval,
         (unsigned long)header.timestamp,
         (long long)points_in_file,
+        (long long)buffered,
+        (long long)(points_in_file + buffered),
         (long long)file_size);
 
     out += buffer;
@@ -1560,7 +1572,7 @@ void BSeriesApi::handleSeriesInfo(BSeries *db, uint32_t key, HTTP_RESPONSE &resp
     }
 
     response.status = 200;
-    appendSeriesJson(response.body,key,header,file_size);
+    appendSeriesJson(response.body,key,header,file_size,db->bufferedPoints(key));
 }
 
 
@@ -1650,7 +1662,7 @@ void BSeriesApi::handleListSeries(BSeries *db, const HTTP_REQUEST &request, HTTP
         } else {
 
             std::string object;
-            appendSeriesJson(object,keys[i],header,file_size);
+            appendSeriesJson(object,keys[i],header,file_size,db->bufferedPoints(keys[i]));
             stream->write(object);
         }
 
@@ -1725,7 +1737,7 @@ void BSeriesApi::handleCreateSeries(BSeries *db, uint32_t key, const HTTP_REQUES
     }
 
     response.status = 201;
-    appendSeriesJson(response.body,key,header,file_size);
+    appendSeriesJson(response.body,key,header,file_size,db->bufferedPoints(key));
 }
 
 

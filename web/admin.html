@@ -108,19 +108,24 @@
       </form>
 
       <table v-if="table">
-        <thead><tr><th class="num">key</th><th>type</th><th class="num">interval</th><th class="num">points</th><th></th></tr></thead>
+        <thead><tr><th class="num">key</th><th>type</th><th class="num">interval</th>
+          <th class="num">on disk</th><th class="num">in series</th><th></th></tr></thead>
         <tbody>
           <tr v-for="s in series" :key="s.key">
             <td class="num"><code>{{ s.key }}</code></td>
             <td>{{ s.type }}<span class="muted" v-if="s.version < 3"> v{{ s.version }}</span></td>
             <td class="num">{{ s.interval }}s</td>
+            <!-- points_in_file counts slots the file holds; anything written since
+                 the last flush is readable but not yet among them. -->
             <td class="num">{{ s.points_in_file ?? '—' }}</td>
+            <td class="num">{{ s.points ?? '—' }}<span class="muted"
+                v-if="s.buffered_points"> +{{ s.buffered_points }}</span></td>
             <td>
               <button class="act" @click="readSeries(s)">read</button>
               <button class="act danger" @click="dropSeries(s.key)">delete</button>
             </td>
           </tr>
-          <tr v-if="!series.length"><td colspan="5" class="muted">no series</td></tr>
+          <tr v-if="!series.length"><td colspan="6" class="muted">no series</td></tr>
         </tbody>
       </table>
 

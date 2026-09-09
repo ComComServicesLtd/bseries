@@ -1651,6 +1651,31 @@ int BSeries::seriesInfo(uint32_t key, SERIES *header, int64_t *file_size){
 }
 
 
+int64_t BSeries::bufferedPoints(uint32_t key){
+
+    if(shuttingDown)
+        return 0;
+
+    index_access.lock();
+
+    map<uint32_t,ENTRY>::iterator it = series_list.find(key);
+
+    if(it == series_list.end()){
+        index_access.unlock();
+        return 0;              // not open, so nothing is held for it
+    }
+
+    it->second.access.lock();
+    index_access.unlock();
+
+    int64_t points = it->second.buffer_points;
+
+    it->second.access.unlock();
+
+    return points;
+}
+
+
 bool BSeries::seriesShape(uint32_t key, SERIES *header_out){
 
     if(header_out == NULL || shuttingDown)

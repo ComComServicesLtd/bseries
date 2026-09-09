@@ -661,6 +661,26 @@ int main(int argc, char **argv){
         CHECK(r.status==200 && bodyHas(r,"\"count\":2"), "batch read condenses too");
         CHECK(bodyHas(r,"\"condense\":\"max\""), "and reports the operation per series");
 
+        // points_in_file counts slots the file holds, so a series written to since
+        // the last flush reports nothing on disk while reading back perfectly.
+        // buffered_points is the difference, and points is what is actually there.
+        r = request("POST","/v1/series/70003?type=uint8&interval=1&start=1700000000","read-write-key");
+        CHECK(r.status==201 && bodyHas(r,"\"points_in_file\":0"), "a new series has nothing on disk");
+        CHECK(bodyHas(r,"\"buffered_points\":0") && bodyHas(r,"\"points\":0"), "and nothing buffered either");
+
+        r = request("POST","/v1/data","read-write-key","70003 1700000000 0a0b0c0d\n");
+        CHECK(r.status==200, "write four points without flushing");
+
+        r = request("GET","/v1/series/70003","read-only-key");
+        CHECK(bodyHas(r,"\"points_in_file\":0"), "still nothing on disk");
+        CHECK(bodyHas(r,"\"buffered_points\":4"), "the four are reported as buffered");
+        CHECK(bodyHas(r,"\"points\":4"), "and counted in the series total");
+
+        // The point of the distinction: they are readable regardless.
+        r = request("GET","/v1/series/70003/data?start=1700000000&end=1700000004","read-only-key");
+        CHECK(r.status==200 && bodyHas(r,"\"data\":\"0a0b0c0d\""), "unflushed points read back");
+        CHECK(bodyHas(r,"\"real_points\":4"), "and count as real, not as fill");
+
         // Reserved values.
         //
         // Bucket 0 holds 1..100, so reserving 1 removes exactly one point from it

@@ -478,6 +478,21 @@ Getting there needs `seriesShape()` rather than `seriesInfo()` on any write path
 cannot grow the in memory index; calling it per point cost an open, two reads, a
 seek and a close for something the open series already knew.
 
+**Buffered points are readable.** A read fills its output from the file and then
+copies the write ahead buffer over the top, so a point is queryable the moment it
+is written and no flush is needed to see it. The flush timer is about what
+survives losing power, not about what a read can see.
+
+What the buffer *is* missing from is the file, and so from `points_in_file`, which
+is derived from the file's size. A series written to in the last hour can report
+`"points_in_file":0` and still read back everything in it. `buffered_points` is
+what is held in memory, and `points` is the two together — the number that answers
+"how much is in this series".
+
+```
+{"key":1234,…,"points_in_file":0,"buffered_points":6,"points":6,"file_size":20}
+```
+
 ### Durability: the flush timer
 
 A buffer holds `write_ahead_size` **points**, not a span of time, so on a slow
