@@ -60,9 +60,29 @@ union BType {
 };
 
 
-#define SERIES_VERSION_LEGACY 1
-#define SERIES_VERSION_TYPED  2
-#define SERIES_VERSION_FILLED 3
+#define SERIES_VERSION_LEGACY   1
+#define SERIES_VERSION_TYPED    2
+#define SERIES_VERSION_FILLED   3
+#define SERIES_VERSION_PROFILED 4
+
+/// Header sizes on disk. This is the data offset, so it is part of the format:
+/// point n lives at bsHeaderBytes(version) + n * datasize.
+#define SERIES_HEADER_BYTES_V3  20
+#define SERIES_HEADER_BYTES_V4  128
+
+/// Field widths in a version 4 header.
+#define SERIES_PROFILE_BYTES    16
+#define SERIES_ADDRESS_BYTES    16
+#define SERIES_NAME_BYTES       48
+
+/// flags, version 4. The address family is two bits of a word that exists
+/// anyway; these are the database's own values and deliberately not the
+/// platform's AF_* constants, which differ between operating systems and would
+/// make a file mean different things depending on what wrote it.
+#define SERIES_ADDRESS_NONE     0
+#define SERIES_ADDRESS_IPV4     1
+#define SERIES_ADDRESS_IPV6     2
+#define SERIES_ADDRESS_MASK     0x3
 
 
 /// What a remap did, for the caller to report rather than have to infer.
@@ -84,16 +104,68 @@ typedef struct {
 /// sizeof(SERIES) + point * datasize, so the size of this struct is part of the
 /// file format and must not change.
 
+/// The header as the rest of the database sees it, whatever version wrote it.
+///
+/// This is no longer the on disk layout. Versions 1 to 3 are 20 bytes and version
+/// 4 is 128, and both are read and written field by field by bsReadHeader() and
+/// bsWriteHeader() -- so the format does not depend on how a compiler happens to
+/// lay this struct out, which it did for as long as the header was fwrite'd whole.
+///
+/// timestamp and interval are kept in seconds because every slot calculation in
+/// the database is in seconds and there are some fifty of them. Version 4 records
+/// milliseconds, and the two are held in step on read: a version 1 to 3 file has
+/// its seconds multiplied up, a version 4 file has its milliseconds divided down.
+/// Sub-second intervals are therefore expressible in the format but refused on
+/// creation until that arithmetic moves to milliseconds, rather than silently
+/// truncating an interval to zero.
+
 typedef struct _SERIES
 {
      uint32_t version;   // 1 = legacy, typecode is a plain byte width
                          // 2 = typecode packs the datatype class and the byte width
                          // 3 = typecode also carries the null fill byte
-     uint32_t timestamp; // First point timestamp (Unix Epoch)
-     uint32_t interval;  // = 10 for every 10 seconds
+                         // 4 = 128 byte header: milliseconds, profile, name, address
+     uint32_t timestamp; // First point timestamp (Unix Epoch seconds)
+     uint32_t interval;  // seconds between points
      uint32_t typecode;  // see bsPackTypeCode(), was called datasize in version 1
-     uint32_t checksum;  // = 1234567890 + ((version ^ timestamp) ^ (interval ^ typecode));
+     uint32_t checksum;  // versions 1-3 only; version 4 uses a CRC32 of the header
+
+     // Version 4. Zero or empty on an older header.
+     uint64_t timestamp_ms;
+     uint64_t interval_ms;
+     uint32_t flags;
+     unsigned char null_fill_wide[8];              // fill at the point's full width
+     char profile[SERIES_PROFILE_BYTES];           // which profile reads this series
+     unsigned char address[SERIES_ADDRESS_BYTES];  // what it measures, if anything
+     char name[SERIES_NAME_BYTES];                 // label, for people
 } SERIES;
+
+
+/// Bytes the header occupies on disk for this version, which is the offset of the
+/// first point. Unknown versions answer 0, so a caller that forgets to check gets
+/// an obviously wrong offset rather than a plausible one.
+
+inline uint32_t bsHeaderBytes(uint32_t version){
+
+    if(version >= SERIES_VERSION_LEGACY && version <= SERIES_VERSION_FILLED)
+        return SERIES_HEADER_BYTES_V3;
+
+    if(version == SERIES_VERSION_PROFILED)
+        return SERIES_HEADER_BYTES_V4;
+
+    return 0;
+}
+
+
+/// Reads and writes a header in whichever layout its version calls for. Both
+/// return false on a short or malformed header; the file position is left after
+/// the header on success.
+bool bsReadHeader(FILE *file, SERIES *out);
+bool bsWriteHeader(FILE *file, const SERIES *header);
+
+/// Fills in the derived fields after the on disk ones have been set, and computes
+/// the checksum. Call after building a header by hand.
+void bsFinaliseHeader(SERIES *header);
 
 
 /// Version 2 packs the datatype class and the byte width into the single 32 bit
@@ -361,7 +433,15 @@ public:
     /// and renamed over the original, so an interrupted run leaves the original
     /// exactly as it was. It needs the file's size again in free space, and holds
     /// the index lock throughout.
-    int remapUint8(uint32_t key, const unsigned char *map256, MIGRATION_REPORT *report, bool dry_run);
+    int remapUint8(uint32_t key, const unsigned char *map256, const char *profile,
+                   MIGRATION_REPORT *report, bool dry_run);
+
+    /// Names the profile a series is read with, in its own header.
+    ///
+    /// Only a version 4 header has anywhere to put it. Rewrites the header in
+    /// place -- 128 bytes, no data moved -- and refuses a name that would not
+    /// survive being turned back into a path.
+    int setSeriesProfile(uint32_t key, const char *profile);
     int listSeriesKeys(vector<uint32_t> *keys, uint32_t after, int limit);
 
     /// Flushes every series whose buffer has been holding points for at least

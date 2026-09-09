@@ -16,6 +16,29 @@ static const char *writeDefinitions(const char *dir){
     return path;
 }
 
+
+// Versions 1 to 3 are twenty bytes on disk: five little endian uint32. The
+// in-memory SERIES is a decoded header and is much larger, so these are written
+// out field by field rather than by dropping the struct on the disk -- which is
+// what the database itself now does, and the reason this helper exists.
+static void writeLegacyHeader(const char *path, uint32_t version, uint32_t timestamp,
+                              uint32_t interval, uint32_t typecode, const unsigned char *points,
+                              size_t count){
+
+    uint32_t checksum = 1234567890 + ((version ^ timestamp) ^ (interval ^ typecode));
+    uint32_t field[5] = { version, timestamp, interval, typecode, checksum };
+
+    FILE *w = fopen(path,"wb");
+    for(int i = 0; i < 5; i++){
+        unsigned char b[4];
+        b[0]=(unsigned char)field[i];      b[1]=(unsigned char)(field[i]>>8);
+        b[2]=(unsigned char)(field[i]>>16);b[3]=(unsigned char)(field[i]>>24);
+        fwrite(b,4,1,w);
+    }
+    if(count) fwrite(points,1,count,w);
+    fclose(w);
+}
+
 int main(int argc,char**argv){
     (void)argc; (void)argv;
     const char *dir = testMakeDirectory();
@@ -129,30 +152,100 @@ int main(int argc,char**argv){
             db.close();
         }
         char path[512]; snprintf(path,sizeof(path),"%s/777",dir);
-        FILE*f=fopen(path,"rb"); SERIES h; size_t got=fread(&h,sizeof(h),1,f); fclose(f);
-        CHECK(got==1 && h.version==SERIES_VERSION_FILLED,"header is version 3");
-        CHECK(sizeof(SERIES)==20,"and is still 20 bytes");
+        FILE*f=fopen(path,"rb"); SERIES h; size_t got=bsReadHeader(f,&h)?1:0; fclose(f);
+        CHECK(got==1 && h.version==SERIES_VERSION_PROFILED,"a new series is written as version 4");
+        CHECK(bsHeaderBytes(SERIES_VERSION_FILLED)==20 && bsHeaderBytes(SERIES_VERSION_PROFILED)==128,
+              "versions 1-3 are 20 bytes on disk, version 4 is 128");
         CHECK(bsTypeCodeDataSize(h.typecode)==1,"width recorded");
         CHECK(bsTypeCodeDataType(h.typecode)==BS_UNSIGNED,"type recorded");
         CHECK(bsTypeCodeNullFill(h.typecode)==0xFF,"fill recorded");
 
+        // Version 4 carries fields the older headers had nowhere to put. Written
+        // and read back through the serialiser, because the struct is no longer
+        // the format and a round trip is the only thing that proves the layout.
+        {
+            snprintf(path,sizeof(path),"%s/790",dir);
+
+            SERIES h;
+            memset(&h,0,sizeof(h));
+            h.version = SERIES_VERSION_PROFILED;
+            h.timestamp = 1700000000;
+            h.interval = 10;
+            h.typecode = bsPackTypeCode(BS_UNSIGNED,1,0xFF);
+            h.flags = SERIES_ADDRESS_IPV4;
+            h.address[0]=8; h.address[1]=8; h.address[2]=8; h.address[3]=8;
+            snprintf(h.profile,sizeof(h.profile),"ping");
+            snprintf(h.name,sizeof(h.name),"gateway latency");
+            bsFinaliseHeader(&h);
+
+            FILE *w = fopen(path,"wb");
+            CHECK(bsWriteHeader(w,&h),"a version 4 header writes");
+            unsigned char point = 33; fwrite(&point,1,1,w);
+            fclose(w);
+
+            FILE *rd = fopen(path,"rb");
+            fseek(rd,0,SEEK_END);
+            CHECK(ftell(rd)==129,"128 byte header plus one point");
+            SERIES back;
+            memset(&back,0,sizeof(back));
+            bool ok = bsReadHeader(rd,&back);
+            fclose(rd);
+
+            CHECK(ok,"and reads back");
+            CHECK(back.version==SERIES_VERSION_PROFILED,"as version 4");
+            CHECK(back.timestamp==1700000000,"its timestamp in seconds");
+            CHECK(back.timestamp_ms==1700000000000ULL,"and in milliseconds");
+            CHECK(back.interval==10 && back.interval_ms==10000,"its interval both ways");
+            CHECK(strcmp(back.profile,"ping")==0,"the profile it is read with");
+            CHECK(strcmp(back.name,"gateway latency")==0,"its name");
+            CHECK((back.flags & SERIES_ADDRESS_MASK)==SERIES_ADDRESS_IPV4,"the address family");
+            CHECK(back.address[0]==8 && back.address[3]==8,"and the address");
+            CHECK(bsTypeCodeNullFill(back.typecode)==0xFF,"the fill still decodes");
+
+            // The point sits after 128 bytes, not 20.
+            BSeries db; db.data_directory=dir; db.default_seconds_per_point=10;
+            int64_t n=0,r2=0,spp=0,fpt=0; uint32_t ds=0; uint8_t dt=0; void*res=NULL;
+            CHECK(db.read(790,1700000000,1700000030,&n,&r2,&spp,&fpt,&ds,&res,&dt)==NO_ERROR,
+                  "a version 4 series reads");
+            CHECK(res && ((unsigned char*)res)[0]==33,"and its point is found at the new offset");
+            delete[] (char*)res;
+            db.close();
+        }
+
+        // A corrupted version 4 header must be refused, not read as though the
+        // damage were data: the checksum covers every byte including the profile
+        // name, which decides how the points are interpreted.
+        {
+            snprintf(path,sizeof(path),"%s/791",dir);
+            SERIES h;
+            memset(&h,0,sizeof(h));
+            h.version = SERIES_VERSION_PROFILED;
+            h.timestamp = 1700000000;
+            h.interval = 10;
+            h.typecode = bsPackTypeCode(BS_UNSIGNED,1,0xFF);
+            snprintf(h.profile,sizeof(h.profile),"ping");
+            bsFinaliseHeader(&h);
+            FILE *w = fopen(path,"wb"); bsWriteHeader(w,&h); fclose(w);
+
+            // flip one byte of the profile name
+            FILE *rw = fopen(path,"r+b");
+            fseek(rw,32,SEEK_SET);
+            unsigned char c = 'X'; fwrite(&c,1,1,rw);
+            fclose(rw);
+
+            SERIES back;
+            FILE *rd = fopen(path,"rb");
+            bool ok = bsReadHeader(rd,&back);
+            fclose(rd);
+            CHECK(!ok,"a single flipped byte in the profile name fails the checksum");
+        }
+
         // Hand build a genuine version 1 header, as releases before typed headers
         // wrote them, and check it still reads.
         {
-            SERIES v1;
-            memset(&v1,0,sizeof(v1));
-            v1.version = SERIES_VERSION_LEGACY;
-            v1.timestamp = t0;
-            v1.interval = 10;
-            v1.typecode = 1;                 // a plain width
-            BSeries tmp; tmp.data_directory = dir;
-            v1.checksum = tmp.getChecksum(&v1);
             snprintf(path,sizeof(path),"%s/778",dir);
-            FILE *w=fopen(path,"wb");
-            fwrite(&v1,sizeof(v1),1,w);
-            unsigned char point=42; fwrite(&point,1,1,w);
-            fclose(w);
-            tmp.close();
+            unsigned char point = 42;
+            writeLegacyHeader(path,SERIES_VERSION_LEGACY,t0,10,1,&point,1);
         }
         {
             BSeries db; db.data_directory=dir; db.default_seconds_per_point=10;
@@ -174,13 +267,12 @@ int main(int argc,char**argv){
             v2.timestamp = t0;
             v2.interval = 10;
             v2.typecode = (uint32_t)BS_UNSIGNED | (1u << 8);   // spare byte zero
-            BSeries tmp; tmp.data_directory = dir;
-            v2.checksum = tmp.getChecksum(&v2);
+
             snprintf(path,sizeof(path),"%s/779",dir);
-            FILE *w=fopen(path,"wb");
-            fwrite(&v2,sizeof(v2),1,w);
-            unsigned char point=7; fwrite(&point,1,1,w);
-            fclose(w);
+            unsigned char point = 7;
+            writeLegacyHeader(path,SERIES_VERSION_TYPED,t0,10,v2.typecode,&point,1);
+
+            BSeries tmp; tmp.data_directory = dir;
             CHECK(tmp.resolveNullFill(779,&v2)==0xFF,"a version 2 fill comes from the type, not the spare byte");
             tmp.close();
         }
@@ -244,7 +336,7 @@ int main(int argc,char**argv){
             // The header, not a definition, is what says so now
             SERIES header; int64_t size=0;
             CHECK(db.seriesInfo(900,&header,&size)==NO_ERROR,"header readable");
-            CHECK(header.version==SERIES_VERSION_FILLED,"written as version 3");
+            CHECK(header.version==SERIES_VERSION_PROFILED,"written as version 4");
             CHECK(db.resolveNullFill(900,&header)==0x02,"and the fill comes from the header");
             CHECK(!db.definitionForKey(900,NULL),"with no definition installed at all");
             db.close();

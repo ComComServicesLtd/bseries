@@ -24,7 +24,218 @@ BSeries::BSeries()
 
 
 
+/// CRC32, for version 4 headers. The version 1 checksum is a sum of exclusive
+/// ors over four fields, which a pair of matching bit flips cancels out; a header
+/// with room for a real one should have a real one.
+
+static uint32_t bsCrc32(const unsigned char *data, size_t length){
+
+    static uint32_t table[256];
+    static bool built = false;
+
+    if(!built){
+        for(uint32_t i = 0; i < 256; i++){
+            uint32_t c = i;
+            for(int k = 0; k < 8; k++)
+                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+        built = true;
+    }
+
+    uint32_t crc = 0xFFFFFFFFu;
+
+    for(size_t i = 0; i < length; i++)
+        crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+
+    return crc ^ 0xFFFFFFFFu;
+}
+
+
+/// Little endian field access, so the on disk layout is written down here rather
+/// than left to whatever a compiler does with the struct.
+
+static void putU32(unsigned char *p, uint32_t v){
+    p[0]=(unsigned char)v; p[1]=(unsigned char)(v>>8); p[2]=(unsigned char)(v>>16); p[3]=(unsigned char)(v>>24);
+}
+
+static void putU64(unsigned char *p, uint64_t v){
+    for(int i = 0; i < 8; i++) p[i] = (unsigned char)(v >> (8*i));
+}
+
+static uint32_t getU32(const unsigned char *p){
+    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+}
+
+static uint64_t getU64(const unsigned char *p){
+    uint64_t v = 0;
+    for(int i = 0; i < 8; i++) v |= ((uint64_t)p[i]) << (8*i);
+    return v;
+}
+
+
+/// Lays a header out on disk.
+///
+///   version 1-3   20 bytes, five little endian uint32
+///   version 4    128 bytes, see bseries.h
+///
+/// A version 4 checksum covers every byte of the header but its own four, so a
+/// change anywhere in it is caught -- including in the profile name, which decides
+/// how the points are read.
+
+static void packHeader(const SERIES *h, unsigned char *out, uint32_t bytes){
+
+    memset(out,0,bytes);
+
+    if(bytes == SERIES_HEADER_BYTES_V3){
+        putU32(out +  0,h->version);
+        putU32(out +  4,h->timestamp);
+        putU32(out +  8,h->interval);
+        putU32(out + 12,h->typecode);
+        putU32(out + 16,h->checksum);
+        return;
+    }
+
+    putU32(out +   0,h->version);
+    putU32(out +   4,h->flags);
+    putU64(out +   8,h->timestamp_ms);
+    putU32(out +  16,(uint32_t)h->interval_ms);
+    putU32(out +  20,h->typecode);
+    memcpy(out +  24,h->null_fill_wide,8);
+    memcpy(out +  32,h->profile,SERIES_PROFILE_BYTES);
+    memcpy(out +  48,h->address,SERIES_ADDRESS_BYTES);
+    memcpy(out +  64,h->name,SERIES_NAME_BYTES);
+    // 112..123 spare, left zero
+    putU32(out + 124,bsCrc32(out,124));
+}
+
+
+static bool unpackHeader(const unsigned char *in, uint32_t bytes, SERIES *h){
+
+    memset(h,0,sizeof(*h));
+
+    if(bytes == SERIES_HEADER_BYTES_V3){
+
+        h->version   = getU32(in +  0);
+        h->timestamp = getU32(in +  4);
+        h->interval  = getU32(in +  8);
+        h->typecode  = getU32(in + 12);
+        h->checksum  = getU32(in + 16);
+
+        // Kept in step so callers can use either without asking the version.
+        h->timestamp_ms = (uint64_t)h->timestamp * 1000u;
+        h->interval_ms  = (uint64_t)h->interval * 1000u;
+        return true;
+    }
+
+    h->version      = getU32(in +  0);
+    h->flags        = getU32(in +  4);
+    h->timestamp_ms = getU64(in +  8);
+    h->interval_ms  = getU32(in + 16);
+    h->typecode     = getU32(in + 20);
+    memcpy(h->null_fill_wide,in + 24,8);
+    memcpy(h->profile,in + 32,SERIES_PROFILE_BYTES);
+    memcpy(h->address,in + 48,SERIES_ADDRESS_BYTES);
+    memcpy(h->name,   in + 64,SERIES_NAME_BYTES);
+    h->checksum     = getU32(in + 124);
+
+    if(h->checksum != bsCrc32(in,124))
+        return false;
+
+    // Every string field is used as a C string, so a file claiming 16 bytes of
+    // profile name with no terminator must not read off the end of it.
+    h->profile[SERIES_PROFILE_BYTES - 1] = 0;
+    h->name[SERIES_NAME_BYTES - 1] = 0;
+
+    h->timestamp = (uint32_t)(h->timestamp_ms / 1000u);
+    h->interval  = (uint32_t)(h->interval_ms / 1000u);
+    return true;
+}
+
+
+bool bsReadHeader(FILE *file, SERIES *out){
+
+    unsigned char buffer[SERIES_HEADER_BYTES_V4];
+
+    if(fseek(file,0,SEEK_SET) != 0)
+        return false;
+
+    if(fread(buffer,SERIES_HEADER_BYTES_V3,1,file) != 1)
+        return false;
+
+    uint32_t version = getU32(buffer);
+    uint32_t bytes = bsHeaderBytes(version);
+
+    if(bytes == 0)
+        return false;                       // a version this build does not know
+
+    if(bytes > SERIES_HEADER_BYTES_V3){
+
+        size_t rest = bytes - SERIES_HEADER_BYTES_V3;
+
+        if(fread(buffer + SERIES_HEADER_BYTES_V3,rest,1,file) != 1)
+            return false;
+    }
+
+    return unpackHeader(buffer,bytes,out);
+}
+
+
+bool bsWriteHeader(FILE *file, const SERIES *header){
+
+    uint32_t bytes = bsHeaderBytes(header->version);
+
+    if(bytes == 0)
+        return false;
+
+    unsigned char buffer[SERIES_HEADER_BYTES_V4];
+    packHeader(header,buffer,bytes);
+
+    if(fseek(file,0,SEEK_SET) != 0)
+        return false;
+
+    return fwrite(buffer,bytes,1,file) == 1;
+}
+
+
+void bsFinaliseHeader(SERIES *header){
+
+    if(header->version == SERIES_VERSION_PROFILED){
+
+        if(header->interval_ms == 0)
+            header->interval_ms = (uint64_t)header->interval * 1000u;
+
+        if(header->timestamp_ms == 0)
+            header->timestamp_ms = (uint64_t)header->timestamp * 1000u;
+
+        header->timestamp = (uint32_t)(header->timestamp_ms / 1000u);
+        header->interval  = (uint32_t)(header->interval_ms / 1000u);
+
+        unsigned char buffer[SERIES_HEADER_BYTES_V4];
+        packHeader(header,buffer,SERIES_HEADER_BYTES_V4);
+        header->checksum = getU32(buffer + 124);
+        return;
+    }
+
+    header->timestamp_ms = (uint64_t)header->timestamp * 1000u;
+    header->interval_ms  = (uint64_t)header->interval * 1000u;
+    header->checksum = 1234567890 + ((header->version ^ header->timestamp) ^ (header->interval ^ header->typecode));
+}
+
+
 uint32_t BSeries::getChecksum(SERIES *series){
+
+    // Version 4 checksums the whole header with a CRC32, so the answer cannot be
+    // computed from four fields the way the original could. Callers compare this
+    // against header.checksum to decide whether a cached header is still good, so
+    // it has to know which scheme the header uses or every version 4 header looks
+    // corrupt.
+    if(series->version == SERIES_VERSION_PROFILED){
+        unsigned char buffer[SERIES_HEADER_BYTES_V4];
+        packHeader(series,buffer,SERIES_HEADER_BYTES_V4);
+        return getU32(buffer + 124);
+    }
+
     return 1234567890 + ((series->version ^ series->timestamp) ^ (series->interval ^ series->typecode));
 }
 
@@ -59,9 +270,10 @@ int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t dat
             return SERIES_TYPE_MISMATCH;
         }
 
-        series->version = SERIES_VERSION_FILLED;
+        series->version = SERIES_VERSION_PROFILED;
         series->interval = def.interval;
         series->typecode = bsPackTypeCode(def.datatype,def.datasize,def.null_fill_byte);
+        memset(series->null_fill_wide,def.null_fill_byte,sizeof(series->null_fill_wide));
 
         _DEBUG("\t Creating series %u as %s every %u seconds\n",key,bsTypeName(def.datatype,def.datasize),def.interval);
 
@@ -76,16 +288,16 @@ int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t dat
             return SERIES_TYPE_MISMATCH;
         }
 
-        series->version = SERIES_VERSION_FILLED;
+        series->version = SERIES_VERSION_PROFILED;
         series->interval = default_seconds_per_point;
         series->typecode = bsPackTypeCode(inferred,(uint8_t)datasize,(unsigned char)default_null_fill_byte);
+        memset(series->null_fill_wide,(unsigned char)default_null_fill_byte,sizeof(series->null_fill_wide));
     }
 
     series->timestamp = start_timestamp ? start_timestamp : (uint32_t)time(NULL);
-    series->checksum = getChecksum(series);
+    bsFinaliseHeader(series);
 
-    fseek(file,0,SEEK_SET);
-    int64_t size = fwrite((char*)series,sizeof(SERIES),1,file);
+    int64_t size = bsWriteHeader(file,series) ? 1 : 0;
 
 
     if(size == 1)
@@ -97,7 +309,7 @@ int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t dat
 
 unsigned char BSeries::resolveNullFill(uint32_t key, const SERIES *header){
 
-    if(header->version == SERIES_VERSION_FILLED)
+    if(header->version >= SERIES_VERSION_FILLED)
         return bsTypeCodeNullFill(header->typecode);
 
     uint32_t datasize = bsHeaderDataSize(header);
@@ -125,7 +337,8 @@ bool BSeries::bindHeader(ENTRY *entry, uint32_t key){
     uint8_t datatype;
     uint32_t datasize;
 
-    if(entry->header.version == SERIES_VERSION_FILLED || entry->header.version == SERIES_VERSION_TYPED){
+    if(entry->header.version == SERIES_VERSION_PROFILED ||
+       entry->header.version == SERIES_VERSION_FILLED || entry->header.version == SERIES_VERSION_TYPED){
 
         datatype = bsTypeCodeDataType(entry->header.typecode);
         datasize = bsTypeCodeDataSize(entry->header.typecode);
@@ -145,7 +358,7 @@ bool BSeries::bindHeader(ENTRY *entry, uint32_t key){
     } else {
 
         _ERROR("\t Series %u has header version %u, this build understands %d to %d\n",
-               key,entry->header.version,SERIES_VERSION_LEGACY,SERIES_VERSION_FILLED);
+               key,entry->header.version,SERIES_VERSION_LEGACY,SERIES_VERSION_PROFILED);
         return false;
     }
 
@@ -807,7 +1020,7 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
             }
 
             // read our header
-            size = fread((char*)&series->header,sizeof(series->header),1,file);
+            size = bsReadHeader(file,&series->header) ? 1 : 0;
 
 
             // If the header not read correctily, create the series
@@ -887,7 +1100,7 @@ retry:
         int64_t point = ((int64_t)timestamp - (int64_t)series->header.timestamp)/(int64_t)series->header.interval;
         // Point since start of file
 
-        int64_t file_pos = point * series->datasize + sizeof(SERIES);
+        int64_t file_pos = point * series->datasize + bsHeaderBytes(series->header.version);
 
 
         if(file_pos >= series->file_size){ // Cached Write
@@ -895,7 +1108,7 @@ retry:
             _DEBUG("\t ===== Performing Cached Write =======\n");
 
             // get total points in series
-            int64_t pointsInBuffer = point - ((series->file_size - sizeof(SERIES)) / series->datasize);
+            int64_t pointsInBuffer = point - ((series->file_size - bsHeaderBytes(series->header.version)) / series->datasize);
             //a int64_t pointsInBuffer = pointsInSeries - point;
 
             _DEBUG("\t Absolute point in series: %d,  buffer pos: %d, buffer size: %d\n",point,pointsInBuffer,write_ahead_size);
@@ -1197,7 +1410,7 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
 
 
             fseek(file,0,SEEK_SET); // Seek begining
-            int size = fread((char*)&series->header,sizeof(series->header),1,file);
+            int size = bsReadHeader(file,&series->header) ? 1 : 0;
 
             if(size != 1){
                 _ERROR("\t FAILED_TO_READ_HEADER\n");
@@ -1249,7 +1462,7 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
         }
 
         int64_t points = ( end_time - start_time) / series->header.interval;
-        int64_t points_in_file = (series->file_size - (int64_t)sizeof(SERIES))/series->datasize;
+        int64_t points_in_file = (series->file_size - (int64_t)bsHeaderBytes(series->header.version))/series->datasize;
         *seconds_per_point = series->header.interval;
 
         // The point grid is anchored to the series' own start, not to whatever
@@ -1345,7 +1558,7 @@ int BSeries::read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n
             if(buffer_output_points > 0 && file_start_point >= 0 && file_end_point >= 0){
 
 
-                fseek(file,((file_start_point*series->datasize)+sizeof(SERIES)),SEEK_SET); // Read Points
+                fseek(file,((file_start_point*series->datasize)+bsHeaderBytes(series->header.version)),SEEK_SET); // Read Points
 
 
                 int64_t file_points = fread(output+(buffer_output_pos*series->datasize),series->datasize,buffer_output_points,file);
@@ -1530,15 +1743,16 @@ int BSeries::createSeriesFile(uint32_t key, uint32_t interval, uint8_t datatype,
         if(definitionForKey(key,&def) && def.datasize == datasize)
             fill = def.null_fill_byte;
 
-        header.version = SERIES_VERSION_FILLED;
+        header.version = SERIES_VERSION_PROFILED;
         header.timestamp = start_timestamp ? start_timestamp : (uint32_t)time(NULL);
         header.interval = interval;
         header.typecode = bsPackTypeCode(datatype,datasize,fill);
-        header.checksum = getChecksum(&header);
+        memset(header.null_fill_wide,fill,sizeof(header.null_fill_wide));
+        bsFinaliseHeader(&header);
 
         fseek(file,0,SEEK_SET);
 
-        if(fwrite((char*)&header,sizeof(header),1,file) != 1){
+        if(!bsWriteHeader(file,&header)){
             _ERROR("\t Could not write the header for series %u\n",key);
             status = CREATE_NEW_HEADER_FAIL;
             break;
@@ -1629,7 +1843,7 @@ int BSeries::seriesInfo(uint32_t key, SERIES *header, int64_t *file_size){
 
     do {
 
-        if(fread((char*)header,sizeof(SERIES),1,file) != 1){
+        if(!bsReadHeader(file,header)){
             status = FAILED_TO_READ_HEADER;
             break;
         }
@@ -1652,7 +1866,8 @@ int BSeries::seriesInfo(uint32_t key, SERIES *header, int64_t *file_size){
 }
 
 
-int BSeries::remapUint8(uint32_t key, const unsigned char *map256, MIGRATION_REPORT *report, bool dry_run){
+int BSeries::remapUint8(uint32_t key, const unsigned char *map256, const char *profile,
+                        MIGRATION_REPORT *report, bool dry_run){
 
     if(shuttingDown)
         return FAILED_TO_OPEN_FILE;
@@ -1719,7 +1934,7 @@ int BSeries::remapUint8(uint32_t key, const unsigned char *map256, MIGRATION_REP
 
         SERIES header;
 
-        if(fread((char*)&header,sizeof(header),1,in) != 1){
+        if(!bsReadHeader(in,&header)){
             status = FAILED_TO_READ_HEADER;
             break;
         }
@@ -1751,12 +1966,25 @@ int BSeries::remapUint8(uint32_t key, const unsigned char *map256, MIGRATION_REP
 
         const unsigned char fill = bsTypeNullFill(BS_UNSIGNED,1);
 
+        // The rewrite already copies every byte, so bringing the header up to the
+        // current version costs nothing extra here -- the data simply lands after
+        // a 128 byte header instead of a 20 byte one. Doing it anywhere else would
+        // mean moving every point in the file for its own sake.
         SERIES migrated = header;
-        migrated.version = SERIES_VERSION_FILLED;
-        migrated.typecode = bsPackTypeCode(BS_UNSIGNED,1,bsTypeNullFill(BS_UNSIGNED,1));
-        migrated.checksum = getChecksum(&migrated);
+        migrated.version = SERIES_VERSION_PROFILED;
+        migrated.typecode = bsPackTypeCode(BS_UNSIGNED,1,fill);
+        memset(migrated.null_fill_wide,fill,sizeof(migrated.null_fill_wide));
 
-        if(!dry_run && fwrite((const char*)&migrated,sizeof(migrated),1,out) != 1){
+        // The points are in the target profile's encoding now, so the header says
+        // so: a later read resolves it without being told.
+        memset(migrated.profile,0,sizeof(migrated.profile));
+
+        if(profile != NULL)
+            snprintf(migrated.profile,sizeof(migrated.profile),"%s",profile);
+
+        bsFinaliseHeader(&migrated);
+
+        if(!dry_run && !bsWriteHeader(out,&migrated)){
             status = CREATE_NEW_HEADER_FAIL;
             break;
         }
@@ -1833,6 +2061,85 @@ int BSeries::remapUint8(uint32_t key, const unsigned char *map256, MIGRATION_REP
     if(in != NULL)
         fclose(in);
 
+    index_access.unlock();
+
+    return status;
+}
+
+
+int BSeries::setSeriesProfile(uint32_t key, const char *profile){
+
+    if(shuttingDown)
+        return FAILED_TO_OPEN_FILE;
+
+    if(profile == NULL || strlen(profile) >= SERIES_PROFILE_BYTES)
+        return INVALID_SERIES_DEFINITION;
+
+    // The whole series is taken out of memory first: its cached header is about
+    // to stop describing the file, and a reader holding it would resolve the old
+    // profile for as long as the entry lived.
+    index_access.lock();
+
+    map<uint32_t,ENTRY>::iterator it = series_list.find(key);
+
+    if(it != series_list.end()){
+
+        it->second.access.lock();
+
+        if(it->second.write_ahead_cache != NULL){
+
+            if(it->second.last_write){
+                FILE *f = openFile(key,true);
+                if(f != NULL){ flushBuffer(&it->second,f); fclose(f); }
+            }
+
+            free(it->second.write_ahead_cache);
+            it->second.write_ahead_cache = NULL;
+        }
+
+        it->second.access.unlock();
+        series_list.erase(it);
+    }
+
+    FILE *file = openFile(key,true);
+
+    if(file == NULL){
+        index_access.unlock();
+        return SERIES_NOT_FOUND;
+    }
+
+    SERIES header;
+    int status = NO_ERROR;
+
+    do {
+
+        if(!bsReadHeader(file,&header)){
+            status = FAILED_TO_READ_HEADER;
+            break;
+        }
+
+        // Older headers have no field for it, and widening one would move every
+        // point in the file -- which is a migration, not a rename.
+        if(header.version != SERIES_VERSION_PROFILED){
+            status = SERIES_TYPE_MISMATCH;
+            break;
+        }
+
+        memset(header.profile,0,sizeof(header.profile));
+        snprintf(header.profile,sizeof(header.profile),"%s",profile);
+
+        bsFinaliseHeader(&header);
+
+        if(!bsWriteHeader(file,&header)){
+            status = CREATE_NEW_HEADER_FAIL;
+            break;
+        }
+
+        fflush(file);
+
+    } while(false);
+
+    fclose(file);
     index_access.unlock();
 
     return status;

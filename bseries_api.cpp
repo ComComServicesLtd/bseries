@@ -1415,6 +1415,21 @@ void BSeriesApi::routeTable(BSeries *db, const std::vector<std::string> &rest, c
         return;
     }
 
+    // <table>/series/{key}/profile - which profile this series is read with
+    if(rest.size() == 3 && rest[2] == "profile"){
+
+        if(request.method != "POST" && request.method != "PUT"){
+            jsonError(response,405,"method_not_allowed","use POST to name the profile");
+            return;
+        }
+
+        if(!authorise(request,true,response))
+            return;
+
+        handleSetSeriesProfile(db,key,request,response);
+        return;
+    }
+
     // <table>/series/{key}/migrate
     if(rest.size() == 3 && rest[2] == "migrate"){
 
@@ -1727,18 +1742,36 @@ static void appendSeriesJson(std::string &out, uint32_t key, const SERIES &heade
     uint32_t datasize = bsHeaderDataSize(&header);
 
     int64_t points_in_file = 0;
-    if(datasize > 0 && file_size >= (int64_t)sizeof(SERIES))
-        points_in_file = (file_size - (int64_t)sizeof(SERIES)) / datasize;
+    int64_t header_bytes = (int64_t)bsHeaderBytes(header.version);
+
+    if(datasize > 0 && header_bytes > 0 && file_size >= header_bytes)
+        points_in_file = (file_size - header_bytes) / datasize;
 
     if(buffered < 0)
         buffered = 0;
 
     char buffer[640];
 
+    // interval_ms and created_ms are reported alongside the seconds rather than
+    // replacing them: every existing client computes point times as
+    // first_point_timestamp + i * interval, and redefining those units would give
+    // each of them wrong answers with no error to notice.
+    char extra[256];
+    extra[0] = 0;
+
+    if(header.version == SERIES_VERSION_PROFILED){
+        snprintf(extra,sizeof(extra),
+                 ",\"interval_ms\":%llu,\"created_ms\":%llu,\"profile\":\"%s\",\"name\":\"%s\"",
+                 (unsigned long long)header.interval_ms,
+                 (unsigned long long)header.timestamp_ms,
+                 header.profile,
+                 header.name);
+    }
+
     snprintf(buffer,sizeof(buffer),
         "{\"key\":%lu,\"version\":%lu,\"type\":\"%s\",\"datasize\":%lu,\"interval\":%lu,"
         "\"created\":%lu,\"points_in_file\":%lld,\"buffered_points\":%lld,\"points\":%lld,"
-        "\"file_size\":%lld}",
+        "\"file_size\":%lld%s}",
         (unsigned long)key,
         (unsigned long)header.version,
         bsTypeName(datatype,(uint8_t)datasize),
@@ -1748,7 +1781,8 @@ static void appendSeriesJson(std::string &out, uint32_t key, const SERIES &heade
         (long long)points_in_file,
         (long long)buffered,
         (long long)(points_in_file + buffered),
-        (long long)file_size);
+        (long long)file_size,
+        extra);
 
     out += buffer;
 }
@@ -2093,7 +2127,7 @@ void BSeriesApi::handleMigrateSeries(BSeries *db, uint32_t key, const HTTP_REQUE
     bool dry_run = !dry_text.empty() && dry_text != "0" && dry_text != "false";
 
     MIGRATION_REPORT report;
-    int rc = db->remapUint8(key,map256,&report,dry_run);
+    int rc = db->remapUint8(key,map256,to_name.c_str(),&report,dry_run);
 
     if(rc != NO_ERROR){
         jsonDatabaseError(response,rc,"re-encoding the series");
@@ -2105,7 +2139,7 @@ void BSeriesApi::handleMigrateSeries(BSeries *db, uint32_t key, const HTTP_REQUE
 
     snprintf(buffer,sizeof(buffer),
         "\"key\":%lu,\"migrated\":%s,\"dry_run\":%s,\"from\":\"%s\",\"to\":\"%s\","
-        "\"from_version\":%lu,\"to_version\":3,"
+        "\"from_version\":%lu,\"to_version\":4,"
         "\"points\":%lld,\"changed\":%lld,\"unchanged\":%lld,\"nulls\":%lld,\"mapping\":[",
         (unsigned long)key,
         dry_run ? "false" : "true",
@@ -2136,6 +2170,57 @@ void BSeriesApi::handleMigrateSeries(BSeries *db, uint32_t key, const HTTP_REQUE
 
     body += "]}";
 
+    response.status = 200;
+    response.body = body;
+}
+
+
+/// Records which profile a series is read with, in the series' own header.
+///
+/// This is what makes a profile a property of the data rather than of a request:
+/// once it is here, a read resolves it without being told, and a multi series
+/// read can answer with several because each series names its own.
+
+void BSeriesApi::handleSetSeriesProfile(BSeries *db, uint32_t key, const HTTP_REQUEST &request,
+                                        HTTP_RESPONSE &response){
+
+    std::string name = httpQueryParam(request,"name");
+
+    // An empty name clears it, which is the only way back to "read the values at
+    // face value" once one has been set.
+    if(!name.empty()){
+
+        if(!ProfileStore::nameIsSafe(name)){
+            jsonError(response,400,"bad_parameter",
+                      "a profile name is letters, digits, underscore and dash");
+            return;
+        }
+
+        std::string error;
+
+        // Refused rather than stored hopefully: a header naming a profile that
+        // cannot be read would make every later read of this series fail.
+        if(profiles.get(name,&error) == NULL){
+            jsonError(response,404,"not_found",error);
+            return;
+        }
+    }
+
+    int rc = db->setSeriesProfile(key,name.c_str());
+
+    if(rc == SERIES_TYPE_MISMATCH){
+        jsonError(response,409,"not_applicable",
+                  "only a version 4 header has room for a profile name; migrate the series first");
+        return;
+    }
+
+    if(rc != NO_ERROR){
+        jsonDatabaseError(response,rc,"naming the series' profile");
+        return;
+    }
+
+    char body[160];
+    snprintf(body,sizeof(body),"{\"key\":%lu,\"profile\":\"%s\"}",(unsigned long)key,name.c_str());
     response.status = 200;
     response.body = body;
 }
@@ -2996,6 +3081,41 @@ int64_t BSeriesApi::pointsInRange(BSeries *db, uint32_t key, long long start_tim
 }
 
 
+/// Resolves the profile a series carries in its own header, when the request did
+/// not name one.
+///
+/// A request still wins: naming a profile explicitly is how you look at a series
+/// through a different convention, which is what a migration dry run needs.
+/// Silence means "use whatever the series says it is", which is the point of
+/// recording it in the file.
+///
+/// A header naming a profile that cannot be read is left alone rather than
+/// failing the request: the series is still readable, its values are just taken
+/// at face value.
+
+void BSeriesApi::applySeriesProfile(const SERIES &header, CONDENSE_RESERVED *reserved){
+
+    if(reserved->profile != NULL || !reserved->values.empty())
+        return;                                  // the request said what to use
+
+    if(header.version != SERIES_VERSION_PROFILED || header.profile[0] == 0)
+        return;
+
+    std::string name = header.profile;
+
+    if(!ProfileStore::nameIsSafe(name))
+        return;
+
+    const PROFILE *profile = profiles.get(name,NULL);
+
+    if(profile == NULL)
+        return;
+
+    reserved->profile = profile;
+    reserved->profile_name = name;
+}
+
+
 void BSeriesApi::handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
     long long start_time = 0, end_time = 0;
@@ -3051,6 +3171,11 @@ void BSeriesApi::handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &r
         jsonDatabaseError(response,info,"reading the series header");
         return;
     }
+
+    // Only when condensing: a raw read hands back what was stored, and a profile
+    // has nothing to change about that.
+    if(condense_mode != CONDENSE_NONE)
+        applySeriesProfile(probe,&reserved);
 
     HttpStream *stream = response.stream;
 
@@ -3188,10 +3313,17 @@ void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_
 
         int rc = info;
 
+        // Each series resolves its own, so a request spanning series written with
+        // different conventions answers each of them correctly.
+        CONDENSE_RESERVED per_series = reserved;
+
+        if(info == NO_ERROR && condense_mode != CONDENSE_NONE)
+            applySeriesProfile(probe,&per_series);
+
         if(info == NO_ERROR)
             rc = (condense_mode == CONDENSE_NONE)
                ? streamSeriesData(db,keys[i],start_time,end_time,stream)
-               : streamCondensedSeries(db,keys[i],start_time,end_time,condense_mode,max_points,reserved,stream,NULL);
+               : streamCondensedSeries(db,keys[i],start_time,end_time,condense_mode,max_points,per_series,stream,NULL);
 
         if(rc != NO_ERROR){
             char entry[256];

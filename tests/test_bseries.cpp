@@ -192,14 +192,14 @@ int main(int argc, char**argv){
         }
 
         FILE *f = fopen(path,"rb"); fseek(f,0,SEEK_END); long before = ftell(f); fclose(f);
-        CHECK(before == (long)sizeof(SERIES), "100 points are still only in memory");
+        CHECK(before == (long)SERIES_HEADER_BYTES_V4, "100 points are still only in memory");
 
         CHECK(db.flushAged(3600) == 0, "a young buffer is not flushed");
         CHECK(db.flushAged(0) == 1, "an aged one is");
         CHECK(db.flushAged(0) == 0, "and is not flushed twice");
 
         f = fopen(path,"rb"); fseek(f,0,SEEK_END); long after = ftell(f); fclose(f);
-        CHECK(after == (long)sizeof(SERIES) + db.write_ahead_size,
+        CHECK(after == (long)SERIES_HEADER_BYTES_V4 + db.write_ahead_size,
               "a partly filled block is padded out with null fill, not left short");
 
         // the rest of that block is already in the file, so those points are
@@ -259,7 +259,7 @@ int main(int argc, char**argv){
         db.flush();
 
         f = fopen(path,"rb"); fseek(f,0,SEEK_END); long three = ftell(f); fclose(f);
-        CHECK(one == (long)sizeof(SERIES) + db.write_ahead_size, "one point flushed writes its whole block");
+        CHECK(one == (long)SERIES_HEADER_BYTES_V4 + db.write_ahead_size, "one point flushed writes its whole block");
         CHECK(three == one, "flushing a clean buffer again adds nothing");
         db.close();
     }

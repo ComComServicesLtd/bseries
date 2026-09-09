@@ -882,8 +882,11 @@ int main(int argc, char **argv){
             CHECK(bodyHas(r,"\"points\":256"), "every point was walked");
             CHECK(bodyHas(r,"\"nulls\":1"), "the single 255 was left as fill");
 
+            // The rewrite copies every byte anyway, so it brings the header up to
+            // the current version and records the profile the data is now in.
             r = request("GET","/v1/series/70004","read-only-key");
-            CHECK(bodyHas(r,"\"version\":3"), "the header is now version 3");
+            CHECK(bodyHas(r,"\"version\":4"), "the header is brought up to version 4");
+            CHECK(bodyHas(r,"\"profile\":\"modern\""), "and names the profile it was written into");
 
             r = request("GET","/v1/series/70004/data?start=1700000000&end=1700000256","read-only-key");
             CHECK(r.status==200, "the remapped series reads");
@@ -906,6 +909,12 @@ int main(int argc, char **argv){
                 CHECK(at_index(253) == 245, "and 253");
                 CHECK(at_index(255) == 255, "255 is still the fill");
             }
+
+            // Which means a later read needs no profile parameter at all.
+            r = request("GET","/v1/series/70004/data?start=1700000000&end=1700000256&max_points=1&condense=max","read-only-key");
+            CHECK(r.status==200 && bodyHas(r,"\"profile\":\"modern\""),
+                  "a read resolves the series' own profile without being told");
+            CHECK(bodyHas(r,"\"type\":\"float64\""), "and answers in magnitudes");
 
             r = request("POST","/v1/series/70004/migrate?from=legacy&to=absent","read-write-key");
             CHECK(r.status==404, "a target profile that does not exist is a 404");
