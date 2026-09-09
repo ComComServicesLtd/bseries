@@ -822,6 +822,44 @@ int main(int argc, char **argv){
             CHECK(bodyHas(r,"\"profiles\":{\"pingt\":"), "the profile is returned with the data");
             CHECK(bodyHas(r,"\"colours\":[\"#0000FF\",\"#FF0000\"]"), "including what a client needs to draw");
 
+            // Each series names its own profile, so a bulk read can legitimately
+            // answer with several -- and the map has to be built before the head
+            // goes out, which it was not: the names appeared per series and the
+            // map came back empty.
+            {
+                char second[600];
+                snprintf(second,sizeof(second),"%s/simplet",profile_dir);
+                FILE *sf = fopen(second,"w");
+                fputs("literal 0-250 ms\n",sf);
+                fputs("state   251 down \"Down\"\n",sf);
+                fclose(sf);
+
+                r = request("POST","/v1/series/70012?type=uint8&interval=1&start=1700000000","read-write-key");
+                r = request("POST","/v1/data","read-write-key","70012 1700000000 0a141e\n");
+                CHECK(r.status==200, "a second series for the second profile");
+
+                r = request("POST","/v1/series/70005/profile?name=pingt","read-write-key");
+                CHECK(r.status==200, "one series on one profile");
+                r = request("POST","/v1/series/70012/profile?name=simplet","read-write-key");
+                CHECK(r.status==200, "another on a different one");
+
+                r = request("GET","/v1/data?keys=70005,70012&start=1700000000&end=1700000005&max_points=1&condense=average","read-only-key");
+                CHECK(r.status==200, "a bulk read with no profile parameter");
+                CHECK(bodyHas(r,"\"profiles\":{"), "carries a profiles map");
+                CHECK(bodyHas(r,"\"pingt\":{") && bodyHas(r,"\"simplet\":{"),
+                      "holding both profiles the request used");
+                CHECK(bodyHas(r,"\"profile\":\"pingt\"") && bodyHas(r,"\"profile\":\"simplet\""),
+                      "and each series names the one it was read with");
+
+                // One entry per profile, however many series use it.
+                r = request("GET","/v1/data?keys=70005,70005&start=1700000000&end=1700000005&max_points=1&condense=average","read-only-key");
+                size_t first = r.body.find("\"pingt\":{");
+                size_t again = first == std::string::npos ? std::string::npos
+                                                          : r.body.find("\"pingt\":{",first + 1);
+                CHECK(first != std::string::npos && again == std::string::npos,
+                      "a profile two series share is sent once");
+            }
+
             r = request("GET","/v1/data?keys=70005,70001&start=1700000000&end=1700000005&max_points=1&condense=max&profile=pingt","read-only-key");
             CHECK(r.status==200, "a bulk read takes a profile too");
             {

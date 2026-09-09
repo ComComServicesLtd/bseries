@@ -990,16 +990,38 @@ static void appendProfileJson(std::string &out, const PROFILE &profile){
 /// then a multi series read legitimately answers with several. Emitting the map
 /// now means that arrives without the response shape changing under anyone.
 
-static void appendProfilesUsed(std::string &out, const CONDENSE_RESERVED &reserved){
+static void appendProfilesUsed(std::string &out,
+                               const std::vector<std::string> &names,
+                               const std::vector<const PROFILE *> &used){
 
     out += "\"profiles\":{";
 
-    if(reserved.profile != NULL){
-        out += "\"" + reserved.profile_name + "\":";
-        appendProfileJson(out,*reserved.profile);
+    for(size_t i = 0; i < used.size(); i++){
+        if(i) out += ",";
+        out += "\"" + names[i] + "\":";
+        appendProfileJson(out,*used[i]);
     }
 
     out += "},";
+}
+
+
+/// Adds a profile to the set a response will carry, if it is not already there.
+
+static void noteProfileUsed(const CONDENSE_RESERVED &reserved,
+                            std::vector<std::string> *names,
+                            std::vector<const PROFILE *> *used){
+
+    if(reserved.profile == NULL)
+        return;
+
+    for(size_t i = 0; i < names->size(); i++){
+        if((*names)[i] == reserved.profile_name)
+            return;
+    }
+
+    names->push_back(reserved.profile_name);
+    used->push_back(reserved.profile);
 }
 
 
@@ -3481,9 +3503,12 @@ void BSeriesApi::handleReadData(BSeries *db, uint32_t key, const HTTP_REQUEST &r
     stream->write(head,strlen(head));
 
     if(reserved.profile != NULL){
-        std::string used;
-        appendProfilesUsed(used,reserved);
-        stream->write(used);
+        std::vector<std::string> names;
+        std::vector<const PROFILE *> used;
+        noteProfileUsed(reserved,&names,&used);
+        std::string text;
+        appendProfilesUsed(text,names,used);
+        stream->write(text);
     }
 
     int rc = (condense_mode == CONDENSE_NONE)
@@ -3579,10 +3604,33 @@ void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_
     stream->begin(200,"application/json",response.headers);
     stream->write(head,strlen(head));
 
-    if(reserved.profile != NULL){
-        std::string used;
-        appendProfilesUsed(used,reserved);
-        stream->write(used);
+    // Each series names its own profile, so which profiles a response carries is
+    // only known once every header has been read -- and the map has to go out
+    // before the series array, because a stream cannot go back. The probes are
+    // kept rather than repeated: reading every header twice to answer one request
+    // is a syscall per series for something already in hand.
+    std::vector<SERIES> probes(keys.size());
+    std::vector<int> probe_status(keys.size(),NO_ERROR);
+    std::vector<std::string> profile_names;
+    std::vector<const PROFILE *> profiles_used;
+
+    for(size_t i = 0; i < keys.size(); i++){
+
+        int64_t probe_size = 0;
+        probe_status[i] = db->seriesInfo(keys[i],&probes[i],&probe_size);
+
+        if(probe_status[i] != NO_ERROR || condense_mode == CONDENSE_NONE)
+            continue;
+
+        CONDENSE_RESERVED per_series = reserved;
+        applySeriesProfile(probes[i],&per_series);
+        noteProfileUsed(per_series,&profile_names,&profiles_used);
+    }
+
+    if(!profiles_used.empty()){
+        std::string text;
+        appendProfilesUsed(text,profile_names,profiles_used);
+        stream->write(text);
     }
 
     stream->write("\"series\":[",10);
@@ -3594,9 +3642,8 @@ void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_
         // Probed before anything is written, because a separator cannot be taken
         // back once it is on the wire and skip_missing has to omit the entry
         // entirely rather than leave a hole in the array.
-        SERIES probe;
-        int64_t probe_size = 0;
-        int info = db->seriesInfo(keys[i],&probe,&probe_size);
+        const SERIES &probe = probes[i];
+        int info = probe_status[i];
 
         if(info != NO_ERROR && skip_missing)
             continue;

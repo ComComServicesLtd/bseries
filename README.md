@@ -860,9 +860,20 @@ $ curl -H 'X-API-Key: $READ_KEY' \
 ```
 
 **The profile comes back with the data**, as a map keyed by name, and each series
-names the profile it used. On a multi series read it is sent once for the request
-rather than once per series. It is a map even with one profile in play so that the
-shape does not change when a series carries its own profile name.
+names the profile it used:
+
+```json
+{"profiles":{"ping2":{"entries":[…]}, "simple":{"entries":[…]}},
+ "series":[{"key":1,"profile":"ping2",…},
+           {"key":2,"profile":"simple",…},
+           {"key":3,…}],
+ "count":3}
+```
+
+A profile two series share is sent once, and a series with no profile simply does
+not name one. Because each series carries its own, a bulk read has to read every
+header before the map can go out — a stream cannot go back and add to it — so the
+headers are read once up front and reused rather than read again per series.
 
 **A profile that cannot be read fails the request**, rather than being ignored.
 Quietly reading everything literally would answer with exactly the wrong numbers
