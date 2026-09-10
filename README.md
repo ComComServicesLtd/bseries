@@ -870,10 +870,17 @@ names the profile it used:
  "count":3}
 ```
 
-A profile two series share is sent once, and a series with no profile simply does
-not name one. Because each series carries its own, a bulk read has to read every
-header before the map can go out — a stream cannot go back and add to it — so the
-headers are read once up front and reused rather than read again per series.
+A single series read carries the one profile it was read with. **A bulk read
+carries every profile the database has**, whether this request needed it or not:
+each series names its own, so which ones are in play is only known after the head
+has gone out, and a stream cannot go back and add to the map. The whole set is a
+few kilobytes against a response of series data, and a client caches each one for
+good, so sending them all costs less than arranging to send exactly the right
+ones.
+
+A profile is sent once however many series use it, and a series with no profile
+simply does not name one. A raw read carries no profiles at all — it hands back
+what was stored.
 
 **A profile that cannot be read fails the request**, rather than being ignored.
 Quietly reading everything literally would answer with exactly the wrong numbers

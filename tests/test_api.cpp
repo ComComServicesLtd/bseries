@@ -138,6 +138,14 @@ static bool bodyHas(const REPLY &reply, const char *needle){
     return reply.body.find(needle) != std::string::npos;
 }
 
+static int bodyCount(const REPLY &reply, const char *needle){
+    int n = 0;
+    size_t at = reply.body.find(needle);
+    while(at != std::string::npos){ n++; at = reply.body.find(needle,at + 1); }
+    return n;
+}
+
+
 static bool headHas(const REPLY &reply, const char *needle){
     return reply.head.find(needle) != std::string::npos;
 }
@@ -851,23 +859,44 @@ int main(int argc, char **argv){
                 CHECK(bodyHas(r,"\"profile\":\"pingt\"") && bodyHas(r,"\"profile\":\"simplet\""),
                       "and each series names the one it was read with");
 
-                // One entry per profile, however many series use it.
+                // A bulk read carries every profile, not only the ones it needed:
+                // which ones it needs is not known until after the head is out.
+                r = request("GET","/v1/data?keys=70005&start=1700000000&end=1700000005&max_points=1&condense=average","read-only-key");
+                CHECK(bodyHas(r,"\"simplet\":{"),
+                      "a bulk read of one series still carries the profiles it did not use");
+                // Each profile object in the map names itself, so a bare substring
+                // cannot tell the map from the series. Counted instead: the one
+                // this series uses appears twice, the one it does not appears once.
+                CHECK(bodyCount(r,"\"profile\":\"pingt\"") == 2,
+                      "the series names its own profile, and the map names it too");
+                CHECK(bodyCount(r,"\"profile\":\"simplet\"") == 1,
+                      "while the unused one appears only in the map");
+
+                // Once each, however many series use it.
                 r = request("GET","/v1/data?keys=70005,70005&start=1700000000&end=1700000005&max_points=1&condense=average","read-only-key");
                 size_t first = r.body.find("\"pingt\":{");
                 size_t again = first == std::string::npos ? std::string::npos
                                                           : r.body.find("\"pingt\":{",first + 1);
                 CHECK(first != std::string::npos && again == std::string::npos,
                       "a profile two series share is sent once");
+
+                // A single series read is still targeted: it knows which one.
+                r = request("GET","/v1/series/70005/data?start=1700000000&end=1700000005&max_points=1&condense=average","read-only-key");
+                CHECK(bodyHas(r,"\"pingt\":{") && !bodyHas(r,"\"simplet\":{"),
+                      "a single series read carries only the profile it used");
+
+                // A raw read hands back what was stored and names no profile.
+                r = request("GET","/v1/data?keys=70005&start=1700000000&end=1700000005","read-only-key");
+                CHECK(!bodyHas(r,"\"profiles\":{"), "a raw bulk read carries no profiles at all");
             }
 
             r = request("GET","/v1/data?keys=70005,70001&start=1700000000&end=1700000005&max_points=1&condense=max&profile=pingt","read-only-key");
             CHECK(r.status==200, "a bulk read takes a profile too");
             {
-                size_t first = r.body.find("\"entries\":[");
-                size_t second = first == std::string::npos ? std::string::npos
-                                                           : r.body.find("\"entries\":[",first + 1);
-                CHECK(first != std::string::npos && second == std::string::npos,
-                      "and sends it once for the request, not once per series");
+                // One block per profile in the database, not one per series: this
+                // request asks for two series and must not repeat anything.
+                CHECK(bodyCount(r,"\"pingt\":{") == 1,
+                      "and sends each profile once for the request, not once per series");
             }
 
             r = request("GET",(std::string(RANGE) + "&condense=max&profile=pingt&reserved=254").c_str(),"read-only-key");

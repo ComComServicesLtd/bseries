@@ -1006,7 +1006,9 @@ static void appendProfilesUsed(std::string &out,
 }
 
 
-/// Adds a profile to the set a response will carry, if it is not already there.
+/// A single series read carries the one profile it was read with; a bulk read
+/// carries every profile the database has, since which ones it needs is only
+/// known after the head has gone out. See handleMultiRead().
 
 static void noteProfileUsed(const CONDENSE_RESERVED &reserved,
                             std::vector<std::string> *names,
@@ -1014,11 +1016,6 @@ static void noteProfileUsed(const CONDENSE_RESERVED &reserved,
 
     if(reserved.profile == NULL)
         return;
-
-    for(size_t i = 0; i < names->size(); i++){
-        if((*names)[i] == reserved.profile_name)
-            return;
-    }
 
     names->push_back(reserved.profile_name);
     used->push_back(reserved.profile);
@@ -3604,33 +3601,52 @@ void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_
     stream->begin(200,"application/json",response.headers);
     stream->write(head,strlen(head));
 
-    // Each series names its own profile, so which profiles a response carries is
-    // only known once every header has been read -- and the map has to go out
-    // before the series array, because a stream cannot go back. The probes are
-    // kept rather than repeated: reading every header twice to answer one request
-    // is a syscall per series for something already in hand.
+    // Headers are read once here and the probes kept for the loop below, rather
+    // than every header being read a second time to answer the same request.
     std::vector<SERIES> probes(keys.size());
     std::vector<int> probe_status(keys.size(),NO_ERROR);
-    std::vector<std::string> profile_names;
-    std::vector<const PROFILE *> profiles_used;
 
     for(size_t i = 0; i < keys.size(); i++){
-
         int64_t probe_size = 0;
         probe_status[i] = db->seriesInfo(keys[i],&probes[i],&probe_size);
-
-        if(probe_status[i] != NO_ERROR || condense_mode == CONDENSE_NONE)
-            continue;
-
-        CONDENSE_RESERVED per_series = reserved;
-        applySeriesProfile(probes[i],&per_series);
-        noteProfileUsed(per_series,&profile_names,&profiles_used);
     }
 
-    if(!profiles_used.empty()){
-        std::string text;
-        appendProfilesUsed(text,profile_names,profiles_used);
-        stream->write(text);
+    // Every profile, not only the ones this request turned out to need.
+    //
+    // A series names its own, so working out the set would mean deciding it
+    // before the head goes out -- a stream cannot go back and add to the map. The
+    // whole set is a few kilobytes and a database has a handful of profiles, so
+    // sending them all costs less than arranging to send exactly the right ones,
+    // and a client caches each one for good regardless.
+    if(condense_mode != CONDENSE_NONE){
+
+        std::vector<std::string> names;
+        std::vector<const PROFILE *> all;
+
+        if(profiles.list(&names)){
+
+            std::sort(names.begin(),names.end());
+
+            std::vector<std::string> loaded;
+
+            for(size_t i = 0; i < names.size(); i++){
+
+                const PROFILE *profile = profiles.get(names[i],NULL);
+
+                // A malformed one is skipped rather than failing the read: it is
+                // not this request's business unless a series names it.
+                if(profile != NULL){
+                    loaded.push_back(names[i]);
+                    all.push_back(profile);
+                }
+            }
+
+            if(!all.empty()){
+                std::string text;
+                appendProfilesUsed(text,loaded,all);
+                stream->write(text);
+            }
+        }
     }
 
     stream->write("\"series\":[",10);
