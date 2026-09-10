@@ -1071,8 +1071,8 @@ rewrites the header and setting both means one change rather than two:
 
 ```
 $ curl -XPOST -H 'X-API-Key: $WRITE_KEY' \
-    'localhost:8086/v1/lab/series/4/meta?name=gateway%20latency&address=172.20.0.1'
-{"key":4,"name":"gateway latency","address":"172.20.0.1","address_family":"ipv4"}
+    'localhost:8086/v1/lab/series/4/meta?name=gateway%20latency&address=192.168.88.1'
+{"key":4,"name":"gateway latency","address":"192.168.88.1","address_family":"ipv4"}
 ```
 
 Only what is named changes, and an empty value clears a field. The address is

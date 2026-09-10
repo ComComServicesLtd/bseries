@@ -1087,17 +1087,17 @@ int main(int argc, char **argv){
             // The descriptive fields a version 4 header carries. Exercised through
             // the endpoint rather than the struct, because the last field added
             // here shipped with nothing calling it.
-            r = request("POST","/v1/series/70005/meta?name=gateway%20latency&address=172.20.0.1","read-write-key");
+            r = request("POST","/v1/series/70005/meta?name=gateway%20latency&address=192.0.2.10","read-write-key");
             CHECK(r.status==200 && bodyHas(r,"\"name\":\"gateway latency\""), "a name and address are set together");
-            CHECK(bodyHas(r,"\"address\":\"172.20.0.1\"") && bodyHas(r,"\"address_family\":\"ipv4\""),
+            CHECK(bodyHas(r,"\"address\":\"192.0.2.10\"") && bodyHas(r,"\"address_family\":\"ipv4\""),
                   "the family follows from the text");
 
             r = request("GET","/v1/series/70005","read-only-key");
-            CHECK(bodyHas(r,"\"name\":\"gateway latency\"") && bodyHas(r,"\"address\":\"172.20.0.1\""),
+            CHECK(bodyHas(r,"\"name\":\"gateway latency\"") && bodyHas(r,"\"address\":\"192.0.2.10\""),
                   "and both are reported by the series, not only echoed");
 
             r = request("POST","/v1/series/70005/meta?name=renamed","read-write-key");
-            CHECK(bodyHas(r,"\"name\":\"renamed\"") && bodyHas(r,"\"address\":\"172.20.0.1\""),
+            CHECK(bodyHas(r,"\"name\":\"renamed\"") && bodyHas(r,"\"address\":\"192.0.2.10\""),
                   "naming one field leaves the other alone");
 
             r = request("POST","/v1/series/70005/meta?address=2001:4860:4860::8888","read-write-key");

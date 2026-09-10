@@ -6,6 +6,21 @@ fail in a way that points at the wrong thing.
 
 Read the failure signatures table at the end first if something is already broken.
 
+**Addresses here are examples.** Substitute your own throughout — nothing depends
+on these particular ranges:
+
+| Placeholder | Example used below | What it is |
+|---|---|---|
+| `<router>` | `192.168.88.1` | the router, on whatever network you manage it from |
+| `<mgmt-subnet>` | `192.168.88.0/24` | where you are allowed to reach it from |
+| `<bridge-gw>` | `172.17.0.1` | the router's address on the container bridge |
+| `<container-ip>` | `172.17.0.2` | the container's own address on that bridge |
+| `<port>` | `8086` | whatever your service listens on |
+
+The container bridge is a private network the router owns; pick a range that does
+not collide with anything the device already routes, including the docker bridge
+on your own workstation if you ever bridge the two.
+
 
 ## 1. Prepare the device, once
 
@@ -48,19 +63,19 @@ Create a key-only user restricted to your lab subnet. Upload the public key to
 the router first (Winbox > Files > drag and drop), then:
 
 ```
-/user add name=claudedev group=full address=172.16.220.0/24 comment="dev access"
-/user ssh-keys import public-key-file=mikrotik_dev.pub user=claudedev
+/user add name=devuser group=full address=<mgmt-subnet> comment="dev access"
+/user ssh-keys import public-key-file=id_dev.pub user=devuser
 ```
 
 **RouterOS ships an older SSH server**, so be explicit about algorithms or the
 handshake fails in a way that looks like a rejected key:
 
 ```bash
-ssh -i dev/keys/mikrotik_dev \
+ssh -i ~/.ssh/id_dev \
     -o IdentitiesOnly=yes \
     -o PubkeyAcceptedKeyTypes=+ssh-rsa \
     -o HostKeyAlgorithms=+ssh-rsa \
-    claudedev@172.16.220.131 '/system resource print'
+    devuser@<router> '/system resource print'
 ```
 
 Wrap that in a script. Typing it by hand every time is how you end up debugging
@@ -79,17 +94,17 @@ talk to. To reach it from your workstation you need a dst-nat rule:
 
 ```
 /ip firewall nat add chain=dstnat action=dst-nat protocol=tcp \
-    dst-address=172.16.220.131 dst-port=8086 \
-    to-addresses=172.20.0.3 to-ports=8086 comment="dev: bseries"
+    dst-address=<router> dst-port=<port> \
+    to-addresses=<container-ip> to-ports=<port> comment="dev: bseries"
 ```
 
 Test both paths — they fail independently:
 
 ```bash
-curl http://172.16.220.131:8086/v1/health          # via dst-nat, from your desk
+curl http://<router>:<port>/v1/health            # via dst-nat, from your desk
 ```
 ```
-/tool/fetch url="http://172.20.0.3:8086/v1/health" output=user
+/tool/fetch url="http://<container-ip>:<port>/v1/health" output=user
 ```
 
 The second runs *on the router* and is the one that matters for container to
@@ -177,7 +192,7 @@ tar tf bseries-arm64.tar | head
 ## 5. Provision it
 
 ```
-/interface/veth/add name=bseries address=172.20.0.3/24 gateway=172.20.0.1
+/interface/veth/add name=bseries address=<container-ip>/24 gateway=<bridge-gw>
 /interface/bridge/port/add bridge=containers interface=bseries
 
 /container/mounts/add list=bseries-data src=/bseries-data dst=/data mode=rw
@@ -215,8 +230,9 @@ tar tf bseries-arm64.tar | head
 
 ## 6. Budget for the hardware
 
-- [ ] **Flash is small.** A hAP ax² has 128 MB total. Two 15 MB series plus images
-      left ~25 MB free here.
+- [ ] **Flash is small.** The hAP ax² this was built against has 128 MB total, and
+      two 15 MB data files plus images left roughly 25 MB free. Check your own
+      device rather than assuming; the smaller models have considerably less.
 
 - [ ] **Any in-place file rewrite needs the file's size again**, for the temp copy
       before the atomic rename. A 15 MB file needs 15 MB free. Check

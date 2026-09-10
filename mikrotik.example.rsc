@@ -8,6 +8,10 @@
 # Then edit the values below and paste this in, or upload it and run
 # `/import mikrotik.example.rsc`.
 #
+# Every address here is an example. Substitute your own: the container bridge is
+# a private network the router owns, so pick a range that collides with nothing
+# the device already routes.
+#
 # Needs the container package, and container support enabled:
 #
 #   /system/device-mode/update container=yes
@@ -18,11 +22,11 @@
 :local ctrName    "bseries"
 :local ctrTar     "bseries-arm64.tar"
 :local ctrBridge  "containers"          ;# an existing bridge for container veths
-:local ctrAddr    "172.20.0.3/24"       ;# free address on that bridge
-:local ctrGw      "172.20.0.1"          ;# the router's address on it
+:local ctrAddr    "172.17.0.2/24"       ;# EXAMPLE: a free address on that bridge
+:local ctrGw      "172.17.0.1"          ;# EXAMPLE: the router's address on it
 :local ctrDir     "/containers/bseries" ;# where the image is unpacked
 :local dataDir    "/bseries-data"       ;# database files, on the router's flash
-:local routerAddr "172.16.220.131"      ;# address the API is reached on
+:local routerAddr "192.168.88.1"        ;# EXAMPLE: address the API is reached on
 :local apiPort    "8086"
 
 # --- network -----------------------------------------------------------------
@@ -38,7 +42,7 @@
 # Egress, so the container can reach a time source or a remote it pushes to.
 # Skip it if a masquerade rule already covers this subnet.
 # /ip/firewall/nat/add chain=srcnat action=masquerade \
-#     src-address=172.20.0.0/24 out-interface=ether1
+#     src-address=172.17.0.0/24 out-interface=ether1
 
 # --- storage -----------------------------------------------------------------
 # Mounted rather than left in the container's own layer, so the database
@@ -95,6 +99,6 @@
 # then mint the first key from a host that can reach the API:
 #
 #   curl -XPOST -H 'X-API-Key: <token>' \
-#     'http://172.16.220.131:8086/v1/auth/keys?role=write&name=admin'
+#     'http://<routerAddr>:<apiPort>/v1/auth/keys?role=write&name=admin'
 #
 # The token works only for that, and only until a write key exists.
