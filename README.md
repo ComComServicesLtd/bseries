@@ -124,7 +124,18 @@ scp -O bseries-arm64.tar <router>:
 
 then edit and apply `mikrotik.example.rsc`. Check the target first with
 `/system resource print`: `architecture-name` is `arm64` for most recent models,
-`arm` for older 32 bit ones. Verified on a hAP ax² running RouterOS 7.24.2, where
+`arm` for older 32 bit ones.
+
+Building for another architecture runs that architecture's shell, so it needs an
+emulator registered on the host or the first `RUN` fails with `exec format
+error` — which reads like a broken Dockerfile rather than a missing handler. The
+script checks before building and says so. Registration does not survive a
+reboot:
+
+```
+docker run --privileged --rm tonistiigi/binfmt --install arm64   # until reboot
+apt install qemu-user-static                                     # at every boot
+``` Verified on a hAP ax² running RouterOS 7.24.2, where
 the container unpacks to 1.2MB and idles around 580KB of memory.
 
 **The image has to be repacked before RouterOS will read it.** Docker has not
