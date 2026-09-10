@@ -97,12 +97,14 @@ static bool streamHex(HttpStream *stream, const void *data, size_t length){
 #define CONDENSE_MIN  1
 #define CONDENSE_MAX  2
 #define CONDENSE_AVG  3
+#define CONDENSE_SUM  4
 
 static bool condenseModeFromName(const std::string &name, int *mode){
 
     if(name == "min")                          { *mode = CONDENSE_MIN; return true; }
     if(name == "max")                          { *mode = CONDENSE_MAX; return true; }
     if(name == "avg" || name == "average")     { *mode = CONDENSE_AVG; return true; }
+    if(name == "sum" || name == "total")       { *mode = CONDENSE_SUM; return true; }
 
     return false;
 }
@@ -114,6 +116,7 @@ static const char *condenseModeName(int mode){
         case CONDENSE_MIN: return "min";
         case CONDENSE_MAX: return "max";
         case CONDENSE_AVG: return "average";
+        case CONDENSE_SUM: return "sum";
         default:           return "none";
     }
 }
@@ -2664,6 +2667,10 @@ static void emitProfiledBucket(std::string &out, int mode, long long samples, do
         value = low;
     } else if(mode == CONDENSE_MAX){
         value = high;
+    } else if(mode == CONDENSE_SUM){
+        // Bucketed readings contribute their low edge, so a total over any of
+        // them is a floor -- which is what lower_bound in the response says.
+        value = sum;
     } else {
         value = sum / (double)samples;
     }
@@ -2706,10 +2713,10 @@ static void emitCondensedBucket(std::string &out, int mode, long long samples, d
         return;
     }
 
-    if(mode == CONDENSE_AVG){
-        double average = sum / (double)samples;
+    if(mode == CONDENSE_AVG || mode == CONDENSE_SUM){
+        double value = (mode == CONDENSE_SUM) ? sum : sum / (double)samples;
         char bytes[8];
-        memcpy(bytes,&average,8);
+        memcpy(bytes,&value,8);
         out.append(bytes,8);
         return;
     }
@@ -2819,9 +2826,14 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
     // operation is promoted, not just an average.
     bool profiled = (reserved.profile != NULL);
 
-    uint8_t out_datatype = (mode == CONDENSE_AVG || profiled) ? BS_FLOAT : src_datatype;
-    uint32_t out_datasize = (mode == CONDENSE_AVG || profiled) ? 8 : src_datasize;
-    unsigned char out_fill = (mode == CONDENSE_AVG || profiled) ? 0xFF : src_fill;
+    // A sum is promoted for the same reason an average is: adding a bucket's
+    // worth of uint8 readings does not give a uint8, and a total that silently
+    // wrapped would be worse than no total at all.
+    bool widened = (mode == CONDENSE_AVG || mode == CONDENSE_SUM || profiled);
+
+    uint8_t out_datatype = widened ? BS_FLOAT : src_datatype;
+    uint32_t out_datasize = widened ? 8 : src_datasize;
+    unsigned char out_fill = widened ? 0xFF : src_fill;
 
 
     // Everything below only appends, so build the head first.
@@ -3025,7 +3037,7 @@ int BSeriesApi::streamCondensedSeries(BSeries *db, uint32_t key, long long start
 
             bucket_samples++;
 
-            if(mode == CONDENSE_AVG){
+            if(mode == CONDENSE_AVG || mode == CONDENSE_SUM){
 
                 bucket_sum += pointToDouble(point,src_datatype,ds);
 
@@ -3219,7 +3231,7 @@ bool BSeriesApi::readCondenseOptions(const HTTP_REQUEST &request, HTTP_RESPONSE 
     }
 
     if(!condenseModeFromName(condense_text,mode)){
-        jsonError(response,400,"bad_parameter","condense must be min, max or average");
+        jsonError(response,400,"bad_parameter","condense must be min, max, average or sum");
         return false;
     }
 

@@ -704,6 +704,46 @@ int main(int argc, char **argv){
             CHECK(js.head.find(tag) == std::string::npos, "and its tag is not the page's");
         }
 
+        // A total. Not a latency thing: a counter or a byte count wants adding up,
+        // and a sum of uint8 readings is not a uint8 any more than an average is.
+        {
+            REPLY r = request("POST","/v1/series/70020?type=uint8&interval=1&start=1700000000","read-write-key");
+            CHECK(r.status==201, "a series to total");
+            r = request("POST","/v1/data","read-write-key","70020 1700000000 0a141e2832\n");
+            CHECK(r.status==200, "10, 20, 30, 40, 50");
+
+            const char *RANGE20 = "/v1/series/70020/data?start=1700000000&end=1700000005&max_points=1";
+
+            r = request("GET",(std::string(RANGE20) + "&condense=sum").c_str(),"read-only-key");
+            CHECK(r.status==200 && bodyHas(r,"\"condense\":\"sum\""), "sum condenses");
+            CHECK(bodyHas(r,"\"type\":\"float64\""), "and is promoted, since a total overflows the type");
+            {
+                size_t at = r.body.find("\"data\":\"");
+                double value = 0;
+                if(at != std::string::npos){
+                    unsigned char bytes[8];
+                    for(int j = 0; j < 8; j++)
+                        bytes[j] = (unsigned char)strtoul(r.body.substr(at + 8 + j*2,2).c_str(),NULL,16);
+                    memcpy(&value,bytes,8);
+                }
+                CHECK(value > 149.9 && value < 150.1, "10+20+30+40+50 is 150");
+            }
+
+            r = request("GET",(std::string(RANGE20) + "&condense=total").c_str(),"read-only-key");
+            CHECK(r.status==200 && bodyHas(r,"\"condense\":\"sum\""), "total is the same thing by another name");
+
+            // Per bucket, not one figure for the range.
+            r = request("GET",(std::string(RANGE20).substr(0,strlen(RANGE20)-1) + "5&condense=sum").c_str(),"read-only-key");
+            CHECK(bodyHas(r,"\"n_points\":5"), "a total is per bucket, like every other operation");
+
+            // min and max still hand back a stored point, so they keep the type.
+            r = request("GET",(std::string(RANGE20) + "&condense=max").c_str(),"read-only-key");
+            CHECK(bodyHas(r,"\"type\":\"uint8\""), "max still keeps the series type");
+
+            r = request("GET",(std::string(RANGE20) + "&condense=median").c_str(),"read-only-key");
+            CHECK(r.status==400 && bodyHas(r,"sum"), "an unknown operation is refused, and lists sum");
+        }
+
         // Profiles: what the stored values mean.
         {
             char profile_dir[512], profile_path[600];
@@ -824,6 +864,24 @@ int main(int argc, char **argv){
                     memcpy(&value,bytes,8);
                 }
                 CHECK(value > 193.9 && value < 194.1, "average uses the low edges and excludes the state");
+            }
+
+            // A total under a profile: states are not measurements and a bucketed
+            // reading contributes its floor, so the total is a floor too.
+            r = request("GET",(std::string(RANGE) + "&condense=sum&profile=pingt").c_str(),"read-only-key");
+            CHECK(r.status==200 && bodyHas(r,"\"lower_bound\":true"), "a total over a bucket is a floor");
+            CHECK(bodyHas(r,"\"reserved_points\":1"), "and the state is excluded from it");
+            {
+                size_t at = r.body.find("\"data\":\"");
+                double value = 0;
+                if(at != std::string::npos){
+                    unsigned char bytes[8];
+                    for(int j = 0; j < 8; j++)
+                        bytes[j] = (unsigned char)strtoul(r.body.substr(at + 8 + j*2,2).c_str(),NULL,16);
+                    memcpy(&value,bytes,8);
+                }
+                // 10 + 20 + 245 + 501, the two readings and the two bucket floors
+                CHECK(value > 775.9 && value < 776.1, "10+20+245+501 is 776");
             }
 
             // The profile comes back with the data, so nothing needs a second call.

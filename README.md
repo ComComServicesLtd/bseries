@@ -663,8 +663,14 @@ readings inside one.
 `max_points` and `condense` downsample a range into at most that many buckets. They
 are **used as a pair** — a bucket count means nothing without saying how to combine
 what falls in a bucket, and vice versa — and supplying one alone is refused.
-`condense` is `min`, `max` or `average`. Both work on `/v1/series/{key}/data` and on
-`/v1/data`.
+`condense` is `min`, `max`, `average` or `sum` (`total` is accepted for the last).
+All work on `/v1/series/{key}/data` and on `/v1/data`.
+
+`sum` is for the series that are counted rather than measured — bytes, packets,
+errors. Like an average it is promoted to `float64`, because adding a bucket's
+worth of `uint8` readings does not give a `uint8` and a total that silently
+wrapped would be worse than none. `min` and `max` hand back a stored point, so
+they keep the series' own type.
 
 ```
 $ curl -H 'X-API-Key: $READ_KEY' \
@@ -845,7 +851,7 @@ different facts and a chart draws them differently.
 
 **Condensing with a profile answers in magnitudes**, so `min` takes a bucket's low
 edge and `max` its high edge, which makes the pair a true enclosing interval. An
-average uses the low edges and the response says `lower_bound` — an average that
+average and a sum use the low edges and the response says `lower_bound` — an average that
 claims "at least 312ms" is honest, one that claims "312ms" is not. Because those
 answers are magnitudes rather than stored values, output is `float64` for every
 operation, not just an average. Raw reads and writes are untouched and stay in the
