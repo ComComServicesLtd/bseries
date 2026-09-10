@@ -164,6 +164,10 @@ Two RouterOS parameter names are easy to get wrong: mounts are declared with
 `list=`, not `name=`, and attached to a container with `mountlists=`, not
 `mounts=`. Both fail with a bare `bad parameter`.
 
+`docs/mikrotik-containers.md` is the full checklist — setting up SSH and API
+access to a device, the image format trap, provisioning, what the hardware can
+take, and a table of failure signatures against what each one actually means.
+
 ### The admin page
 
 `bseriesd` serves a small Vue page at `/` for managing tables, series, keys and
