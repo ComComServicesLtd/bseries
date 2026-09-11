@@ -3720,7 +3720,7 @@ void BSeriesApi::handleMultiRead(BSeries *db, const HTTP_REQUEST &request, HTTP_
 /// the definitions file decides, and failing that the caller's payload is taken to
 /// be a single point, which is the only unambiguous reading available.
 
-bool BSeriesApi::resolveWriteShape(BSeries *db, uint32_t key, size_t body_bytes, uint32_t *datasize, int64_t *interval, std::string *error){
+bool BSeriesApi::resolveWriteShape(BSeries *db, uint32_t key, size_t body_bytes, uint32_t *datasize, int64_t *interval, std::string *error, const CREATE_SHAPE *shape){
 
     SERIES header;
 
@@ -3737,11 +3737,21 @@ bool BSeriesApi::resolveWriteShape(BSeries *db, uint32_t key, size_t body_bytes,
         SERIES_DEFINITION definition;
 
         if(db->definitionForKey(key,&definition)){
+
+            // A definition still decides: it exists to say what shape a new
+            // series takes, and a write with a different opinion should not
+            // quietly overrule it.
             *datasize = definition.datasize;
             *interval = (int64_t)definition.interval;
+
         } else {
-            *datasize = (uint32_t)body_bytes;
-            *interval = (int64_t)config.default_interval;
+
+            // Otherwise the caller's own declaration, and failing that the guess
+            // that the whole payload is a single point -- the only unambiguous
+            // reading available when nothing has said otherwise.
+            *datasize = (shape != NULL && shape->datasize) ? shape->datasize : (uint32_t)body_bytes;
+            *interval = (shape != NULL && shape->interval) ? (int64_t)shape->interval
+                                                           : (int64_t)config.default_interval;
         }
     }
 
@@ -3768,10 +3778,77 @@ bool BSeriesApi::resolveWriteShape(BSeries *db, uint32_t key, size_t body_bytes,
 }
 
 
+/// Reads the shape a write declares for any series it has to create.
+///
+///     ?interval=10&type=uint8&profile=ping2
+///
+/// Applied only when creating, and only where no definition covers the key: a
+/// series already on disk keeps its own header, because the points in it were
+/// laid out to that header and reinterpreting them would be a migration rather
+/// than a write.
+///
+/// This is what lets an ingest path be a single request. Without it a prober has
+/// to discover which series are new and configure each one, and that discovery is
+/// what makes a write path expensive.
+
+bool BSeriesApi::readCreateShape(const HTTP_REQUEST &request, HTTP_RESPONSE &response, CREATE_SHAPE *shape){
+
+    memset(shape,0,sizeof(*shape));
+    shape->datatype = BS_TYPE_INVALID;
+
+    std::string interval_text = httpQueryParam(request,"interval");
+
+    if(!interval_text.empty()){
+
+        unsigned long value = 0;
+
+        if(!parseUnsigned(interval_text,&value) || value == 0 || value > 0xFFFFFFFFuL){
+            jsonError(response,400,"bad_parameter","interval is a positive number of seconds");
+            return false;
+        }
+
+        shape->interval = (uint32_t)value;
+    }
+
+    std::string type_text = httpQueryParam(request,"type");
+
+    if(!type_text.empty()){
+
+        uint8_t datatype = 0, datasize = 0;
+
+        if(!bsTypeFromName(type_text.c_str(),&datatype,&datasize)){
+            jsonError(response,400,"bad_parameter","type is a datatype name such as uint8 or float32");
+            return false;
+        }
+
+        shape->datatype = datatype;
+        shape->datasize = datasize;
+    }
+
+    std::string profile_text = httpQueryParam(request,"profile");
+
+    if(!profile_text.empty()){
+
+        std::string error;
+
+        // Refused rather than stored hopefully: a header naming a profile that
+        // cannot be read would make every later read of the series wrong.
+        if(profiles.get(profile_text,&error) == NULL){
+            jsonError(response,404,"not_found",error);
+            return false;
+        }
+
+        snprintf(shape->profile,sizeof(shape->profile),"%s",profile_text.c_str());
+    }
+
+    return true;
+}
+
+
 /// Writes consecutive points starting at timestamp. Returns a database status and
 /// sets written to how many points landed before any failure.
 
-int BSeriesApi::writePoints(BSeries *db, uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written, int64_t *overwritten){
+int BSeriesApi::writePoints(BSeries *db, uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written, int64_t *overwritten, const CREATE_SHAPE *shape){
 
     int64_t count = (int64_t)(points.size() / datasize);
     *written = 0;
@@ -3788,7 +3865,7 @@ int BSeriesApi::writePoints(BSeries *db, uint32_t key, const std::string &points
 
         bool replaced = false;
         int rc = db->write(key,(void*)(points.data() + point * datasize),datasize,(uint32_t)point_time,
-                           overwritten != NULL ? &replaced : NULL);
+                           overwritten != NULL ? &replaced : NULL,shape);
 
         if(rc != NO_ERROR)
             return rc;
@@ -3862,7 +3939,12 @@ void BSeriesApi::handleWriteData(BSeries *db, uint32_t key, const HTTP_REQUEST &
     int64_t interval = 0;
     std::string shape_error;
 
-    if(!resolveWriteShape(db,key,points.size(),&datasize,&interval,&shape_error)){
+    CREATE_SHAPE create;
+
+    if(!readCreateShape(request,response,&create))
+        return;
+
+    if(!resolveWriteShape(db,key,points.size(),&datasize,&interval,&shape_error,&create)){
         jsonError(response,422,"bad_point_width",shape_error);
         return;
     }
@@ -3878,7 +3960,7 @@ void BSeriesApi::handleWriteData(BSeries *db, uint32_t key, const HTTP_REQUEST &
     }
 
     int64_t written = 0, overwritten = 0;
-    int rc = writePoints(db,key,points,datasize,interval,timestamp,&written,&overwritten);
+    int rc = writePoints(db,key,points,datasize,interval,timestamp,&written,&overwritten,&create);
 
     if(rc != NO_ERROR){
 
@@ -3983,6 +4065,11 @@ static int splitTokens(const std::string &line, std::string *tokens, int max){
 
 void BSeriesApi::handleWriteNow(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
+    CREATE_SHAPE create;
+
+    if(!readCreateShape(request,response,&create))
+        return;
+
     long long now = (long long)time(NULL);
 
     // An explicit time is allowed so a run can be replayed or tested; the point of
@@ -4053,7 +4140,7 @@ void BSeriesApi::handleWriteNow(BSeries *db, const HTTP_REQUEST &request, HTTP_R
 
         std::string shape_error;
 
-        if(!resolveWriteShape(db,record.key,record.points.size(),&record.datasize,&record.interval,&shape_error)){
+        if(!resolveWriteShape(db,record.key,record.points.size(),&record.datasize,&record.interval,&shape_error,&create)){
             char message[256];
             snprintf(message,sizeof(message),"line %d: %s",line_number,shape_error.c_str());
             jsonError(response,422,"bad_point_width",shape_error);
@@ -4196,6 +4283,11 @@ void BSeriesApi::handleWriteNow(BSeries *db, const HTTP_REQUEST &request, HTTP_R
 
 void BSeriesApi::handleBatchWrite(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response){
 
+    CREATE_SHAPE create;
+
+    if(!readCreateShape(request,response,&create))
+        return;
+
     std::vector<BATCH_RECORD> records;
     int64_t total_points = 0;
     long long now = (long long)time(NULL);
@@ -4271,7 +4363,7 @@ void BSeriesApi::handleBatchWrite(BSeries *db, const HTTP_REQUEST &request, HTTP
 
         std::string shape_error;
 
-        if(!resolveWriteShape(db,record.key,record.points.size(),&record.datasize,&record.interval,&shape_error)){
+        if(!resolveWriteShape(db,record.key,record.points.size(),&record.datasize,&record.interval,&shape_error,&create)){
             char message[256];
             snprintf(message,sizeof(message),"line %d: %s",line_number,shape_error.c_str());
             jsonError(response,422,"bad_point_width",message);
@@ -4313,7 +4405,7 @@ void BSeriesApi::handleBatchWrite(BSeries *db, const HTTP_REQUEST &request, HTTP
         records[i].attempted = true;
         records[i].status = writePoints(db,records[i].key,records[i].points,records[i].datasize,
                                         records[i].interval,records[i].timestamp,
-                                        &records[i].written,&records[i].overwritten);
+                                        &records[i].written,&records[i].overwritten,&create);
 
         written_points += records[i].written;
         overwritten_points += records[i].overwritten;

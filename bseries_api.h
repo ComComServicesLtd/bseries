@@ -212,8 +212,9 @@ private:
     void handleBatchWrite(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
     void handleWriteNow(BSeries *db, const HTTP_REQUEST &request, HTTP_RESPONSE &response);
 
-    bool resolveWriteShape(BSeries *db, uint32_t key, size_t body_bytes, uint32_t *datasize, int64_t *interval, std::string *error);
-    int writePoints(BSeries *db, uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written, int64_t *overwritten = NULL);
+    bool resolveWriteShape(BSeries *db, uint32_t key, size_t body_bytes, uint32_t *datasize, int64_t *interval, std::string *error, const CREATE_SHAPE *shape = NULL);
+    bool readCreateShape(const HTTP_REQUEST &request, HTTP_RESPONSE &response, CREATE_SHAPE *shape);
+    int writePoints(BSeries *db, uint32_t key, const std::string &points, uint32_t datasize, int64_t interval, long long timestamp, int64_t *written, int64_t *overwritten = NULL, const CREATE_SHAPE *shape = NULL);
     bool nearestSlotTime(BSeries *db, uint32_t key, long long when, long long *slot_time);
 };
 

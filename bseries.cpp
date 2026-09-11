@@ -258,7 +258,8 @@ uint32_t BSeries::getChecksum(SERIES *series){
 ///
 /// Returns NO_ERROR, or a negative error code.
 
-int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize, uint32_t start_timestamp){
+int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize, uint32_t start_timestamp,
+                          const CREATE_SHAPE *shape){
 
     SERIES_DEFINITION def;
 
@@ -280,18 +281,32 @@ int BSeries::createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t dat
     } else {
 
         // The same inference reading a version 1 file applies, made explicit here
-        // so it is recorded rather than repeated on every read.
+        // so it is recorded rather than repeated on every read. A caller that
+        // says what it is writing overrides the guess.
         uint8_t inferred = (datasize == 4) ? BS_FLOAT : BS_UNSIGNED;
+        uint32_t width = datasize;
+        uint32_t interval = default_seconds_per_point;
 
-        if(!bsTypeValid(inferred,(uint8_t)datasize)){
-            _ERROR("\t Series %u has no definition and %u is not a storable point width\n",key,datasize);
+        if(shape != NULL){
+            if(shape->datatype != BS_TYPE_INVALID) inferred = shape->datatype;
+            if(shape->datasize) width = shape->datasize;
+            if(shape->interval) interval = shape->interval;
+        }
+
+        if(!bsTypeValid(inferred,(uint8_t)width)){
+            _ERROR("\t Series %u has no definition and %u is not a storable point width\n",key,width);
             return SERIES_TYPE_MISMATCH;
         }
 
         series->version = SERIES_VERSION_PROFILED;
-        series->interval = default_seconds_per_point;
-        series->typecode = bsPackTypeCode(inferred,(uint8_t)datasize,(unsigned char)default_null_fill_byte);
+        series->interval = interval;
+        series->typecode = bsPackTypeCode(inferred,(uint8_t)width,(unsigned char)default_null_fill_byte);
         memset(series->null_fill_wide,(unsigned char)default_null_fill_byte,sizeof(series->null_fill_wide));
+
+        // Recorded in the header, so a later read resolves it without being told
+        // and the caller needs no second request to set it.
+        if(shape != NULL && shape->profile[0])
+            snprintf(series->profile,sizeof(series->profile),"%s",shape->profile);
     }
 
     series->timestamp = start_timestamp ? start_timestamp : (uint32_t)time(NULL);
@@ -959,7 +974,8 @@ bool BSeries::validateWriteAheadCache(ENTRY *series){
 
 /// Any modifications to the map (New entries or deleted entries have to lock)
 
-int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timestamp, bool *overwrote){
+int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timestamp, bool *overwrote,
+                   const CREATE_SHAPE *shape){
 
     if(overwrote != NULL)
         *overwrote = false;
@@ -1026,7 +1042,7 @@ int BSeries::write(uint32_t key, void *value,uint32_t datasize, uint32_t timesta
             // If the header not read correctily, create the series
             if(size != 1){
                 /// Create header and continue write
-                int create_status = createSeries(file,&series->header,key,datasize,timestamp);
+                int create_status = createSeries(file,&series->header,key,datasize,timestamp,shape);
                 if(create_status != NO_ERROR){
                     fclose(file);
                     file = NULL; // the exit path below closes file, don't close it twice

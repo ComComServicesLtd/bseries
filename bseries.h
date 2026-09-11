@@ -222,6 +222,26 @@ inline uint8_t bsHeaderDataType(const SERIES *header){
 }
 
 
+/// What to give a series being created by a write, when nothing else decides it.
+///
+/// A write already creates a series that does not exist, but it could only guess
+/// the shape: the datatype from the payload width, the interval from a server
+/// default, and no profile at all. A prober then had to find out which series
+/// were new and go back to configure each one -- which is the enumeration that
+/// makes an ingest path expensive.
+///
+/// Unset fields fall through to what happened before. A definition still wins:
+/// the definitions file exists to say what shape a new series takes, and a write
+/// arriving with a different opinion should not quietly overrule it.
+
+typedef struct {
+    uint32_t interval;                        // 0 = unset
+    uint8_t  datatype;                        // BS_TYPE_INVALID = unset
+    uint8_t  datasize;                        // 0 = unset
+    char     profile[SERIES_PROFILE_BYTES];   // empty = unset
+} CREATE_SHAPE;
+
+
 /// Declares the shape of a series before it exists on disk: how often a point is
 /// recorded and what each point is. Keys in [key_first,key_last] use this shape.
 ///
@@ -294,7 +314,8 @@ public:
     bool flushBuffer(ENTRY *entry, FILE *file, int64_t points = -1);
 
 
-    int createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize, uint32_t start_timestamp); // NO_ERROR, or negative
+    int createSeries(FILE *file, SERIES *series, uint32_t key, uint32_t datasize, uint32_t start_timestamp,
+                     const CREATE_SHAPE *shape = NULL); // NO_ERROR, or negative
     uint32_t getChecksum(SERIES *series);
     bool bindHeader(ENTRY *entry, uint32_t key);
 
@@ -308,7 +329,8 @@ public:
     /// already held something other than the series' null fill, meaning a real
     /// reading was replaced. Checking costs a read of one point on the direct
     /// write path, so it is only done when a caller asks for it.
-    int write(uint32_t key, void *value, uint32_t datasize, uint32_t timestamp = 0, bool *overwrote = NULL);
+    int write(uint32_t key, void *value, uint32_t datasize, uint32_t timestamp = 0, bool *overwrote = NULL,
+              const CREATE_SHAPE *shape = NULL);
     int read(uint32_t key, int64_t start_time, int64_t end_time, int64_t *n_points, int64_t *r_points, int64_t *seconds_per_point, int64_t *first_point_timestamp, uint32_t *datasize, void **result, uint8_t *datatype = NULL);
 
 

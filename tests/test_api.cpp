@@ -977,6 +977,59 @@ int main(int argc, char **argv){
             CHECK(r.status==400, "and a table cannot be created with that name");
         }
 
+        // A write declaring the shape for anything it creates. This is what lets
+        // an ingest path be one request: without it a prober has to find out
+        // which series are new and configure each one, and that discovery is the
+        // expensive part.
+        {
+            REPLY r = request("POST","/v1/data?interval=10&type=uint8&profile=pingt","read-write-key",
+                              "70030 1700000000 0a\n70031 1700000000 14\n");
+            CHECK(r.status==200 && bodyHas(r,"\"records_written\":2"), "a write creates the series it needs");
+
+            r = request("GET","/v1/series/70030","read-only-key");
+            CHECK(bodyHas(r,"\"interval\":10"), "with the interval the write declared");
+            CHECK(bodyHas(r,"\"type\":\"uint8\""), "the type it declared");
+            CHECK(bodyHas(r,"\"profile\":\"pingt\""), "and the profile, so no second call is needed");
+
+            // An existing series keeps its own header: the points on disk were
+            // laid out to it, and reinterpreting them is a migration not a write.
+            r = request("POST","/v1/data?interval=60","read-write-key","70030 1700000010 28\n");
+            CHECK(r.status==200, "writing again with a different shape succeeds");
+            r = request("GET","/v1/series/70030","read-only-key");
+            CHECK(bodyHas(r,"\"interval\":10"), "but does not reshape the series");
+
+            // The declared width decides how the payload is read: four bytes is
+            // one float32 here, not four uint8.
+            r = request("POST","/v1/data?type=float32&interval=60","read-write-key",
+                        "70032 1700000000 0000c03f\n");
+            CHECK(r.status==200, "a wider type is accepted");
+            r = request("GET","/v1/series/70032","read-only-key");
+            CHECK(bodyHas(r,"\"type\":\"float32\"") && bodyHas(r,"\"datasize\":4"), "and is stored as one");
+            CHECK(bodyHas(r,"\"points\":1"), "four bytes read as one point, not four");
+
+            // A definition still decides; it exists to say what shape a new
+            // series takes.
+            r = request("POST","/v1/data?interval=999","read-write-key","70033 1700000000 0a\n");
+            CHECK(r.status==200, "a write into a range with no definition");
+
+            r = request("POST","/v1/data?interval=0","read-write-key","70034 1700000000 0a\n");
+            CHECK(r.status==400, "a zero interval is refused");
+            r = request("POST","/v1/data?type=nonsense","read-write-key","70034 1700000000 0a\n");
+            CHECK(r.status==400, "an unknown type is refused");
+            r = request("POST","/v1/data?profile=absent","read-write-key","70034 1700000000 0a\n");
+            CHECK(r.status==404, "a profile that cannot be read is refused, not stored hopefully");
+
+            r = request("GET","/v1/series/70034","read-only-key");
+            CHECK(r.status==404, "and none of those refusals created anything");
+
+            // The single series write takes the same parameters.
+            r = request("POST","/v1/series/70035/data?timestamp=1700000000&interval=30&profile=pingt",
+                        "read-write-key","0a");
+            CHECK(r.status==200, "the single series write declares a shape too");
+            r = request("GET","/v1/series/70035","read-only-key");
+            CHECK(bodyHas(r,"\"interval\":30") && bodyHas(r,"\"profile\":\"pingt\""), "and it lands");
+        }
+
         // Migrating a legacy series.
         //
         // Written as a version 1 file by hand, since nothing in this build produces

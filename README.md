@@ -392,6 +392,23 @@ $ printf '# one line per device\n10 1700000000 0a0b0c\n11 1700000000 141516\n' \
 {"records":2,"records_written":2,"records_failed":0,"points_written":6,"points_expected":6}
 ```
 
+**A write creates any series it names**, so an ingest path needs no enumeration
+and no create call — and it can say what shape those series should take:
+
+```
+$ printf '1 now 14\n2 now 1e\n' | curl -XPOST -H 'X-API-Key: $WRITE_KEY' --data-binary @- \
+    'localhost:8086/v1/lab/data?interval=10&type=uint8&profile=ping2'
+```
+
+`interval`, `type` and `profile` apply **only when creating**, and only where no
+definition covers the key. A series already on disk keeps its own header: the
+points in it were laid out to that header, so reinterpreting them would be a
+migration rather than a write. `type` also decides how the payload is read — four
+bytes with `type=float32` is one point, without it four `uint8` ones.
+
+That is the difference between one request per cycle and one per series: a prober
+that declares its shape never has to find out which series are new.
+
 The whole body is parsed and validated before anything is written, so a typo on
 line four hundred cannot leave the first three hundred and ninety nine applied.
 Records are then applied independently: one device with a bad clock does not cost
