@@ -29,11 +29,13 @@
 
 # Build output
 bseriesd
-tests/test_bseries
-tests/test_definitions
-tests/test_api
-tests/test_concurrency
-tests/test_auth
+
+# Compiled test binaries, by pattern rather than one line each. Named
+# individually this list went stale the moment a test was added without one, and
+# a 512KB executable was committed twelve times before anyone looked.
+tests/test_*
+!tests/test_*.cpp
+!tests/test_*.h
 
 # Container images built for RouterOS
 bseries-*.tar
